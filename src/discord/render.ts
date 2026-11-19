@@ -188,17 +188,20 @@ export function stripQuote(text: string): string {
 }
 
 /**
- * Builds one Discord blockquote: `> header`, a bare `>` spacer, every body line
- * as `> line`, then optional `> footer` lines. Existing `>` prefixes in the body
- * are stripped first, so the result never contains `> >`.
+ * Builds one Discord blockquote: `> header` immediately followed by every
+ * non-empty body line as `> line`, then optional `> footer` lines. Blank lines
+ * are skipped because Discord renders a bare `>` as visible text. Existing `>`
+ * prefixes in the body are stripped first, so the result never contains `> >`.
  */
 export function quoteBlock(header: string, body: string, footer?: string): string {
-  const lines = [`> ${stripQuote(header)}`, ">"];
-  for (const line of stripQuote(body).split("\n")) {
-    lines.push(line.trim() ? `> ${line}` : ">");
-  }
+  const lines = [`> ${stripQuote(header)}`];
+  const push = (value: string) => {
+    const line = stripQuote(value);
+    if (line.trim()) lines.push(`> ${line}`);
+  };
+  for (const line of body.split("\n")) push(line);
   if (footer) {
-    for (const line of footer.split("\n")) lines.push(line.trim() ? `> ${line}` : ">");
+    for (const line of footer.split("\n")) push(line);
   }
   return lines.join("\n");
 }

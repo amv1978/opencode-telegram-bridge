@@ -7,9 +7,9 @@ const lines = block.split("\n");
 
 const checks: Array<[string, boolean]> = [
   ["header quoted once", lines[0] === "> 💠 **Расшифровка · голос**"],
-  ["blank quote line has no trailing space", lines[1] === ">"],
-  ["blank body line is bare >", lines[3] === ">"],
-  ["content line quoted", lines[2] === "> привет" && lines[4] === "> вторая строка"],
+  ["header immediately followed by text", lines[1] === "> привет"],
+  ["no bare quote lines", lines.every((line) => line.trim() !== ">")],
+  ["content line quoted", lines[1] === "> привет" && lines[2] === "> вторая строка"],
   ["pre-quoted input not wrapped twice", block.includes("> уже цитата") && !block.includes("> > ")],
   ["no double quote anywhere", !/> >/.test(block)],
   ["footer quoted", lines[lines.length - 1] === "> ⏱ 4.2 с"],
