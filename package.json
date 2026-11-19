@@ -1,0 +1,24 @@
+{
+  "name": "opencode-telegram-bridge",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram <-> OpenCode bridge: drive your coding sessions from chat",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "doctor": "bun run src/doctor.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/index.ts --compile --outfile dist/ocbridge.exe",
+    "build:linux": "bun build src/index.ts --compile --target=bun-linux-x64 --outfile dist/ocbridge-linux-x64",
+    "build:mac": "bun build src/index.ts --compile --target=bun-darwin-arm64 --outfile dist/ocbridge-darwin-arm64"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0",
+    "ogg-opus-decoder": "^1.7.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "bun-types": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}

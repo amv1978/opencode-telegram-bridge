@@ -1,0 +1,28 @@
+# Build output
+dist/
+desktop/release/
+cli/bin/
+cli/obj/
+
+# Dependencies
+node_modules/
+desktop/node_modules/
+.bun/
+
+# Local runtime data (never commit: the token lives in config.json)
+config.json
+config.json.migrated
+state.json
+state.json.migrated
+*.log
+
+# Binaries and tooling
+*.exe
+*.pdb
+*.user
+.vs/
+.playwright-mcp/
+
+# OS junk
+Thumbs.db
+.DS_Store
