@@ -368,6 +368,7 @@ export class DiscordStreamer {
         tools.push({
           icon: tool.icon,
           label: tool.label,
+          code: true,
           count: tool.count,
           duration: formatDuration((tool.finishedAt ?? now) - tool.startedAt),
           mark: tool.state === "ok" ? "✓" : tool.state === "fail" ? "✗" : "",
