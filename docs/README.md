@@ -10,6 +10,7 @@
 | [architecture.md](architecture.md) | Компоненты, поток данных, порты, файлы на диске |
 | [opencode-integration.md](opencode-integration.md) | Эндпоинты OpenCode, события SSE, особенности |
 | [telegram.md](telegram.md) | Команды, режимы, темы, права, медиа и голос |
+| [media.md](media.md) | Пересылка файлов: лимиты, ссылки, режимы relay |
 | [discord.md](discord.md) | Discord: Dev Portal, интенты, треды, команды, лимиты |
 | [voice.md](voice.md) | Голосовые: ffmpeg, HEX, Labs, задержки |
 | [ui.md](ui.md) | Темы, язык, Electron-оболочка, трей |

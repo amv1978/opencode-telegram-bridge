@@ -184,6 +184,18 @@ export const PAGE = /* html */ `<!doctype html>
             <span data-i18n="cfg.showSubagents">Показывать субагентов</span>
           </label>
         </div>
+        <div>
+          <label data-i18n="cfg.media.relay">Пересылка файлов</label>
+          <select id="mediaRelay">
+            <option value="all">all — пользователи + агент</option>
+            <option value="user">user — только пользователи</option>
+            <option value="none">none — выключено</option>
+          </select>
+        </div>
+        <div>
+          <label data-i18n="cfg.media.photo">Фото до, МБ</label>
+          <input id="mediaPhotoMb" type="number" min="1" max="10" step="1" />
+        </div>
       </div>
       <div class="divider"></div>
       <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 14px">Discord</h3>
@@ -298,6 +310,8 @@ const I18N = {
     "cfg.format": "Формат ответов",
     "cfg.autoTopics": "Тема на каждую задачу из общего чата",
     "cfg.showSubagents": "Показывать субагентов",
+    "cfg.media.relay": "Пересылка файлов",
+    "cfg.media.photo": "Фото до, МБ",
     "cfg.discord.enabled": "Включить Discord",
     "cfg.discord.token": "Токен бота Discord",
     "cfg.discord.guilds": "ID серверов (через запятую)",
@@ -368,6 +382,8 @@ const I18N = {
     "cfg.format": "Reply format",
     "cfg.autoTopics": "Topic per task from the general chat",
     "cfg.showSubagents": "Show subagents",
+    "cfg.media.relay": "File relay",
+    "cfg.media.photo": "Photo max, MB",
     "cfg.discord.enabled": "Enable Discord",
     "cfg.discord.token": "Discord bot token",
     "cfg.discord.guilds": "Server IDs (comma separated)",
@@ -516,6 +532,8 @@ function fill(s) {
     applyI18n();
     $("autoTopics").checked = s.config.autoTopics;
     $("showSubagents").checked = s.config.showSubagents;
+    $("mediaRelay").value = s.config.media.relay;
+    $("mediaPhotoMb").value = s.config.media.maxPhotoMb;
     $("proxy").value = s.config.proxy || "";
     $("apiIp").value = s.config.apiIp || "";
     const dcfg = s.discord || {};
@@ -574,6 +592,7 @@ $("form").addEventListener("submit", async (event) => {
     defaultDirectory: $("defaultDirectory").value,
     autoTopics: $("autoTopics").checked,
     showSubagents: $("showSubagents").checked,
+    media: { relay: $("mediaRelay").value, maxPhotoMb: Number($("mediaPhotoMb").value) },
     stream: { editIntervalMs: Number($("editIntervalMs").value), showTools: $("showTools").value, format: $("format").value },
     discord: {
       enabled: $("dcEnabled").checked,

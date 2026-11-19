@@ -19,6 +19,13 @@ import type { OcClient, OcEvent, OcSession } from "../opencode/client.ts";
 import type { Store } from "../state/store.ts";
 import { transcribeAudio } from "../audio/transcribe.ts";
 import { registerCommands } from "./commands.ts";
+import {
+  collectAgentFiles,
+  type DiscordMediaTarget,
+  type MediaItem,
+  type MediaRelay,
+  type MediaSendLimits,
+} from "../media/relay.ts";
 import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFromText, formatDuration, formatTokens, toDiscordMarkdown } from "./render.ts";
 import { modelLabel, turnStats } from "./stats.ts";
 import { DiscordStreamer, resolveSendable } from "./stream.ts";
@@ -62,6 +69,7 @@ export type DiscordState = "stopped" | "starting" | "running" | "error";
 
 export interface DiscordOptions {
   onStateChange?: (state: DiscordState, error: string) => void;
+  relay?: MediaRelay;
 }
 
 /**
@@ -75,6 +83,8 @@ export class DiscordBridge {
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent agent, so `execution.*` updates the parent block. */
   private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
+  /** Last agent-files scan per session, so tool.success + turn end don't double-fetch. */
+  private readonly agentFilesAt = new Map<string, number>();
   private eventChain: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void) | undefined;
   private state: DiscordState = "stopped";
@@ -168,6 +178,32 @@ export class DiscordBridge {
     log.info("discord bot stopped");
   }
 
+  /** Media relay sender: uploads bytes into the bound Discord thread/channel. */
+  async sendMedia(target: DiscordMediaTarget, item: MediaItem, _limits?: MediaSendLimits): Promise<void> {
+    if (!item.buffer?.length || !this.client) return;
+    const channel = await resolveSendable(this.client, target.channelId);
+    if (!channel) return;
+    await channel.send({
+      files: [{ attachment: item.buffer, name: item.name }],
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  async sendRelayText(target: DiscordMediaTarget, text: string): Promise<void> {
+    await this.send(target.channelId, text);
+  }
+
+  /** Relays files the model produced (last assistant message + tool results). */
+  private async relayAgentFiles(sessionID: string): Promise<void> {
+    if (!this.options.relay) return;
+    const now = Date.now();
+    const last = this.agentFilesAt.get(sessionID) ?? 0;
+    if (now - last < 2500) return;
+    this.agentFilesAt.set(sessionID, now);
+    const items = await collectAgentFiles(this.oc, sessionID);
+    if (items.length) this.options.relay.relay(sessionID, items, "agent");
+  }
+
   // ---------------------------------------------------------------- handlers
 
   private register(client: Client): void {
@@ -222,6 +258,7 @@ export class DiscordBridge {
 
     const isVoice = attachments.some((attachment) => this.isAudio(attachment));
     const files: Array<{ uri: string; name?: string }> = [];
+    const media: MediaItem[] = [];
     let promptText = text;
 
     for (const attachment of attachments) {
@@ -234,6 +271,7 @@ export class DiscordBridge {
         const buffer = await this.download(attachment);
         const mime = attachment.contentType ?? "application/octet-stream";
         files.push({ uri: `data:${mime};base64,${buffer.toString("base64")}`, name: attachment.name });
+        media.push({ buffer, mime, name: attachment.name });
       } catch (error) {
         await this.send(destination, `⚠️ Не смог скачать «${attachment.name}»: ${(error as Error).message.slice(0, 160)}`);
       }
@@ -288,6 +326,7 @@ export class DiscordBridge {
     log.info(`discord prompt → ${sessionID.slice(0, 16)}: ${promptText.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
       await this.oc.prompt(sessionID, promptText, { source: "discord" }, files.length ? files : undefined);
+      this.options.relay?.relay(sessionID, media, "discord");
     } catch (error) {
       await this.streamer?.end(sessionID, `⚠️ ${(error as Error).message.slice(0, 200)}`);
     }
@@ -613,6 +652,7 @@ export class DiscordBridge {
       case "session.tool.failed": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
         this.streamer?.toolFinished(sessionID, callID, event.type === "session.tool.success");
+        if (event.type === "session.tool.success") void this.relayAgentFiles(sessionID);
         break;
       }
       case "session.execution.succeeded":
@@ -645,6 +685,7 @@ export class DiscordBridge {
         if (stats.tps) parts.push(`⚡ ${stats.tps.toFixed(1)} tok/s`);
         if (stats.contextTokens) parts.push(`🧠 ${formatTokens(stats.contextTokens)}`);
         await this.streamer.end(sessionID, italicLine(parts.join(" · ")) || undefined);
+        if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
         log.info(`discord turn ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)}`);
         break;
       }

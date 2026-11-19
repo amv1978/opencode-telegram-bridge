@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard, type Context } from "grammy";
+import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import type { BridgeConfig, UserConfig } from "../config.ts";
 import { findUser, isAdmin } from "../config.ts";
 import { log } from "../log.ts";
@@ -7,6 +7,13 @@ import type { Store } from "../state/store.ts";
 import { entitiesToMarkdown } from "./entities.ts";
 import { Streamer, type Target } from "./stream.ts";
 import { enableHexFileTranscription, transcribeAudio } from "../audio/transcribe.ts";
+import {
+  collectAgentFiles,
+  type MediaItem,
+  type MediaRelay,
+  type MediaSendLimits,
+  type TelegramMediaTarget,
+} from "../media/relay.ts";
 
 const EVENT_TYPES = [
   "session.text.started",
@@ -46,6 +53,8 @@ export class Bridge {
   private readonly recentMirrors = new Map<string, { text: string; at: number }[]>();
   private readonly appliedTitles = new Map<string, string>();
   private readonly fetchImpl: typeof fetch;
+  /** Last agent-files scan per session, so tool.success + turn end don't double-fetch. */
+  private readonly agentFilesAt = new Map<string, number>();
   private eventChain: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void) | undefined;
 
@@ -53,7 +62,12 @@ export class Bridge {
     private readonly cfg: BridgeConfig,
     private readonly oc: OcClient,
     private readonly store: Store,
-    private readonly options: { fetch?: typeof fetch; onConfigChange?: () => void; onPollingError?: (message: string) => void } = {},
+    private readonly options: {
+      fetch?: typeof fetch;
+      relay?: MediaRelay;
+      onConfigChange?: () => void;
+      onPollingError?: (message: string) => void;
+    } = {},
   ) {
     this.bot = new Bot(cfg.telegram.token, options.fetch ? { client: { fetch: options.fetch } } : {});
     this.fetchImpl = options.fetch ?? globalThis.fetch;
@@ -108,6 +122,35 @@ export class Bridge {
     this.unsubscribe?.();
     await this.streamer.shutdown();
     await this.bot.stop();
+  }
+
+  /** Media relay sender: uploads bytes to the bound Telegram chat/topic. */
+  async sendMedia(target: TelegramMediaTarget, item: MediaItem, limits: MediaSendLimits): Promise<void> {
+    if (!item.buffer?.length) return;
+    const options = target.threadId ? { message_thread_id: target.threadId } : {};
+    const photo =
+      Boolean(item.mime?.startsWith("image/")) &&
+      !/gif/i.test(item.mime ?? "") &&
+      item.buffer.length <= Math.max(1, limits.maxPhotoMb) * 1024 * 1024;
+    const file = new InputFile(item.buffer, item.name);
+    if (photo) await this.bot.api.sendPhoto(target.chatId, file, options);
+    else await this.bot.api.sendDocument(target.chatId, file, options);
+  }
+
+  async sendRelayText(target: TelegramMediaTarget, text: string): Promise<void> {
+    const options = target.threadId ? { message_thread_id: target.threadId } : {};
+    await this.bot.api.sendMessage(target.chatId, text, options);
+  }
+
+  /** Relays files the model produced (last assistant message + tool results). */
+  private async relayAgentFiles(sessionID: string): Promise<void> {
+    if (!this.options.relay) return;
+    const now = Date.now();
+    const last = this.agentFilesAt.get(sessionID) ?? 0;
+    if (now - last < 2500) return;
+    this.agentFilesAt.set(sessionID, now);
+    const items = await collectAgentFiles(this.oc, sessionID);
+    if (items.length) this.options.relay.relay(sessionID, items, "agent");
   }
 
   // ---------------------------------------------------------------- handlers
@@ -434,6 +477,7 @@ export class Bridge {
     ctx: Context,
     text: string,
     files?: Array<{ uri: string; name?: string }>,
+    media: MediaItem[] = [],
   ): Promise<void> {
     log.info(`task: ${text.slice(0, 80).replace(/\s+/g, " ")}${files ? ` [+${files.length} file]` : ""}`);
     const threadId = (ctx.message as { message_thread_id?: number } | undefined)?.message_thread_id;
@@ -450,6 +494,7 @@ export class Bridge {
         const target = { chatId, threadId: topic.message_thread_id };
         await this.streamer.begin(session.id, target, await this.modelLabel(session.id));
         await this.oc.prompt(session.id, text, { source: "telegram" }, files);
+        this.options.relay?.relay(session.id, media, "telegram");
         log.info(`auto-topic ${topic.message_thread_id} → ${session.id.slice(0, 16)}`);
         return;
       } catch (error) {
@@ -475,6 +520,7 @@ export class Bridge {
     log.info(`prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
       await this.oc.prompt(sessionID, text, { source: "telegram" }, files);
+      this.options.relay?.relay(sessionID, media, "telegram");
     } catch (error) {
       await this.streamer.end(sessionID, `⚠️ ${(error as Error).message.slice(0, 200)}`);
     }
@@ -606,7 +652,9 @@ export class Bridge {
       const mime = document?.mime_type ?? "image/jpeg";
       const name = document?.file_name ?? `photo-${Date.now()}.jpg`;
       const caption = (message.caption ?? "").trim() || "Посмотри это изображение.";
-      await this.submitTask(ctx, caption, [{ uri: `data:${mime};base64,${buffer.toString("base64")}`, name }]);
+      await this.submitTask(ctx, caption, [{ uri: `data:${mime};base64,${buffer.toString("base64")}`, name }], [
+        { buffer, mime, name },
+      ]);
     } catch (error) {
       log.warn("media download failed:", (error as Error).message);
       await ctx.reply(`⚠️ Не смог скачать файл: ${(error as Error).message.slice(0, 120)}`).catch(() => undefined);
@@ -752,6 +800,7 @@ export class Bridge {
       case "session.tool.failed": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
         this.streamer.toolFinished(sessionID, callID, event.type === "session.tool.success");
+        if (event.type === "session.tool.success") void this.relayAgentFiles(sessionID);
         break;
       }
       case "session.execution.succeeded":
@@ -783,6 +832,7 @@ export class Bridge {
         if (stats.tps) parts.push(`⚡ ${stats.tps.toFixed(1)} tok/s`);
         if (stats.contextTokens) parts.push(`🧠 ${formatTokens(stats.contextTokens)}`);
         await this.streamer.end(sessionID, parts.join(" · "));
+        if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
         log.info(`turn ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)}`);
         break;
       }

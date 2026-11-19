@@ -8,6 +8,7 @@ import { Store } from "./state/store.ts";
 import { Bridge } from "./telegram/bot.ts";
 import { setupTelegramNetwork, type TelegramNet } from "./telegram/net.ts";
 import { DiscordBridge } from "./discord/adapter.ts";
+import { MediaRelay } from "./media/relay.ts";
 
 export type BotState = "stopped" | "starting" | "running" | "error";
 
@@ -30,6 +31,7 @@ export interface Snapshot {
     format: "rich" | "html";
     autoTopics: boolean;
     showSubagents: boolean;
+    media: { relay: "none" | "user" | "all"; maxPhotoMb: number };
     ui: { theme: "opencode" | "matrix"; scheme: "system" | "light" | "dark"; lang: "system" | "ru" | "en" };
     proxy?: string;
     apiIp?: string;
@@ -60,6 +62,7 @@ export class App {
   private client?: OcClient;
   private bridge?: Bridge;
   private discord?: DiscordBridge;
+  private relay?: MediaRelay;
   private net?: TelegramNet;
   private state: BotState = "stopped";
   private error = "";
@@ -95,6 +98,10 @@ export class App {
         format: this.cfg.stream.format ?? "rich",
         autoTopics: this.cfg.autoTopics !== false,
         showSubagents: this.cfg.showSubagents !== false,
+        media: {
+          relay: this.cfg.media?.relay ?? "all",
+          maxPhotoMb: this.cfg.media?.maxPhotoMb ?? 10,
+        },
         ui: {
           theme: this.cfg.ui?.theme ?? "opencode",
           scheme: this.cfg.ui?.scheme ?? "system",
@@ -134,11 +141,27 @@ export class App {
       this.client = new OcClient(endpoint.baseUrl, endpoint.password);
       this.ocUrl = endpoint.baseUrl;
       this.ocVersion = (await this.client.info()).version;
+      this.relay = new MediaRelay({
+        store: this.store,
+        media: () => this.cfg.media ?? { relay: "all", maxPhotoMb: 10 },
+        topicsChatId: () => this.cfg.topicsChatId,
+        senders: {
+          telegram: {
+            send: (target, item, limits) => this.bridge?.sendMedia(target, item, limits) ?? Promise.resolve(),
+            sendText: (target, text) => this.bridge?.sendRelayText(target, text) ?? Promise.resolve(),
+          },
+          discord: {
+            send: (target, item, limits) => this.discord?.sendMedia(target, item, limits) ?? Promise.resolve(),
+            sendText: (target, text) => this.discord?.sendRelayText(target, text) ?? Promise.resolve(),
+          },
+        },
+      });
 
       if (hasTelegram) {
         this.net = await this.connectTelegram();
         this.bridge = new Bridge(this.cfg, this.client, this.store, {
           fetch: this.net.fetch,
+          relay: this.relay,
           onConfigChange: () => saveConfig(this.paths, this.cfg),
           onPollingError: (message) => {
             if (/409/.test(message)) {
@@ -172,6 +195,7 @@ export class App {
   private async startDiscord(): Promise<void> {
     if (!this.client || !isDiscordConfigured(this.cfg)) return;
     this.discord = new DiscordBridge(this.cfg, this.client, this.store, {
+      relay: this.relay,
       onStateChange: (state, error) => {
         if (state === "error") log.error(`discord: ${error}`);
       },
@@ -268,6 +292,16 @@ export class App {
     if (typeof patch.defaultDirectory === "string") this.cfg.defaultDirectory = patch.defaultDirectory.trim() || undefined;
     if (typeof patch.autoTopics === "boolean") this.cfg.autoTopics = patch.autoTopics;
     if (typeof patch.showSubagents === "boolean") this.cfg.showSubagents = patch.showSubagents;
+    const media = (patch.media ?? {}) as Record<string, unknown>;
+    if (media.relay === "none" || media.relay === "user" || media.relay === "all") {
+      this.cfg.media = { ...(this.cfg.media ?? {}), relay: media.relay };
+    }
+    if (typeof media.maxPhotoMb === "number" && Number.isFinite(media.maxPhotoMb)) {
+      this.cfg.media = {
+        ...(this.cfg.media ?? {}),
+        maxPhotoMb: Math.min(10, Math.max(1, Math.round(media.maxPhotoMb))),
+      };
+    }
     const ui = (patch.ui ?? {}) as Record<string, unknown>;
     if (ui.theme === "opencode" || ui.theme === "matrix") {
       this.cfg.ui = { ...(this.cfg.ui ?? {}), theme: ui.theme };

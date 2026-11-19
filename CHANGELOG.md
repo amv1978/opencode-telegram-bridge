@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0 — 2026-11-19
+
+Пересылка файлов между чатами.
+
+### Добавлено
+
+- `src/media/relay.ts`: `MediaRelay` + `listTargets` — все Telegram-темы/чаты
+  и Discord-треды/каналы, привязанные к сессии. Источник исключается.
+- Входящие фото/документы Telegram и любые вложения Discord передаются в
+  другие чаты вместе с их байтами.
+- Вывод агента: на `session.execution.succeeded` и `session.tool.success`
+  читаются последние сообщения, части `file` в `content[]` и в
+  `state.content[]` инструментов; найденные файлы релеятся (наблюдаемый формат
+  — `{ "type": "file", "uri": "data:<mime>;base64,…" }`).
+- Лимиты: Telegram фото 10 МБ / документ 50 МБ, Discord 10 МБ. Сверх лимита
+  отправляется ссылка (https как есть) или абсолютный путь текстом.
+  Дедупликация по sha256 (или URI) — 10 минут на сессию.
+- Конфиг `media.relay` (`all`/`user`/`none`, по умолчанию `all`) и
+  `media.maxPhotoMb`; поля в UI и `/api/state`.
+- `docs/media.md`.
+
+### Сборка
+
+- Версия `0.4.0` в `package.json`, `desktop/package.json`,
+  `installer/ocbridge.iss`, `cli/cli.csproj` и `Program.Version`.
+
 ## 0.3.9 — 2026-11-19
 
 Подписи инструментов со путями больше не ломаются.

@@ -22,6 +22,15 @@ export interface DiscordConfig {
   mode?: "threads";
 }
 
+export type MediaRelayMode = "none" | "user" | "all";
+
+export interface MediaConfig {
+  /** none = off, user = only user-sent media, all = user + agent output. */
+  relay?: MediaRelayMode;
+  /** Images up to this size go as Telegram photos; bigger ones as documents. */
+  maxPhotoMb?: number;
+}
+
 export interface BridgeConfig {
   telegram: {
     token: string;
@@ -42,6 +51,8 @@ export interface BridgeConfig {
   mode: "topics" | "private" | "both";
   /** Show subagent activity lines and final reports in chat (default true). */
   showSubagents?: boolean;
+  /** Media relay between bound chats (default all). */
+  media?: MediaConfig;
   /** Forum supergroup chat id used in "topics" mode. */
   topicsChatId?: number;
   /** Default directory for new sessions (empty = current working directory). */
@@ -73,6 +84,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   opencode: {},
   mode: "both",
   showSubagents: true,
+  media: { relay: "all", maxPhotoMb: 10 },
   web: { port: 7788 },
   stream: { editIntervalMs: 1800, showReasoning: false, showTools: "compact", format: "rich" },
 };
@@ -176,6 +188,10 @@ export function loadConfig(paths: Paths): BridgeConfig {
     opencode: { baseUrl: raw.opencode?.baseUrl, password: raw.opencode?.password },
     mode: raw.mode ?? DEFAULT_CONFIG.mode,
     showSubagents: raw.showSubagents ?? true,
+    media: {
+      relay: raw.media?.relay === "none" || raw.media?.relay === "user" ? raw.media.relay : "all",
+      maxPhotoMb: clampNumber(raw.media?.maxPhotoMb, 1, 10, 10),
+    },
     topicsChatId: raw.topicsChatId,
     defaultDirectory: raw.defaultDirectory,
     autoTopics: raw.autoTopics ?? true,
@@ -199,6 +215,12 @@ export function isDiscordConfigured(cfg: BridgeConfig): boolean {
 function readIdList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => String(item).trim()).filter(Boolean);
+}
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(number)));
 }
 
 export function saveConfig(paths: Paths, cfg: BridgeConfig): void {
