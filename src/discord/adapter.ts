@@ -19,7 +19,7 @@ import type { OcClient, OcEvent, OcSession } from "../opencode/client.ts";
 import type { Store } from "../state/store.ts";
 import { transcribeAudio } from "../audio/transcribe.ts";
 import { registerCommands } from "./commands.ts";
-import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFromText, formatDuration, formatTokens } from "./render.ts";
+import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFromText, formatDuration, formatTokens, toDiscordMarkdown } from "./render.ts";
 import { modelLabel, turnStats } from "./stats.ts";
 import { DiscordStreamer, resolveSendable } from "./stream.ts";
 
@@ -258,10 +258,16 @@ export class DiscordBridge {
           }
           log.info(`discord voice → ${result.text.slice(0, 60)} (${result.elapsedMs} ms)`);
           const seconds = (result.elapsedMs / 1000).toFixed(1);
-          await this.send(
-            destination,
-            quoteBlock("💠 **Расшифровка · голос**", result.text, `⏱ ${seconds} с`),
-          );
+          const transcript = toDiscordMarkdown(result.text);
+          if (transcript !== result.text) {
+            // Tables/headings need real fenced blocks, which do not render inside `>` quotes.
+            await this.send(destination, `💠 **Расшифровка · голос**\n\n${transcript}\n\n⏱ ${seconds} с`);
+          } else {
+            await this.send(
+              destination,
+              quoteBlock("💠 **Расшифровка · голос**", transcript, `⏱ ${seconds} с`),
+            );
+          }
           promptText = result.text + (promptText ? `\n\n${promptText}` : "");
         } catch (error) {
           await this.send(destination, `🎤 Ошибка обработки аудио: ${(error as Error).message.slice(0, 160)}`);

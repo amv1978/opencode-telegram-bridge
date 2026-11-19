@@ -1,36 +1,163 @@
 /** Discord hard limit is 2000 chars; keep headroom for edits and footers. */
 export const DISCORD_CHUNK = 1900;
 
-/** Splits text on line boundaries, hard-splitting any single overlong line. */
+const FENCE_OPEN = /^\s{0,3}(`{3,}|~{3,})/;
+const FENCE_CLOSE = /^\s{0,3}(`{3,}|~{3,})\s*$/;
+
+/** Marker (` ``` ` / `~~~`) that closes a fence opened by `line`. */
+function fenceMarker(line: string): string {
+  return FENCE_OPEN.exec(line)?.[1] ?? "```";
+}
+
+/**
+ * Splits text on line boundaries, hard-splitting any single overlong line.
+ * A chunk never ends inside a fenced code block: the fence is closed at the
+ * end of the chunk and reopened (with its language tag) in the next one.
+ */
 export function chunkText(text: string, limit = DISCORD_CHUNK): string[] {
   const value = text.replace(/\r\n/g, "\n");
   if (value.length <= limit) return [value];
 
   const chunks: string[] = [];
   let current = "";
-  const push = () => {
-    if (current.trim()) chunks.push(current);
+  /** Opening fence line while the current chunk is inside a code block. */
+  let fence: string | undefined;
+
+  const push = (close: boolean) => {
+    const body = close && fence ? `${current}\n${fenceMarker(fence)}` : current;
+    if (body.trim()) chunks.push(body);
     current = "";
   };
 
   for (const line of value.split("\n")) {
+    const closesFence = fence !== undefined && FENCE_CLOSE.test(line);
+
     if (line.length > limit) {
-      push();
-      for (let index = 0; index < line.length; index += limit) {
-        chunks.push(line.slice(index, index + limit));
+      push(true);
+      const room = Math.max(1, limit - (fence ? fenceMarker(fence).length + 1 : 0));
+      let rest = line;
+      while (rest.length > room) {
+        const piece = rest.slice(0, room);
+        rest = rest.slice(room);
+        current = fence ? `${fence}\n${piece}` : piece;
+        push(true);
       }
+      current = fence ? `${fence}\n${rest}` : rest;
       continue;
     }
+
+    const overhead = fence && !closesFence ? fenceMarker(fence).length + 1 : 0;
     const candidate = current ? `${current}\n${line}` : line;
-    if (candidate.length > limit) {
-      push();
-      current = line;
+    if (candidate.length + overhead > limit) {
+      push(true);
+      current = fence ? `${fence}\n${line}` : line;
     } else {
       current = candidate;
     }
+
+    if (fence) {
+      if (closesFence) fence = undefined;
+    } else if (FENCE_OPEN.test(line)) {
+      fence = line.trim();
+    }
   }
-  push();
+  push(false);
   return chunks.length ? chunks : [""];
+}
+
+/** `#### title` and deeper → bold; Discord only renders `#`, `##`, `###`. */
+function demoteHeading(line: string): string {
+  const match = /^\s*(#{4,6})\s+(.*?)\s*$/.exec(line);
+  if (!match) return line;
+  const text = (match[2] ?? "").replace(/\s+#+\s*$/, "").trim();
+  return text ? `**${text}**` : line;
+}
+
+/** Splits one pipe-table row into trimmed cells. */
+function tableCells(line: string): string[] {
+  let value = line.trim();
+  if (value.startsWith("|")) value = value.slice(1);
+  if (value.endsWith("|")) value = value.slice(0, -1);
+  return value.split("|").map((cell) => cell.trim());
+}
+
+/** `|---|---|` style alignment row. */
+function isSeparatorRow(line: string): boolean {
+  return /^\s*\|?[\s:|-]+\|/.test(line) && line.includes("-") && line.includes("|");
+}
+
+/**
+ * Pads every cell to the widest value of its column and wraps the table in a
+ * fenced code block, because Discord does not render Markdown tables.
+ */
+function renderTable(rows: string[]): string[] {
+  const grid = rows.map(tableCells);
+  const columns = Math.max(...grid.map((cells) => cells.length));
+  const widths: number[] = [];
+  for (let column = 0; column < columns; column += 1) {
+    let width = 3;
+    grid.forEach((cells, row) => {
+      if (row === 1) return; // separator row is regenerated
+      width = Math.max(width, (cells[column] ?? "").length);
+    });
+    widths.push(width);
+  }
+  const out = ["```"];
+  grid.forEach((cells, row) => {
+    const padded: string[] = [];
+    for (let column = 0; column < columns; column += 1) {
+      const width = widths[column] ?? 3;
+      if (row === 1) padded.push("-".repeat(width));
+      else padded.push((cells[column] ?? "").padEnd(width));
+    }
+    out.push(`| ${padded.join(" | ")} |`);
+  });
+  out.push("```");
+  return out;
+}
+
+/**
+ * Makes agent Markdown closer to Telegram output for Discord:
+ * tables become aligned code blocks, `####`..`######` become bold.
+ * Text inside fenced code blocks and everything else is left untouched.
+ */
+export function toDiscordMarkdown(md: string): string {
+  const lines = md.replace(/\r\n/g, "\n").split("\n");
+  const out: string[] = [];
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+
+    if (inFence) {
+      out.push(line);
+      if (FENCE_CLOSE.test(line)) inFence = false;
+      continue;
+    }
+    if (FENCE_OPEN.test(line)) {
+      inFence = true;
+      out.push(line);
+      continue;
+    }
+
+    const next = lines[index + 1];
+    if (line.includes("|") && next !== undefined && isSeparatorRow(next)) {
+      const rows = [line, next];
+      let cursor = index + 2;
+      while (cursor < lines.length) {
+        const row = lines[cursor] ?? "";
+        if (!row.trim() || !row.includes("|") || FENCE_OPEN.test(row)) break;
+        rows.push(row);
+        cursor += 1;
+      }
+      out.push(...renderTable(rows));
+      index = cursor - 1;
+      continue;
+    }
+
+    out.push(demoteHeading(line));
+  }
+  return out.join("\n");
 }
 
 /** Discord thread names are capped at 100 chars. */

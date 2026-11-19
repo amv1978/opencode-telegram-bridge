@@ -1,6 +1,6 @@
 import type { Client, Message, MessageCreateOptions } from "discord.js";
 import { log } from "../log.ts";
-import { chunkText, formatDuration } from "./render.ts";
+import { chunkText, formatDuration, toDiscordMarkdown } from "./render.ts";
 
 const PLACEHOLDER = "⏳ Думаю…";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -237,7 +237,8 @@ export class DiscordStreamer {
     const parts: string[] = [];
     const status = state.finished ? "" : this.statusBlock(state);
     if (status) parts.push(status);
-    if (state.text.trim()) parts.push(state.text.trim());
+    const body = state.text.trim();
+    if (body) parts.push(toDiscordMarkdown(body));
     if (footer) parts.push(footer);
     return parts.join("\n\n") || PLACEHOLDER;
   }
