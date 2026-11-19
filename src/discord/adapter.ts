@@ -37,6 +37,8 @@ const EVENT_TYPES = [
   "session.inbox.enqueued",
   "permission.asked",
   "session.renamed",
+  "session.created",
+  "session.synthetic",
 ];
 
 const PERMISSION_TTL_MS = 15 * 60 * 1000;
@@ -70,7 +72,9 @@ export class DiscordBridge {
   private client?: Client;
   private streamer?: DiscordStreamer;
   private readonly pending = new Map<string, PendingPermission>();
-  private readonly sessionCache = new Map<string, { parentID?: string | null; title?: string }>();
+  private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
+  /** Child session id → parent agent, so `execution.*` updates the parent block. */
+  private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
   private eventChain: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void) | undefined;
   private state: DiscordState = "stopped";
@@ -557,6 +561,14 @@ export class DiscordBridge {
   // ------------------------------------------------------------------ events
 
   private async onEvent(event: OcEvent): Promise<void> {
+    if (event.type === "session.created") {
+      const data = event.data ?? {};
+      const session = data.session as { id?: string } | undefined;
+      const id = String(session?.id ?? data.id ?? data.sessionID ?? "");
+      if (id) await this.sessionMeta(id);
+      return;
+    }
+
     const sessionID = String(event.data?.sessionID ?? "");
     if (!sessionID) return;
 
@@ -565,6 +577,16 @@ export class DiscordBridge {
         await this.mirrorUserMessage(sessionID, event.data.item);
         break;
       case "session.execution.started": {
+        const meta = await this.sessionMeta(sessionID);
+        if (meta.parentID) {
+          const agent = meta.agent || "subagent";
+          this.childSessions.set(sessionID, { parentID: meta.parentID, agent });
+          if (this.cfg.showSubagents !== false && this.streamer?.has(meta.parentID)) {
+            this.streamer.subagentStarted(meta.parentID, agent);
+            log.info(`discord subagent ${agent} started under ${meta.parentID.slice(0, 16)}`);
+          }
+          break;
+        }
         await this.ensureStream(sessionID);
         this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
         break;
@@ -596,6 +618,15 @@ export class DiscordBridge {
       case "session.execution.succeeded":
       case "session.execution.failed":
       case "session.execution.interrupted": {
+        const child = this.childSessions.get(sessionID);
+        if (child) {
+          this.childSessions.delete(sessionID);
+          if (this.cfg.showSubagents !== false) {
+            this.streamer?.subagentFinished(child.parentID, child.agent, event.type === "session.execution.succeeded");
+          }
+          log.info(`discord subagent ${child.agent} finished ${sessionID.slice(0, 16)}`);
+          break;
+        }
         if (!this.streamer?.has(sessionID)) break;
         const elapsed = this.streamer.elapsedMs(sessionID);
         const status =
@@ -619,6 +650,9 @@ export class DiscordBridge {
       }
       case "permission.asked":
         await this.askPermission(event);
+        break;
+      case "session.synthetic":
+        await this.subagentReport(sessionID, event.data);
         break;
       case "session.renamed": {
         const title = String(event.data.title ?? "").trim();
@@ -773,17 +807,44 @@ export class DiscordBridge {
     return (this.cfg.discord?.allowedUsers ?? []).includes(userId);
   }
 
-  private async sessionMeta(sessionID: string): Promise<{ parentID?: string | null; title?: string }> {
+  private async sessionMeta(sessionID: string): Promise<{ parentID?: string | null; agent?: string; title?: string }> {
     const cached = this.sessionCache.get(sessionID);
     if (cached) return cached;
     try {
       const session = await this.oc.getSession(sessionID);
-      const meta = { parentID: session.parentID, title: session.title };
+      const meta = { parentID: session.parentID, agent: session.agent, title: session.title };
       this.sessionCache.set(sessionID, meta);
       return meta;
     } catch {
       return {};
     }
+  }
+
+  /**
+   * `session.synthetic` on the parent: child's `<subagent>` report as a muted
+   * quote `> 🧩 <agent>: …` (first ~300 chars) unless `showSubagents` is off.
+   */
+  private async subagentReport(sessionID: string, data: Record<string, unknown>): Promise<void> {
+    if (this.cfg.showSubagents === false) return;
+    const raw = syntheticText(data);
+    if (!raw) return;
+    const cleaned = raw
+      .replace(/<\/?subagent[^>]*>/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!cleaned) return;
+    const own = await this.sessionMeta(sessionID);
+    const parentID = own.parentID ?? sessionID;
+    const childID = /<subagent[^>]*sessionID="([^"]+)"/i.exec(raw)?.[1];
+    let agent = typeof data.agent === "string" ? data.agent.trim() : "";
+    if (!agent && own.parentID) agent = own.agent ?? "";
+    if (!agent && childID) agent = (await this.sessionMeta(childID)).agent ?? "";
+    if (!agent) agent = "subagent";
+    const target = this.targetFor(parentID);
+    if (!target) return;
+    const text = cleaned.length > 300 ? `${cleaned.slice(0, 299)}…` : cleaned;
+    await this.send(target, `> 🧩 ${agent}: ${text}`);
+    log.info(`discord subagent report ${agent} → ${parentID.slice(0, 16)}`);
   }
 
   private async isSubagent(sessionID: string): Promise<boolean> {
@@ -848,4 +909,24 @@ function threadParent(channel: unknown): ThreadParent | undefined {
   if (!parent.id || !parent.threads) return undefined;
   if (parent.type !== ChannelType.GuildText && parent.type !== ChannelType.GuildAnnouncement) return undefined;
   return candidate as unknown as ThreadParent;
+}
+
+/** Text of a `session.synthetic` event; the payload shape has varied across builds. */
+function syntheticText(data: unknown): string {
+  if (!data || typeof data !== "object") return "";
+  const source = data as Record<string, any>;
+  const item = source.item as Record<string, any> | undefined;
+  const candidates = [
+    source.text,
+    item?.text,
+    item?.payload?.text,
+    item?.preview,
+    source.preview,
+    source.message,
+    source.report?.text,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return "";
 }

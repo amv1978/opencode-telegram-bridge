@@ -7,12 +7,21 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 /** Finished tool lines fade out of the status block after this long. */
 const TOOL_TTL_MS = 10_000;
 const MAX_STATUS_TOOLS = 2;
+const MAX_STATUS_SUBAGENTS = 2;
 
 type ToolResult = "running" | "ok" | "fail";
 
 interface ToolState {
   callID: string;
   icon: string;
+  label: string;
+  startedAt: number;
+  state: ToolResult;
+  finishedAt?: number;
+  count: number;
+}
+
+interface SubagentState {
   label: string;
   startedAt: number;
   state: ToolResult;
@@ -48,6 +57,7 @@ interface State {
   channelId: string;
   text: string;
   tools: ToolState[];
+  subagents: SubagentState[];
   messageIds: Array<string | undefined>;
   rendered: Array<string | undefined>;
   timer?: ReturnType<typeof setTimeout>;
@@ -100,6 +110,7 @@ export class DiscordStreamer {
       channelId,
       text: "",
       tools: [],
+      subagents: [],
       messageIds: [],
       rendered: [],
       frame: 0,
@@ -182,6 +193,35 @@ export class DiscordStreamer {
     this.schedule(state);
   }
 
+  /** Child session started: `🧩 <agent> · 12s` in the parent's live block. */
+  subagentStarted(sessionID: string, label: string): void {
+    const state = this.states.get(sessionID);
+    if (!state) return;
+    const value = label || "subagent";
+    const existing = state.subagents.find((entry) => entry.label === value);
+    if (existing) {
+      existing.count += 1;
+      existing.startedAt = Date.now();
+      existing.state = "running";
+      existing.finishedAt = undefined;
+    } else {
+      state.subagents.push({ label: value, startedAt: Date.now(), state: "running", count: 1 });
+      if (state.subagents.length > 24) state.subagents.shift();
+    }
+    this.schedule(state);
+  }
+
+  /** Child session finished: `✓` / `✗`, fades out after ~10 s. */
+  subagentFinished(sessionID: string, label: string, ok: boolean): void {
+    const state = this.states.get(sessionID);
+    if (!state) return;
+    const entry = state.subagents.find((item) => item.label === (label || "subagent") && item.state === "running");
+    if (!entry) return;
+    entry.state = ok ? "ok" : "fail";
+    entry.finishedAt = Date.now();
+    this.schedule(state);
+  }
+
   async end(sessionID: string, footer?: string): Promise<void> {
     const state = this.states.get(sessionID);
     if (!state) return;
@@ -243,7 +283,7 @@ export class DiscordStreamer {
     return parts.join("\n\n") || PLACEHOLDER;
   }
 
-  /** Spinner + model + up to two recent tools, like the Telegram status block. */
+  /** Spinner + model + two recent tools + two subagents, like Telegram. */
   private statusBlock(state: State): string {
     const frame = SPINNER[state.frame % SPINNER.length] ?? "⠋";
     const elapsed = formatDuration(Date.now() - state.startedAt);
@@ -259,6 +299,15 @@ export class DiscordStreamer {
         const duration = formatDuration((tool.finishedAt ?? now) - tool.startedAt);
         lines.push(`${tool.icon} ${tool.label}${count} · ${duration}${mark}`);
       }
+    }
+    const now = Date.now();
+    const subagents = state.subagents
+      .filter((entry) => entry.state === "running" || !entry.finishedAt || now - entry.finishedAt <= TOOL_TTL_MS)
+      .slice(-MAX_STATUS_SUBAGENTS);
+    for (const sub of subagents) {
+      const mark = sub.state === "ok" ? " ✓" : sub.state === "fail" ? " ✗" : "";
+      const count = sub.count > 1 ? ` ×${sub.count}` : "";
+      lines.push(`🧩 ${sub.label}${count} · ${formatSubagentElapsed((sub.finishedAt ?? now) - sub.startedAt)}${mark}`);
     }
     return lines.join("\n");
   }
@@ -306,6 +355,15 @@ export class DiscordStreamer {
   private async resolve(channelId: string): Promise<SendableChannel | undefined> {
     return resolveSendable(this.client, channelId);
   }
+}
+
+/** Subagent line: `12s`, `1m 03s` (seconds zero-padded). */
+function formatSubagentElapsed(ms: number): string {
+  const total = Math.max(1, Math.round(ms / 1000));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return seconds ? `${minutes}m ${String(seconds).padStart(2, "0")}s` : `${minutes}m`;
 }
 
 /** Human label for a tool call (`edit bot.ts`, `bash npm test`). Copied from Telegram. */

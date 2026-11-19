@@ -29,6 +29,7 @@ export interface Snapshot {
     showTools: BridgeConfig["stream"]["showTools"];
     format: "rich" | "html";
     autoTopics: boolean;
+    showSubagents: boolean;
     ui: { theme: "opencode" | "matrix"; scheme: "system" | "light" | "dark"; lang: "system" | "ru" | "en" };
     proxy?: string;
     apiIp?: string;
@@ -93,6 +94,7 @@ export class App {
         showTools: this.cfg.stream.showTools,
         format: this.cfg.stream.format ?? "rich",
         autoTopics: this.cfg.autoTopics !== false,
+        showSubagents: this.cfg.showSubagents !== false,
         ui: {
           theme: this.cfg.ui?.theme ?? "opencode",
           scheme: this.cfg.ui?.scheme ?? "system",
@@ -265,6 +267,7 @@ export class App {
     }
     if (typeof patch.defaultDirectory === "string") this.cfg.defaultDirectory = patch.defaultDirectory.trim() || undefined;
     if (typeof patch.autoTopics === "boolean") this.cfg.autoTopics = patch.autoTopics;
+    if (typeof patch.showSubagents === "boolean") this.cfg.showSubagents = patch.showSubagents;
     const ui = (patch.ui ?? {}) as Record<string, unknown>;
     if (ui.theme === "opencode" || ui.theme === "matrix") {
       this.cfg.ui = { ...(this.cfg.ui ?? {}), theme: ui.theme };

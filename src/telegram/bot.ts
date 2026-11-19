@@ -22,6 +22,8 @@ const EVENT_TYPES = [
   "session.inbox.enqueued",
   "permission.asked",
   "session.renamed",
+  "session.created",
+  "session.synthetic",
 ];
 
 const PERMISSION_TTL_MS = 15 * 60 * 1000;
@@ -36,7 +38,9 @@ export class Bridge {
   private readonly bot: Bot;
   private readonly streamer: Streamer;
   private readonly pending = new Map<string, PendingPermission>();
-  private readonly sessionCache = new Map<string, { parentID?: string | null; title?: string }>();
+  private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
+  /** Child session id → parent binding, so `execution.*` updates the parent block. */
+  private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
   private modelNamesCache?: Map<string, string>;
   private modelNamesAt = 0;
   private readonly recentMirrors = new Map<string, { text: string; at: number }[]>();
@@ -698,6 +702,14 @@ export class Bridge {
   // ------------------------------------------------------------------ events
 
   private async onEvent(event: OcEvent): Promise<void> {
+    if (event.type === "session.created") {
+      const data = event.data ?? {};
+      const session = data.session as { id?: string } | undefined;
+      const id = String(session?.id ?? data.id ?? data.sessionID ?? "");
+      if (id) await this.sessionMeta(id);
+      return;
+    }
+
     const sessionID = String(event.data?.sessionID ?? "");
     if (!sessionID) return;
 
@@ -707,6 +719,18 @@ export class Bridge {
         break;
       case "session.execution.started":
       case "session.text.started":
+        if (event.type === "session.execution.started") {
+          const meta = await this.sessionMeta(sessionID);
+          if (meta.parentID) {
+            const agent = meta.agent || "subagent";
+            this.childSessions.set(sessionID, { parentID: meta.parentID, agent });
+            if (this.cfg.showSubagents !== false && this.streamer.has(meta.parentID)) {
+              this.streamer.subagentStarted(meta.parentID, agent);
+              log.info(`subagent ${agent} started under ${meta.parentID.slice(0, 16)}`);
+            }
+            break;
+          }
+        }
         await this.ensureStream(sessionID);
         break;
       case "session.text.delta": {
@@ -733,6 +757,15 @@ export class Bridge {
       case "session.execution.succeeded":
       case "session.execution.failed":
       case "session.execution.interrupted": {
+        const child = this.childSessions.get(sessionID);
+        if (child) {
+          this.childSessions.delete(sessionID);
+          if (this.cfg.showSubagents !== false) {
+            this.streamer.subagentFinished(child.parentID, child.agent, event.type === "session.execution.succeeded");
+          }
+          log.info(`subagent ${child.agent} finished ${sessionID.slice(0, 16)}`);
+          break;
+        }
         if (!this.streamer.has(sessionID)) break;
         const elapsed = this.streamer.elapsedMs(sessionID);
         const status =
@@ -755,6 +788,9 @@ export class Bridge {
       }
       case "permission.asked":
         await this.askPermission(event);
+        break;
+      case "session.synthetic":
+        await this.subagentReport(sessionID, event.data);
         break;
       case "session.renamed": {
         const title = String(event.data.title ?? "").trim();
@@ -786,16 +822,48 @@ export class Bridge {
     log.info(`attached to running session ${sessionID.slice(0, 16)}`);
   }
 
-  private async sessionMeta(sessionID: string): Promise<{ parentID?: string | null; title?: string }> {
+  private async sessionMeta(sessionID: string): Promise<{ parentID?: string | null; agent?: string; title?: string }> {
     const cached = this.sessionCache.get(sessionID);
     if (cached) return cached;
     try {
       const session = await this.oc.getSession(sessionID);
-      const meta = { parentID: session.parentID, title: session.title };
+      const meta = { parentID: session.parentID, agent: session.agent, title: session.title };
       this.sessionCache.set(sessionID, meta);
       return meta;
     } catch {
       return {};
+    }
+  }
+
+  /**
+   * `session.synthetic` on the parent: the child's `<subagent>` report.
+   * Posts the first ~300 chars as a muted quote unless `showSubagents` is off.
+   */
+  private async subagentReport(sessionID: string, data: Record<string, unknown>): Promise<void> {
+    if (this.cfg.showSubagents === false) return;
+    const raw = syntheticText(data);
+    if (!raw) return;
+    const cleaned = raw
+      .replace(/<\/?subagent[^>]*>/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!cleaned) return;
+    const own = await this.sessionMeta(sessionID);
+    const parentID = own.parentID ?? sessionID;
+    const childID = /<subagent[^>]*sessionID="([^"]+)"/i.exec(raw)?.[1];
+    let agent = typeof data.agent === "string" ? data.agent.trim() : "";
+    if (!agent && own.parentID) agent = own.agent ?? "";
+    if (!agent && childID) agent = (await this.sessionMeta(childID)).agent ?? "";
+    if (!agent) agent = "subagent";
+    const target = this.targetFor(parentID);
+    if (!target) return;
+    const text = cleaned.length > 300 ? `${cleaned.slice(0, 299)}…` : cleaned;
+    const options = target.threadId ? { message_thread_id: target.threadId } : {};
+    try {
+      await this.bot.api.sendRichMessage(target.chatId, { markdown: `> 🧩 ${agent}: ${text}` }, options);
+      log.info(`subagent report ${agent} → ${parentID.slice(0, 16)}`);
+    } catch {
+      await this.bot.api.sendMessage(target.chatId, `🧩 ${agent}: ${text}`, options).catch(() => undefined);
     }
   }
 
@@ -1077,6 +1145,26 @@ function argText(ctx: Context): string {  return typeof ctx.match === "string" ?
 
 function escape(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Text of a `session.synthetic` event; the payload shape has varied across builds. */
+function syntheticText(data: unknown): string {
+  if (!data || typeof data !== "object") return "";
+  const source = data as Record<string, any>;
+  const item = source.item as Record<string, any> | undefined;
+  const candidates = [
+    source.text,
+    item?.text,
+    item?.payload?.text,
+    item?.preview,
+    source.preview,
+    source.message,
+    source.report?.text,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return "";
 }
 
 function label(session: OcSession): string {

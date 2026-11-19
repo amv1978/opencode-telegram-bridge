@@ -40,6 +40,8 @@ export interface BridgeConfig {
   };
   /** "topics" = forum supergroup, one topic per session; "private" = one chat + /switch; "both". */
   mode: "topics" | "private" | "both";
+  /** Show subagent activity lines and final reports in chat (default true). */
+  showSubagents?: boolean;
   /** Forum supergroup chat id used in "topics" mode. */
   topicsChatId?: number;
   /** Default directory for new sessions (empty = current working directory). */
@@ -70,6 +72,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   discord: { enabled: false, token: "", allowedGuilds: [], allowedUsers: [], mode: "threads" },
   opencode: {},
   mode: "both",
+  showSubagents: true,
   web: { port: 7788 },
   stream: { editIntervalMs: 1800, showReasoning: false, showTools: "compact", format: "rich" },
 };
@@ -172,6 +175,7 @@ export function loadConfig(paths: Paths): BridgeConfig {
     },
     opencode: { baseUrl: raw.opencode?.baseUrl, password: raw.opencode?.password },
     mode: raw.mode ?? DEFAULT_CONFIG.mode,
+    showSubagents: raw.showSubagents ?? true,
     topicsChatId: raw.topicsChatId,
     defaultDirectory: raw.defaultDirectory,
     autoTopics: raw.autoTopics ?? true,

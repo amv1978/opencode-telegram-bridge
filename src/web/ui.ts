@@ -178,6 +178,12 @@ export const PAGE = /* html */ `<!doctype html>
             <span data-i18n="cfg.autoTopics">Тема на каждую задачу из общего чата</span>
           </label>
         </div>
+        <div>
+          <label style="display:flex;gap:8px;align-items:center;margin-top:24px;color:var(--fg)">
+            <input type="checkbox" id="showSubagents" style="width:16px;height:16px" />
+            <span data-i18n="cfg.showSubagents">Показывать субагентов</span>
+          </label>
+        </div>
       </div>
       <div class="divider"></div>
       <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 14px">Discord</h3>
@@ -291,6 +297,7 @@ const I18N = {
     "cfg.tools": "Инструменты в чате",
     "cfg.format": "Формат ответов",
     "cfg.autoTopics": "Тема на каждую задачу из общего чата",
+    "cfg.showSubagents": "Показывать субагентов",
     "cfg.discord.enabled": "Включить Discord",
     "cfg.discord.token": "Токен бота Discord",
     "cfg.discord.guilds": "ID серверов (через запятую)",
@@ -360,6 +367,7 @@ const I18N = {
     "cfg.tools": "Tools in chat",
     "cfg.format": "Reply format",
     "cfg.autoTopics": "Topic per task from the general chat",
+    "cfg.showSubagents": "Show subagents",
     "cfg.discord.enabled": "Enable Discord",
     "cfg.discord.token": "Discord bot token",
     "cfg.discord.guilds": "Server IDs (comma separated)",
@@ -507,6 +515,7 @@ function fill(s) {
     $("lang").value = (s.config.ui && s.config.ui.lang) || localStorage.getItem("ocbridge.lang") || "system";
     applyI18n();
     $("autoTopics").checked = s.config.autoTopics;
+    $("showSubagents").checked = s.config.showSubagents;
     $("proxy").value = s.config.proxy || "";
     $("apiIp").value = s.config.apiIp || "";
     const dcfg = s.discord || {};
@@ -564,6 +573,7 @@ $("form").addEventListener("submit", async (event) => {
     topicsChatId: $("topicsChatId").value,
     defaultDirectory: $("defaultDirectory").value,
     autoTopics: $("autoTopics").checked,
+    showSubagents: $("showSubagents").checked,
     stream: { editIntervalMs: Number($("editIntervalMs").value), showTools: $("showTools").value, format: $("format").value },
     discord: {
       enabled: $("dcEnabled").checked,
