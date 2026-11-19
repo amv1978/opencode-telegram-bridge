@@ -3,7 +3,7 @@
 ; Produces: dist\ocbridge-setup-<version>.exe
 
 #define AppName "OpenCode Telegram Bridge"
-#define AppVersion "0.3.6"
+#define AppVersion "0.3.8"
 #define AppExe "ocbridge.exe"
 
 [Setup]

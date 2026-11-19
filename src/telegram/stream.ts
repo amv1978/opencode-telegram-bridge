@@ -1,6 +1,6 @@
 import { GrammyError, type Api } from "grammy";
 import { log } from "../log.ts";
-import { statusHtml, statusMarkdown, type StatusItem } from "../status.ts";
+import { statusHtml, statusMarkdownList, type StatusItem } from "../status.ts";
 import { markdownToHtml, splitHtml, splitMarkdown, stripHtml } from "./render.ts";
 
 export interface Target {
@@ -46,14 +46,12 @@ interface State {
   messageIds: number[];
   timer?: ReturnType<typeof setTimeout>;
   typing?: ReturnType<typeof setInterval>;
-  spinner?: ReturnType<typeof setInterval>;
-  /** Independent ticker: elapsed time changes even without new events. */
+  /** Repeating ticker: elapsed time changes even without new events. */
   ticker?: ReturnType<typeof setInterval>;
   finalizeTimer?: ReturnType<typeof setTimeout>;
   /** Parent turn ended but children are still running: keep the block alive. */
   awaiting: boolean;
   footer?: string;
-  frame: number;
   model: string;
   startedAt: number;
   lastEditAt: number;
@@ -62,7 +60,6 @@ interface State {
 }
 
 const PLACEHOLDER = "⏳ Думаю…";
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /** Finished tool lines fade out of the status block after this long. */
 const TOOL_TTL_MS = 10_000;
 const STATUS_TICK_MS = 1200;
@@ -103,7 +100,6 @@ export class Streamer {
       subagents: [],
       messageIds: [],
       awaiting: false,
-      frame: 0,
       model: model || this.models.get(sessionID) || "OpenCode",
       startedAt: Date.now(),
       lastEditAt: 0,
@@ -119,19 +115,16 @@ export class Streamer {
       void this.api.sendChatAction(target.chatId, "typing").catch(() => undefined);
     }, 5000);
     state.typing.unref?.();
-    // Animate the status line only while the turn is running.
-    state.spinner = setInterval(() => {
-      if (state.finished) return;
-      state.frame = (state.frame + 1) % SPINNER.length;
-      this.schedule(state, STATUS_TICK_MS);
-    }, STATUS_TICK_MS);
-    state.spinner.unref?.();
-    // Independent of spinner/text deltas: keeps `🧩 … · 12s` and `🛠 … · 3s`
-    // moving while anything is active, including after the parent turn ended.
+    // Repeating ticker (not a one-shot setTimeout chain): recomputes elapsed
+    // strings and forces an edit even when only the number changed. Keeps
+    // `🧩 … · 12s` / `🛠 … · 3s` moving after the parent turn ended too.
     state.ticker = setInterval(() => {
-      if (!state.finished || state.awaiting) {
-        if (hasLiveLines(state)) this.schedule(state, STATUS_TICK_MS);
-      }
+      if (state.finished && !state.awaiting) return;
+      if (state.flushing) return;
+      if (Date.now() - state.lastEditAt < Math.max(STATUS_TICK_MS, this.options.editIntervalMs || STATUS_TICK_MS)) return;
+      void this.flush(state.sessionID, state).catch((error) =>
+        log.warn("status tick flush failed:", (error as Error).message),
+      );
     }, STATUS_TICK_MS);
     state.ticker.unref?.();
   }
@@ -230,9 +223,11 @@ export class Streamer {
     const state = this.states.get(sessionID);
     if (!state) return;
     state.finished = true;
-    if (state.timer) clearTimeout(state.timer);
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = undefined;
+    }
     if (state.typing) clearInterval(state.typing);
-    if (state.spinner) clearInterval(state.spinner);
 
     if (hasActiveSubagents(state)) {
       state.awaiting = true;
@@ -366,7 +361,7 @@ export class Streamer {
       tools,
       subagents,
     };
-    return html ? statusHtml(snapshot) : statusMarkdown(snapshot);
+    return html ? statusHtml(snapshot) : statusMarkdownList(snapshot);
   }
 
   private async flush(sessionID: string, state: State, footer?: string): Promise<void> {
@@ -460,6 +455,11 @@ export class Streamer {
       await this.api.editMessageText(state.target.chatId, messageId, { markdown });
     } catch (error) {
       if (isNotModified(error)) return;
+      if (error instanceof GrammyError && error.error_code === 429) {
+        // Wait `retry_after`; the next 1.2 s tick repeats the edit.
+        await this.handleRetry(error);
+        return;
+      }
       throw error;
     }
   }

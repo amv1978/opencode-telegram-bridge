@@ -71,6 +71,8 @@ interface State {
   model: string;
   startedAt: number;
   lastEditAt: number;
+  lastTickLogAt?: number;
+  flushing: boolean;
   finished: boolean;
 }
 
@@ -123,6 +125,7 @@ export class DiscordStreamer {
       model: model || this.models.get(sessionID) || "OpenCode",
       startedAt: Date.now(),
       lastEditAt: 0,
+      flushing: false,
       finished: false,
     };
     this.models.set(sessionID, state.model);
@@ -131,11 +134,23 @@ export class DiscordStreamer {
     state.messageIds.push(message.id);
     state.rendered.push(PLACEHOLDER);
     state.lastEditAt = Date.now();
-    // Independent ticker: elapsed labels keep moving without new events,
-    // including while children run after the parent turn ended.
+    // Repeating ticker (not a one-shot setTimeout chain): elapsed labels keep
+    // moving without new events, including while children run after the parent
+    // turn ended. Discord's edit spacing is respected by `lastEditAt`.
     const tick = Math.max(2500, this.options.editIntervalMs || 2500);
     state.statusTimer = setInterval(() => {
-      if (!state.finished || state.awaiting) this.schedule(state);
+      if (state.finished && !state.awaiting) return;
+      if (state.flushing) return;
+      if (Date.now() - state.lastEditAt < tick) return;
+      if (!state.lastTickLogAt || Date.now() - state.lastTickLogAt >= 10_000) {
+        state.lastTickLogAt = Date.now();
+        const active = state.subagents.filter((entry) => entry.state === "running").length +
+          state.tools.filter((entry) => entry.state === "running").length;
+        log.info(
+          `discord status tick ${state.sessionID.slice(0, 16)} elapsed=${formatDuration(Date.now() - state.startedAt)} active=${active}`,
+        );
+      }
+      void this.flush(state).catch((error) => log.warn("discord status tick flush failed:", (error as Error).message));
     }, tick);
     state.statusTimer.unref?.();
   }
@@ -242,7 +257,10 @@ export class DiscordStreamer {
     const state = this.states.get(sessionID);
     if (!state) return;
     state.finished = true;
-    if (state.timer) clearTimeout(state.timer);
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = undefined;
+    }
 
     if (hasActiveSubagents(state)) {
       state.awaiting = true;
@@ -376,43 +394,54 @@ export class DiscordStreamer {
   }
 
   private async flush(state: State, footer?: string): Promise<void> {
-    if (!state.finished) state.frame = (state.frame + 1) % SPINNER.length;
-    const channel = await this.resolve(state.channelId);
-    if (!channel) {
-      this.options.onGone?.(state.sessionID);
-      return;
-    }
-    const chunks = chunkText(this.compose(state, footer));
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunk = chunks[index] ?? "";
-      if (!chunk) continue;
-      const messageId = state.messageIds[index];
-      if (!messageId) {
-        const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
-        state.messageIds[index] = message.id;
-        state.rendered[index] = chunk;
-        continue;
+    if (state.flushing) return;
+    state.flushing = true;
+    try {
+      if (!state.finished) state.frame = (state.frame + 1) % SPINNER.length;
+      const channel = await this.resolve(state.channelId);
+      if (!channel) {
+        this.options.onGone?.(state.sessionID);
+        return;
       }
-      if (state.rendered[index] === chunk) continue;
-      try {
-        const message = await channel.messages.fetch(messageId);
-        await message.edit({ content: chunk, allowedMentions: { parse: [] } });
-        state.rendered[index] = chunk;
-      } catch (error) {
-        const code = (error as { code?: number }).code;
-        if (code === 10008 || code === 10003) {
-          // Message or channel was deleted mid-stream: send this chunk afresh.
-          state.messageIds[index] = undefined;
-          state.rendered[index] = undefined;
+      const chunks = chunkText(this.compose(state, footer));
+      for (let index = 0; index < chunks.length; index += 1) {
+        const chunk = chunks[index] ?? "";
+        if (!chunk) continue;
+        const messageId = state.messageIds[index];
+        if (!messageId) {
           const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
           state.messageIds[index] = message.id;
           state.rendered[index] = chunk;
           continue;
         }
-        throw error;
+        // Always edit: elapsed strings change every tick, so a same-content
+        // guard would leave the live block frozen.
+        try {
+          const message = await channel.messages.fetch(messageId);
+          await message.edit({ content: chunk, allowedMentions: { parse: [] } });
+          state.rendered[index] = chunk;
+        } catch (error) {
+          const code = (error as { code?: number }).code;
+          if (code === 10008 || code === 10003) {
+            // Message or channel was deleted mid-stream: send this chunk afresh.
+            state.messageIds[index] = undefined;
+            state.rendered[index] = undefined;
+            const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
+            state.messageIds[index] = message.id;
+            state.rendered[index] = chunk;
+            continue;
+          }
+          if (isRateLimited(error)) {
+            await waitForRateLimit(error);
+            return; // the next 2.5 s tick retries
+          }
+          throw error;
+        }
       }
+      state.lastEditAt = Date.now();
+    } finally {
+      state.flushing = false;
     }
-    state.lastEditAt = Date.now();
   }
 
   private async resolve(channelId: string): Promise<SendableChannel | undefined> {
@@ -432,6 +461,20 @@ function formatSubagentElapsed(ms: number): string {
 /** At least one child is running (not counting the fade-out window). */
 function hasActiveSubagents(state: { subagents: SubagentState[] }): boolean {
   return state.subagents.some((entry) => entry.state === "running");
+}
+
+function isRateLimited(error: unknown): boolean {
+  const value = error as { status?: number; httpStatus?: number; name?: string; code?: number };
+  return value?.status === 429 || value?.httpStatus === 429 || value?.name === "RateLimitError" || value?.code === 429;
+}
+
+/** Waits `retry_after` from a Discord 429; the next tick retries the edit. */
+async function waitForRateLimit(error: unknown): Promise<void> {
+  const value = error as { retryAfter?: number; rawError?: { retry_after?: number } };
+  const raw = value?.rawError?.retry_after ?? value?.retryAfter ?? 2.5;
+  const ms = Math.max(1000, raw > 100 ? raw : raw * 1000);
+  log.warn(`discord 429, retry after ${Math.round(ms / 1000)}s`);
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Human label for a tool call (`edit bot.ts`, `bash npm test`). Copied from Telegram. */

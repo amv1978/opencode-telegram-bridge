@@ -41,26 +41,35 @@ export function statusLabel(value: string): string {
   return text.length > 60 ? `${text.slice(0, 59)}…` : text;
 }
 
-function itemLine(item: StatusItem, escape: (value: string) => string): string {
+function itemLine(item: StatusItem, escape: (value: string) => string, bullet: boolean): string {
   const count = item.count && item.count > 1 ? ` ×${item.count}` : "";
   const mark = item.mark ? ` ${item.mark}` : "";
-  return `${item.icon} ${escape(statusLabel(item.label))}${count} · ${item.duration}${mark}`;
+  const prefix = bullet ? "- " : "";
+  return `${prefix}${item.icon} ${escape(statusLabel(item.label))}${count} · ${item.duration}${mark}`;
 }
 
-/** Telegram Rich Message markdown. Only the model name is bold. */
-export function statusMarkdown(snapshot: StatusSnapshot): string {
+/**
+ * Telegram Rich Message markdown. Only the model name is bold; every card is a
+ * list item, because a single "\n" is collapsed into a space by rich markdown.
+ */
+export function statusMarkdown(snapshot: StatusSnapshot, bulletItems = false): string {
   const identity = (value: string) => value;
   const lines = [`🟢 **${statusLabel(snapshot.model)}** · ${snapshot.phase} ${snapshot.elapsed}`];
-  for (const item of snapshot.tools) lines.push(itemLine(item, identity));
-  for (const item of snapshot.subagents) lines.push(itemLine(item, identity));
+  for (const item of snapshot.tools) lines.push(itemLine(item, identity, bulletItems));
+  for (const item of snapshot.subagents) lines.push(itemLine(item, identity, bulletItems));
   return lines.join("\n");
+}
+
+/** Telegram status with guaranteed per-item lines (`- ` bullets). */
+export function statusMarkdownList(snapshot: StatusSnapshot): string {
+  return statusMarkdown(snapshot, true);
 }
 
 /** Classic Telegram `parse_mode: "HTML"` variant of the same block. */
 export function statusHtml(snapshot: StatusSnapshot): string {
   const lines = [`🟢 <b>${escapeHtml(statusLabel(snapshot.model))}</b> · ${escapeHtml(snapshot.phase)} ${snapshot.elapsed}`];
-  for (const item of snapshot.tools) lines.push(itemLine(item, escapeHtml));
-  for (const item of snapshot.subagents) lines.push(itemLine(item, escapeHtml));
+  for (const item of snapshot.tools) lines.push(itemLine(item, escapeHtml, true));
+  for (const item of snapshot.subagents) lines.push(itemLine(item, escapeHtml, true));
   return lines.join("\n");
 }
 
