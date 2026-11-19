@@ -170,6 +170,7 @@ export class Bridge {
 
     this.bot.on("message:text", (ctx) => this.onText(ctx));
     this.bot.on(["message:photo", "message:document", "message:voice", "message:audio"], (ctx) => this.onMedia(ctx));
+    this.bot.on("message:forum_topic_created", (ctx) => this.onTopicCreated(ctx));
     this.bot.on("message:forum_topic_edited", (ctx) => this.onTopicRenamed(ctx));
     this.bot.on("message", (ctx) => this.onNonText(ctx));
     this.bot.on("callback_query:data", (ctx) => this.onCallback(ctx));
@@ -471,6 +472,36 @@ export class Bridge {
     }
   }
 
+  private async onTopicCreated(ctx: Context): Promise<void> {
+    const message = ctx.message as
+      | { message_thread_id?: number; forum_topic_created?: { name?: string } }
+      | undefined;
+    const threadId = message?.message_thread_id;
+    if (!threadId) return;
+    // The topic already owns a session (e.g. created by /topic): nothing to do.
+    if (this.store.byThread(threadId)) return;
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+    const name = message?.forum_topic_created?.name?.trim() || "Тема";
+    try {
+      const session = await this.oc.createSession({ title: name, directory: this.cfg.defaultDirectory });
+      this.store.bindThread(threadId, session.id);
+      this.store.upsert({ id: session.id, title: session.title, chatId, threadId });
+      const markdown = `> 🆕 Сессия создана\n>\n> ${name}`;
+      try {
+        await this.bot.api.sendRichMessage(chatId, { markdown }, { message_thread_id: threadId });
+      } catch (error) {
+        log.warn("rich topic greeting failed:", (error as Error).message);
+        await this.bot.api
+          .sendMessage(chatId, `🆕 Сессия создана\n\n${name}`, { message_thread_id: threadId })
+          .catch(() => undefined);
+      }
+      log.info(`topic ${threadId} → new session ${session.id.slice(0, 16)}`);
+    } catch (error) {
+      log.warn("topic session creation failed:", (error as Error).message);
+    }
+  }
+
   private async onTopicRenamed(ctx: Context): Promise<void> {
     const message = ctx.message as
       | { message_thread_id?: number; forum_topic_edited?: { name?: string } }
@@ -510,7 +541,22 @@ export class Bridge {
         const result = await transcribeAudio(buffer, "ogg");
         if (result.ok) {
           log.info(`voice → ${result.text.slice(0, 60)} (${result.elapsedMs} ms)`);
-          await ctx.reply(`🎤 ${result.text}\n⏱ ${(result.elapsedMs / 1000).toFixed(1)} с`).catch(() => undefined);
+          const seconds = (result.elapsedMs / 1000).toFixed(1);
+          const quoted = result.text
+            .split("\n")
+            .map((line) => `> ${line}`)
+            .join("\n");
+          const markdown = `> 💠 **Расшифровка · голос**\n>\n${quoted}\n>\n> ⏱ ${seconds} с`;
+          const chatId = ctx.chat?.id;
+          const threadId = (ctx.message as { message_thread_id?: number } | undefined)?.message_thread_id;
+          const options = threadId ? { message_thread_id: threadId } : {};
+          try {
+            if (!chatId) throw new Error("no chat id");
+            await this.bot.api.sendRichMessage(chatId, { markdown }, options);
+          } catch (error) {
+            log.warn("rich transcript failed, falling back to plain:", (error as Error).message);
+            await ctx.reply(`💠 Расшифровка · голос\n\n${result.text}\n\n⏱ ${seconds} с`).catch(() => undefined);
+          }
           await this.submitTask(ctx, result.text);
           return;
         }
