@@ -1,5 +1,50 @@
 import type { OcClient } from "../opencode/client.ts";
 
+interface ModelRef {
+  providerID?: string;
+  id?: string;
+}
+
+let namesCache: Map<string, string> | undefined;
+let namesAt = 0;
+
+/**
+ * Human model name from OpenCode `/api/model`; provider/id when unknown.
+ * Same mapping as the Telegram adapter (`listModels` → `providerID/id`).
+ */
+export async function modelLabel(oc: OcClient, sessionID: string): Promise<string> {
+  try {
+    const session = await oc.getSession(sessionID);
+    return await labelFor(oc, session.model);
+  } catch {
+    return "OpenCode";
+  }
+}
+
+async function labelFor(oc: OcClient, model: ModelRef | undefined): Promise<string> {
+  if (!model?.providerID || !model.id) return "OpenCode";
+  const names = await modelNames(oc);
+  return names.get(`${model.providerID}/${model.id}`) ?? `${model.providerID}/${model.id}`;
+}
+
+/** `/api/model` names, cached for five minutes. Copied from Telegram (no cross-import). */
+async function modelNames(oc: OcClient): Promise<Map<string, string>> {
+  if (namesCache && Date.now() - namesAt < 5 * 60 * 1000) return namesCache;
+  namesAt = Date.now();
+  const map = new Map<string, string>();
+  try {
+    for (const model of await oc.listModels()) {
+      if (!model.name) continue;
+      map.set(`${model.providerID}/${model.id}`, model.name);
+      if (model.modelID) map.set(`${model.providerID}/${model.modelID}`, model.name);
+    }
+  } catch {
+    /* names are cosmetic: fall back to provider/id */
+  }
+  namesCache = map;
+  return map;
+}
+
 /**
  * Mirrors OpenCode's `SessionTurn.duration` / `SessionTurn.tokensPerSecond`:
  * duration is prompt creation → this message completed, and tok/s aggregates
@@ -12,7 +57,7 @@ export async function turnStats(
   oc: OcClient,
   sessionID: string,
   elapsedMs?: number,
-): Promise<{ duration?: number; tps?: number; contextTokens?: number }> {
+): Promise<{ duration?: number; tps?: number; contextTokens?: number; model?: string }> {
   try {
     const fetched = await oc.messages(sessionID, { limit: 60, order: "desc" });
     // The API returns newest-first; OpenCode's turn logic walks the timeline oldest-first.
@@ -25,10 +70,12 @@ export async function turnStats(
       }
     }
     const last = messages[end];
-    if (!last) return { duration: elapsedMs };
+    if (!last) return { duration: elapsedMs, model: await modelLabel(oc, sessionID) };
     const tokens = last.tokens as
       | { output?: number; reasoning?: number; input?: number; cache?: { read?: number } }
       | undefined;
+    // The model of the last assistant message is the one that actually answered.
+    const model = await labelFor(oc, (last as { model?: ModelRef }).model);
 
     // Turn boundary: the prompt after the previous idle marker, or the nearest prompt in legacy sessions.
     const legacy = !messages.some((message) => message.type === "idle");
@@ -66,8 +113,8 @@ export async function turnStats(
     }, 0);
     const tps = output > 0 && generated > 200 ? output / (generated / 1000) : undefined;
 
-    return { duration, tps, contextTokens };
+    return { duration, tps, contextTokens, model };
   } catch {
-    return { duration: elapsedMs };
+    return { duration: elapsedMs, model: await modelLabel(oc, sessionID) };
   }
 }

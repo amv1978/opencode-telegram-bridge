@@ -52,6 +52,41 @@ export function quoteLines(text: string): string {
     .join("\n");
 }
 
+/** Drops existing Markdown quote markers so text is never quoted twice (`> > `). */
+export function stripQuote(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.replace(/^\s*>\s?/, ""))
+    .join("\n");
+}
+
+/**
+ * Builds one Discord blockquote: `> header`, a bare `>` spacer, every body line
+ * as `> line`, then optional `> footer` lines. Existing `>` prefixes in the body
+ * are stripped first, so the result never contains `> >`.
+ */
+export function quoteBlock(header: string, body: string, footer?: string): string {
+  const lines = [`> ${stripQuote(header)}`, ">"];
+  for (const line of stripQuote(body).split("\n")) {
+    lines.push(line.trim() ? `> ${line}` : ">");
+  }
+  if (footer) {
+    for (const line of footer.split("\n")) lines.push(line.trim() ? `> ${line}` : ">");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Discord italics are `_text_`; underscores/asterisks/backticks inside the text
+ * break the markup, so such a line falls back to plain text.
+ */
+export function italicLine(text: string): string {
+  const value = text.replace(/\s+/g, " ").trim();
+  if (!value) return "";
+  if (/[*_~`\\]/.test(value)) return value;
+  return `_${value}_`;
+}
+
 export function formatTokens(count: number): string {
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
   if (count >= 1_000) return `${Math.round(count / 1_000)}k`;

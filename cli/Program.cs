@@ -7,7 +7,7 @@ namespace OcbridgeCli;
 
 internal static class Program
 {
-    public const string Version = "0.3.0";
+    public const string Version = "0.3.1";
     public const string DefaultUrl = "http://127.0.0.1:7788";
 
     public static readonly JsonSerializerOptions PrettyJson = new()

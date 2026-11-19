@@ -19,8 +19,8 @@ import type { OcClient, OcEvent, OcSession } from "../opencode/client.ts";
 import type { Store } from "../state/store.ts";
 import { transcribeAudio } from "../audio/transcribe.ts";
 import { registerCommands } from "./commands.ts";
-import { DISCORD_CHUNK, chunkText, quoteLines, threadName, titleFromText, formatDuration, formatTokens } from "./render.ts";
-import { turnStats } from "./stats.ts";
+import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFromText, formatDuration, formatTokens } from "./render.ts";
+import { modelLabel, turnStats } from "./stats.ts";
 import { DiscordStreamer, resolveSendable } from "./stream.ts";
 
 const EVENT_TYPES = [
@@ -28,6 +28,8 @@ const EVENT_TYPES = [
   "session.text.delta",
   "session.text.ended",
   "session.tool.called",
+  "session.tool.success",
+  "session.tool.failed",
   "session.execution.started",
   "session.execution.succeeded",
   "session.execution.failed",
@@ -256,7 +258,10 @@ export class DiscordBridge {
           }
           log.info(`discord voice → ${result.text.slice(0, 60)} (${result.elapsedMs} ms)`);
           const seconds = (result.elapsedMs / 1000).toFixed(1);
-          await this.send(destination, `> 💠 **Расшифровка · голос**\n>\n${quoteLines(result.text)}\n>\n> ⏱ ${seconds} с`);
+          await this.send(
+            destination,
+            quoteBlock("💠 **Расшифровка · голос**", result.text, `⏱ ${seconds} с`),
+          );
           promptText = result.text + (promptText ? `\n\n${promptText}` : "");
         } catch (error) {
           await this.send(destination, `🎤 Ошибка обработки аудио: ${(error as Error).message.slice(0, 160)}`);
@@ -269,7 +274,7 @@ export class DiscordBridge {
     if (!promptText) return;
     if (promptText.length > DISCORD_CHUNK * 8) promptText = promptText.slice(0, DISCORD_CHUNK * 8);
 
-    await this.streamer?.begin(sessionID, destination);
+    await this.streamer?.begin(sessionID, destination, await modelLabel(this.oc, sessionID));
     log.info(`discord prompt → ${sessionID.slice(0, 16)}: ${promptText.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
       await this.oc.prompt(sessionID, promptText, { source: "discord" }, files.length ? files : undefined);
@@ -553,7 +558,11 @@ export class DiscordBridge {
       case "session.inbox.enqueued":
         await this.mirrorUserMessage(sessionID, event.data.item);
         break;
-      case "session.execution.started":
+      case "session.execution.started": {
+        await this.ensureStream(sessionID);
+        this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
+        break;
+      }
       case "session.text.started":
         await this.ensureStream(sessionID);
         break;
@@ -567,9 +576,17 @@ export class DiscordBridge {
         if (text) this.streamer?.setText(sessionID, text);
         break;
       }
-      case "session.tool.called":
-        this.streamer?.tool(sessionID, `🔧 ${String(event.data.name ?? "tool")}`);
+      case "session.tool.called": {
+        const callID = String(event.data.id ?? event.data.callID ?? "");
+        this.streamer?.toolCalled(sessionID, callID, String(event.data.name ?? "tool"), event.data.input);
         break;
+      }
+      case "session.tool.success":
+      case "session.tool.failed": {
+        const callID = String(event.data.id ?? event.data.callID ?? "");
+        this.streamer?.toolFinished(sessionID, callID, event.type === "session.tool.success");
+        break;
+      }
       case "session.execution.succeeded":
       case "session.execution.failed":
       case "session.execution.interrupted": {
@@ -581,13 +598,16 @@ export class DiscordBridge {
             : event.type === "session.execution.failed"
               ? "⚠️ ошибка"
               : "";
-        const stats = status ? { duration: elapsed, tps: undefined } : await turnStats(this.oc, sessionID, elapsed);
-        const parts: string[] = [];
+        const stats = status
+          ? { duration: elapsed, tps: undefined, contextTokens: undefined, model: await modelLabel(this.oc, sessionID) }
+          : await turnStats(this.oc, sessionID, elapsed);
+        // One italic line: model · duration · tok/s · context.
+        const parts: string[] = [stats.model || this.streamer.modelOf(sessionID)];
         if (status) parts.push(status);
         if (stats.duration) parts.push(`⏱ ${formatDuration(stats.duration)}`);
         if (stats.tps) parts.push(`⚡ ${stats.tps.toFixed(1)} tok/s`);
         if (stats.contextTokens) parts.push(`🧠 ${formatTokens(stats.contextTokens)}`);
-        await this.streamer.end(sessionID, parts.join("\n") || undefined);
+        await this.streamer.end(sessionID, italicLine(parts.join(" · ")) || undefined);
         log.info(`discord turn ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)}`);
         break;
       }
@@ -619,7 +639,7 @@ export class DiscordBridge {
     if (await this.isSubagent(sessionID)) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
-    await this.streamer?.begin(sessionID, target);
+    await this.streamer?.begin(sessionID, target, await modelLabel(this.oc, sessionID));
     log.info(`discord attached to running session ${sessionID.slice(0, 16)}`);
   }
 
@@ -632,7 +652,7 @@ export class DiscordBridge {
     if (!text) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
-    await this.send(target, `> 👤 **Вы** · OpenCode\n>\n${quoteLines(text)}`);
+    await this.send(target, quoteBlock("👤 **Вы** · OpenCode", text));
     log.info(`discord mirror user → ${sessionID.slice(0, 16)}`);
   }
 
