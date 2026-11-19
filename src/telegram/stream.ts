@@ -1,5 +1,6 @@
 import { GrammyError, type Api } from "grammy";
 import { log } from "../log.ts";
+import { statusHtml, statusMarkdown, type StatusItem } from "../status.ts";
 import { markdownToHtml, splitHtml, splitMarkdown, stripHtml } from "./render.ts";
 
 export interface Target {
@@ -46,6 +47,12 @@ interface State {
   timer?: ReturnType<typeof setTimeout>;
   typing?: ReturnType<typeof setInterval>;
   spinner?: ReturnType<typeof setInterval>;
+  /** Independent ticker: elapsed time changes even without new events. */
+  ticker?: ReturnType<typeof setInterval>;
+  finalizeTimer?: ReturnType<typeof setTimeout>;
+  /** Parent turn ended but children are still running: keep the block alive. */
+  awaiting: boolean;
+  footer?: string;
   frame: number;
   model: string;
   startedAt: number;
@@ -95,6 +102,7 @@ export class Streamer {
       tools: [],
       subagents: [],
       messageIds: [],
+      awaiting: false,
       frame: 0,
       model: model || this.models.get(sessionID) || "OpenCode",
       startedAt: Date.now(),
@@ -118,6 +126,14 @@ export class Streamer {
       this.schedule(state, STATUS_TICK_MS);
     }, STATUS_TICK_MS);
     state.spinner.unref?.();
+    // Independent of spinner/text deltas: keeps `🧩 … · 12s` and `🛠 … · 3s`
+    // moving while anything is active, including after the parent turn ended.
+    state.ticker = setInterval(() => {
+      if (!state.finished || state.awaiting) {
+        if (hasLiveLines(state)) this.schedule(state, STATUS_TICK_MS);
+      }
+    }, STATUS_TICK_MS);
+    state.ticker.unref?.();
   }
 
   append(sessionID: string, delta: string): void {
@@ -175,6 +191,10 @@ export class Streamer {
   subagentStarted(sessionID: string, label: string): void {
     const state = this.states.get(sessionID);
     if (!state) return;
+    if (state.finalizeTimer) {
+      clearTimeout(state.finalizeTimer);
+      state.finalizeTimer = undefined;
+    }
     const value = label || "subagent";
     const existing = state.subagents.find((entry) => entry.label === value);
     if (existing) {
@@ -186,6 +206,7 @@ export class Streamer {
       state.subagents.push({ label: value, startedAt: Date.now(), state: "running", count: 1 });
       if (state.subagents.length > 24) state.subagents.shift();
     }
+    if (state.finished) state.awaiting = true;
     this.schedule(state, STATUS_TICK_MS);
   }
 
@@ -198,8 +219,13 @@ export class Streamer {
     entry.state = ok ? "ok" : "fail";
     entry.finishedAt = Date.now();
     this.schedule(state, STATUS_TICK_MS);
+    if (state.awaiting && !hasActiveSubagents(state)) this.scheduleFinalize(state);
   }
 
+  /**
+   * Parent turn ended. If children are still running the block stays alive
+   * (footer included) until the last child finishes and its line fades.
+   */
   async end(sessionID: string, footer?: string): Promise<void> {
     const state = this.states.get(sessionID);
     if (!state) return;
@@ -208,10 +234,37 @@ export class Streamer {
     if (state.typing) clearInterval(state.typing);
     if (state.spinner) clearInterval(state.spinner);
 
+    if (hasActiveSubagents(state)) {
+      state.awaiting = true;
+      state.footer = footer;
+      log.info(`turn ended with active subagents ${sessionID.slice(0, 16)}; keeping live block`);
+      await this.flush(sessionID, state, footer).catch((error) =>
+        log.warn("subagent tail flush failed:", (error as Error).message),
+      );
+      return;
+    }
+
+    await this.finalize(sessionID, state, footer);
+  }
+
+  /** Delivers the final message once and removes the state. */
+  private async finalize(sessionID: string, state: State, footer?: string): Promise<void> {
+    if (this.states.get(sessionID) !== state) return;
+    if (state.finalizeTimer) {
+      clearTimeout(state.finalizeTimer);
+      state.finalizeTimer = undefined;
+    }
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = undefined;
+    }
+    if (state.ticker) clearInterval(state.ticker);
+
+    const text = footer ?? state.footer;
     let delivered = false;
     for (let attempt = 0; attempt < 3 && !delivered; attempt += 1) {
       try {
-        await this.flush(sessionID, state, footer);
+        await this.flush(sessionID, state, text);
         delivered = true;
       } catch (error) {
         const wait = attempt === 0 ? 2000 : attempt === 1 ? 5000 : 10000;
@@ -223,15 +276,28 @@ export class Streamer {
     if (!delivered) {
       // Last resort: send the answer as a brand-new message.
       try {
-        const text = this.composeMarkdown(state, footer);
-        if (this.rich) await this.api.sendRichMessage(state.target.chatId, { markdown: text }, this.threadOptions(state));
-        else await this.api.sendMessage(state.target.chatId, markdownToHtml(text), { parse_mode: "HTML", ...this.threadOptions(state) });
+        const markdown = this.composeMarkdown(state, text);
+        if (this.rich) await this.api.sendRichMessage(state.target.chatId, { markdown }, this.threadOptions(state));
+        else await this.api.sendMessage(state.target.chatId, markdownToHtml(markdown), { parse_mode: "HTML", ...this.threadOptions(state) });
         log.info(`final delivery recovered as a new message for ${sessionID.slice(0, 16)}`);
       } catch (error) {
         log.error(`final delivery lost for ${sessionID.slice(0, 16)}: ${(error as Error).message}`);
       }
     }
     this.states.delete(sessionID);
+  }
+
+  /** Keeps the finished child line visible for the TTL, then finalizes. */
+  private scheduleFinalize(state: State): void {
+    if (state.finalizeTimer) return;
+    state.finalizeTimer = setTimeout(() => {
+      state.finalizeTimer = undefined;
+      if (hasActiveSubagents(state)) return;
+      void this.finalize(state.sessionID, state).catch((error) =>
+        log.warn("subagent finalize failed:", (error as Error).message),
+      );
+    }, TOOL_TTL_MS);
+    state.finalizeTimer.unref?.();
   }
 
   private schedule(state: State, overrideInterval?: number): void {
@@ -247,49 +313,60 @@ export class Streamer {
 
   private composeMarkdown(state: State, footer?: string): string {
     const parts: string[] = [];
-    const status = state.finished ? "" : this.statusBlock(state);
+    const status = state.finished && !state.awaiting ? "" : this.statusBlock(state);
     if (status) parts.push(status);
     if (state.text.trim()) parts.push(state.text.trim());
-    if (footer) parts.push(`_${footer}_`);
+    const line = footer ?? state.footer;
+    if (line) parts.push(`_${line}_`);
     return parts.join("\n\n") || PLACEHOLDER;
   }
 
   private composeHtml(state: State, footer?: string): string {
     const parts: string[] = [];
-    const status = state.finished ? "" : this.statusBlock(state);
+    const status = state.finished && !state.awaiting ? "" : this.statusBlock(state, true);
     if (status) parts.push(status);
     if (state.text.trim()) parts.push(markdownToHtml(state.text));
-    if (footer) parts.push(`<i>${footer}</i>`);
+    const line = footer ?? state.footer;
+    if (line) parts.push(`<i>${line}</i>`);
     return parts.join("\n\n") || PLACEHOLDER;
   }
 
-  /** Variant B status block: model + elapsed, two recent tools, two subagents. */
-  private statusBlock(state: State): string {
-    const frame = SPINNER[state.frame % SPINNER.length] ?? "⠋";
-    const elapsed = formatElapsed(Date.now() - state.startedAt);
-    const lines = [`${frame} ${state.model} · thinking… ${elapsed}`];
+  /** Three physical lines: model, tools, subagents. Bold only the model. */
+  private statusBlock(state: State, html = false): string {
+    const now = Date.now();
+    const elapsed = formatElapsed(now - state.startedAt);
+    const tools: StatusItem[] = [];
     if (this.options.showTools !== "off") {
-      const now = Date.now();
-      const visible = state.tools
-        .filter((tool) => tool.state === "running" || !tool.finishedAt || now - tool.finishedAt <= TOOL_TTL_MS)
-        .slice(-MAX_STATUS_TOOLS);
-      for (const tool of visible) {
-        const mark = tool.state === "ok" ? " ✓" : tool.state === "fail" ? " ✗" : "";
-        const count = tool.count > 1 ? ` ×${tool.count}` : "";
-        const duration = formatElapsed((tool.finishedAt ?? now) - tool.startedAt);
-        lines.push(`${tool.icon} ${tool.label}${count} · ${duration}${mark}`);
+      for (const tool of state.tools
+        .filter((item) => item.state === "running" || (item.finishedAt !== undefined && now - item.finishedAt <= TOOL_TTL_MS))
+        .slice(-MAX_STATUS_TOOLS)) {
+        tools.push({
+          icon: tool.icon,
+          label: tool.label,
+          count: tool.count,
+          duration: formatElapsed((tool.finishedAt ?? now) - tool.startedAt),
+          mark: tool.state === "ok" ? "✓" : tool.state === "fail" ? "✗" : "",
+        });
       }
     }
-    const now = Date.now();
-    const subagents = state.subagents
-      .filter((entry) => entry.state === "running" || !entry.finishedAt || now - entry.finishedAt <= TOOL_TTL_MS)
-      .slice(-MAX_STATUS_SUBAGENTS);
-    for (const sub of subagents) {
-      const mark = sub.state === "ok" ? " ✓" : sub.state === "fail" ? " ✗" : "";
-      const count = sub.count > 1 ? ` ×${sub.count}` : "";
-      lines.push(`🧩 ${sub.label}${count} · ${formatSubagentElapsed((sub.finishedAt ?? now) - sub.startedAt)}${mark}`);
-    }
-    return lines.join("\n");
+    const subagents: StatusItem[] = state.subagents
+      .filter((entry) => entry.state === "running" || (entry.finishedAt !== undefined && now - entry.finishedAt <= TOOL_TTL_MS))
+      .slice(-MAX_STATUS_SUBAGENTS)
+      .map((entry) => ({
+        icon: "🧩",
+        label: entry.label,
+        count: entry.count,
+        duration: formatSubagentElapsed((entry.finishedAt ?? now) - entry.startedAt),
+        mark: entry.state === "ok" ? "✓" : entry.state === "fail" ? "✗" : "",
+      }));
+    const snapshot = {
+      model: state.model,
+      phase: state.awaiting ? "subagents…" : "thinking…",
+      elapsed,
+      tools,
+      subagents,
+    };
+    return html ? statusHtml(snapshot) : statusMarkdown(snapshot);
   }
 
   private async flush(sessionID: string, state: State, footer?: string): Promise<void> {
@@ -453,6 +530,19 @@ function formatSubagentElapsed(ms: number): string {
   const minutes = Math.floor(total / 60);
   const seconds = total % 60;
   return seconds ? `${minutes}m ${String(seconds).padStart(2, "0")}s` : `${minutes}m`;
+}
+
+/** At least one child is running (not counting the fade-out window). */
+function hasActiveSubagents(state: { subagents: SubagentState[] }): boolean {
+  return state.subagents.some((entry) => entry.state === "running");
+}
+
+/** Anything whose elapsed label must keep ticking. */
+function hasLiveLines(state: { tools: ToolState[]; subagents: SubagentState[] }): boolean {
+  return (
+    state.subagents.some((entry) => entry.state === "running") ||
+    state.tools.some((entry) => entry.state === "running")
+  );
 }
 
 function toolPresentation(name: string, input: unknown): { icon: string; label: string } {
