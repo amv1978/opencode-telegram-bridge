@@ -75,14 +75,14 @@ winget install JRSoftware.InnoSetup
 |---|---|
 | `package.json` | `"version"` |
 | `desktop/package.json` | `"version"` |
-| `installer/ocbridge.iss` | `#define AppVersion "0.2.0"` |
+| `installer/ocbridge.iss` | `#define AppVersion "0.3.0"` |
 | `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` |
 
 Дополнительно: `cli/Program.cs`, константа `Program.Version` — её печатает
 `ocbridge-cli version`; держите равной версии csproj. Версия API берётся из
 `package.json` автоматически.
 
-Имя установщика формируется из `AppVersion`: `ocbridge-setup-0.2.0.exe`.
+Имя установщика формируется из `AppVersion`: `ocbridge-setup-0.3.0.exe`.
 После смены версии пересоберите **все** артефакты — старый exe внутри нового
 установщика иначе покажет прежнюю версию.
 
@@ -93,7 +93,7 @@ winget install JRSoftware.InnoSetup
 3. Пересобрать демон, CLI, оболочку, установщик.
 4. Запустить установщик на чистой машине: окно, трей, `/start`, тема, голос.
 5. Проверить, что в git нет `config.json`, `state.json`, `*.log`, `dist/`, `*.exe`.
-6. Тег `v0.2.0`, к релизу приложить `ocbridge-setup-0.2.0.exe` и исходники.
+6. Тег `v0.3.0`, к релизу приложить `ocbridge-setup-0.3.0.exe` и исходники.
 
 ## Подпись кода
 

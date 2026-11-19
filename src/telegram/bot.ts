@@ -13,6 +13,8 @@ const EVENT_TYPES = [
   "session.text.delta",
   "session.text.ended",
   "session.tool.called",
+  "session.tool.success",
+  "session.tool.failed",
   "session.execution.started",
   "session.execution.succeeded",
   "session.execution.failed",
@@ -35,6 +37,8 @@ export class Bridge {
   private readonly streamer: Streamer;
   private readonly pending = new Map<string, PendingPermission>();
   private readonly sessionCache = new Map<string, { parentID?: string | null; title?: string }>();
+  private modelNamesCache?: Map<string, string>;
+  private modelNamesAt = 0;
   private readonly recentMirrors = new Map<string, { text: string; at: number }[]>();
   private readonly appliedTitles = new Map<string, string>();
   private readonly fetchImpl: typeof fetch;
@@ -440,7 +444,7 @@ export class Bridge {
         this.store.bindThread(topic.message_thread_id, session.id);
         this.store.upsert({ id: session.id, title: session.title, chatId, threadId: topic.message_thread_id });
         const target = { chatId, threadId: topic.message_thread_id };
-        await this.streamer.begin(session.id, target);
+        await this.streamer.begin(session.id, target, await this.modelLabel(session.id));
         await this.oc.prompt(session.id, text, { source: "telegram" }, files);
         log.info(`auto-topic ${topic.message_thread_id} → ${session.id.slice(0, 16)}`);
         return;
@@ -463,7 +467,7 @@ export class Bridge {
       await ctx.reply("Не понимаю, куда отвечать. Настройте topicsChatId или пишите боту в личку.");
       return;
     }
-    await this.streamer.begin(sessionID, target);
+    await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
     log.info(`prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
       await this.oc.prompt(sessionID, text, { source: "telegram" }, files);
@@ -716,7 +720,14 @@ export class Bridge {
         break;
       }
       case "session.tool.called": {
-        this.streamer.tool(sessionID, `🔧 ${String(event.data.name ?? "tool")}`);
+        const callID = String(event.data.id ?? event.data.callID ?? "");
+        this.streamer.toolCalled(sessionID, callID, String(event.data.name ?? "tool"), event.data.input);
+        break;
+      }
+      case "session.tool.success":
+      case "session.tool.failed": {
+        const callID = String(event.data.id ?? event.data.callID ?? "");
+        this.streamer.toolFinished(sessionID, callID, event.type === "session.tool.success");
         break;
       }
       case "session.execution.succeeded":
@@ -731,12 +742,14 @@ export class Bridge {
               ? "⚠️ ошибка"
               : "";
         const stats = status ? { duration: elapsed, tps: undefined } : await this.turnStats(sessionID, elapsed);
-        const parts: string[] = [];
+        const resolved = await this.modelLabel(sessionID);
+        const model = resolved === "OpenCode" ? this.streamer.modelOf(sessionID) : resolved;
+        const parts: string[] = [model];
         if (status) parts.push(status);
         if (stats.duration) parts.push(`⏱ ${formatDuration(stats.duration)}`);
         if (stats.tps) parts.push(`⚡ ${stats.tps.toFixed(1)} tok/s`);
         if (stats.contextTokens) parts.push(`🧠 ${formatTokens(stats.contextTokens)}`);
-        await this.streamer.end(sessionID, parts.join("\n") || undefined);
+        await this.streamer.end(sessionID, parts.join(" · "));
         log.info(`turn ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)}`);
         break;
       }
@@ -769,7 +782,7 @@ export class Bridge {
     if (await this.isSubagent(sessionID)) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
-    await this.streamer.begin(sessionID, target);
+    await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
     log.info(`attached to running session ${sessionID.slice(0, 16)}`);
   }
 
@@ -788,6 +801,36 @@ export class Bridge {
 
   private async isSubagent(sessionID: string): Promise<boolean> {
     return Boolean((await this.sessionMeta(sessionID)).parentID);
+  }
+
+  /** Human model name from `/api/model`; provider/id when the name is unknown. */
+  private async modelLabel(sessionID: string): Promise<string> {
+    try {
+      const session = await this.oc.getSession(sessionID);
+      const model = session.model;
+      if (!model?.providerID || !model?.id) return "OpenCode";
+      const names = await this.modelNames();
+      return names.get(`${model.providerID}/${model.id}`) ?? `${model.providerID}/${model.id}`;
+    } catch {
+      return "OpenCode";
+    }
+  }
+
+  private async modelNames(): Promise<Map<string, string>> {
+    if (this.modelNamesCache && Date.now() - this.modelNamesAt < 5 * 60 * 1000) return this.modelNamesCache;
+    this.modelNamesAt = Date.now();
+    const map = new Map<string, string>();
+    try {
+      for (const model of await this.oc.listModels()) {
+        if (!model.name) continue;
+        map.set(`${model.providerID}/${model.id}`, model.name);
+        if (model.modelID) map.set(`${model.providerID}/${model.modelID}`, model.name);
+      }
+    } catch (error) {
+      log.warn("model list unavailable:", (error as Error).message);
+    }
+    this.modelNamesCache = map;
+    return map;
   }
 
   /** Guards against feeding a message the bridge itself posted back into the model. */

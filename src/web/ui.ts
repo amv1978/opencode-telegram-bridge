@@ -85,6 +85,7 @@ export const PAGE = /* html */ `<!doctype html>
     <div class="kv">
       <span data-i18n="status.telegram">Telegram</span><span id="tg">—</span>
       <span data-i18n="status.opencode">OpenCode</span><span id="oc">—</span>
+      <span data-i18n="status.discord">Discord</span><span id="dc">—</span>
       <span data-i18n="status.network">Сеть Telegram</span><span id="net">—</span>
       <span data-i18n="status.uptime">Аптайм</span><span id="uptime">—</span>
     </div>
@@ -178,6 +179,29 @@ export const PAGE = /* html */ `<!doctype html>
           </label>
         </div>
       </div>
+      <div class="divider"></div>
+      <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 14px">Discord</h3>
+      <div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(190px, 1fr))">
+        <div>
+          <label style="display:flex;gap:8px;align-items:center;margin-top:24px;color:var(--fg)">
+            <input type="checkbox" id="dcEnabled" style="width:16px;height:16px" />
+            <span data-i18n="cfg.discord.enabled">Включить Discord</span>
+          </label>
+        </div>
+        <div>
+          <label data-i18n="cfg.discord.token">Токен бота Discord</label>
+          <input id="dcToken" type="password" placeholder="оставьте пустым, чтобы не менять" autocomplete="off" />
+        </div>
+        <div>
+          <label data-i18n="cfg.discord.guilds">ID серверов (через запятую)</label>
+          <input id="dcGuilds" type="text" placeholder="123456789012345678, …" />
+        </div>
+        <div>
+          <label data-i18n="cfg.discord.users">ID пользователей (через запятую)</label>
+          <input id="dcUsers" type="text" placeholder="123456789012345678" />
+        </div>
+      </div>
+      <div class="hint" data-i18n="cfg.discord.hint">Публичные треды, одна сессия на тред. Пустой список серверов или пользователей = доступа нет. MESSAGE_CONTENT включается в Discord Developer Portal.</div>
       <details>
         <summary data-i18n="cfg.network">Сеть (прокси / IP)</summary>
         <div class="grid" style="margin-top:10px">
@@ -233,6 +257,8 @@ const I18N = {
     "status.title": "Состояние",
     "status.telegram": "Telegram",
     "status.opencode": "OpenCode",
+    "status.discord": "Discord",
+    "status.off": "выключен",
     "status.network": "Сеть Telegram",
     "status.uptime": "Аптайм",
     "status.autostart": "автозапуск",
@@ -265,6 +291,11 @@ const I18N = {
     "cfg.tools": "Инструменты в чате",
     "cfg.format": "Формат ответов",
     "cfg.autoTopics": "Тема на каждую задачу из общего чата",
+    "cfg.discord.enabled": "Включить Discord",
+    "cfg.discord.token": "Токен бота Discord",
+    "cfg.discord.guilds": "ID серверов (через запятую)",
+    "cfg.discord.users": "ID пользователей (через запятую)",
+    "cfg.discord.hint": "Публичные треды, одна сессия на тред. Пустой список серверов или пользователей = доступа нет. MESSAGE_CONTENT включается в Discord Developer Portal.",
     "cfg.network": "Сеть (прокси / IP)",
     "cfg.proxy": "Прокси",
     "cfg.apiIp": "IP Bot API",
@@ -295,6 +326,8 @@ const I18N = {
     "status.title": "Status",
     "status.telegram": "Telegram",
     "status.opencode": "OpenCode",
+    "status.discord": "Discord",
+    "status.off": "off",
     "status.network": "Telegram network",
     "status.uptime": "Uptime",
     "status.autostart": "autostart",
@@ -327,6 +360,11 @@ const I18N = {
     "cfg.tools": "Tools in chat",
     "cfg.format": "Reply format",
     "cfg.autoTopics": "Topic per task from the general chat",
+    "cfg.discord.enabled": "Enable Discord",
+    "cfg.discord.token": "Discord bot token",
+    "cfg.discord.guilds": "Server IDs (comma separated)",
+    "cfg.discord.users": "User IDs (comma separated)",
+    "cfg.discord.hint": "Public threads, one session per thread. Empty server or user list = no access. MESSAGE_CONTENT must be enabled in the Discord Developer Portal.",
     "cfg.network": "Network (proxy / IP)",
     "cfg.proxy": "Proxy",
     "cfg.apiIp": "IP Bot API",
@@ -442,6 +480,10 @@ function fill(s) {
   else { ver.textContent = ""; ver.hidden = true; }
   $("tg").textContent = s.configured ? t("status.token") + " " + s.config.tokenTail : t("status.notConfigured");
   $("oc").textContent = s.ocVersion ? "v" + s.ocVersion + " · " + s.ocUrl : "—";
+  const dc = s.discord || {};
+  $("dc").textContent = dc.enabled
+    ? (dc.state || "off") + (dc.username ? " · @" + dc.username : "") + (dc.tokenTail ? " · " + dc.tokenTail : "")
+    : t("status.off");
   $("net").textContent = s.telegramMode || "—";
   $("uptime").textContent = s.startedAt ? Math.round((Date.now() - s.startedAt) / 1000) + " " + t("status.seconds") : "—";
   $("err").textContent = s.error || "";
@@ -467,6 +509,10 @@ function fill(s) {
     $("autoTopics").checked = s.config.autoTopics;
     $("proxy").value = s.config.proxy || "";
     $("apiIp").value = s.config.apiIp || "";
+    const dcfg = s.discord || {};
+    $("dcEnabled").checked = Boolean(dcfg.enabled);
+    $("dcGuilds").value = (dcfg.allowedGuilds || []).join(", ");
+    $("dcUsers").value = (dcfg.allowedUsers || []).join(", ");
   }
   $("autostart").checked = s.autostart;
   $("autostart").disabled = !s.autostartSupported;
@@ -519,10 +565,17 @@ $("form").addEventListener("submit", async (event) => {
     defaultDirectory: $("defaultDirectory").value,
     autoTopics: $("autoTopics").checked,
     stream: { editIntervalMs: Number($("editIntervalMs").value), showTools: $("showTools").value, format: $("format").value },
+    discord: {
+      enabled: $("dcEnabled").checked,
+      token: $("dcToken").value,
+      allowedGuilds: $("dcGuilds").value,
+      allowedUsers: $("dcUsers").value,
+    },
   };
   try {
     await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
     $("token").value = "";
+    $("dcToken").value = "";
     toast(t("toast.saved"), "ok");
     await refresh();
   } catch (e) {

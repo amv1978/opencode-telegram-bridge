@@ -8,29 +8,49 @@ export interface SessionRecord {
   threadId?: number;
 }
 
+export interface DiscordSessionRecord {
+  chatId?: string;
+  threadId?: string;
+  title?: string;
+}
+
 export interface State {
   /** forum thread id -> session id */
   topics: Record<string, string>;
   /** private chat id -> current session id */
   chats: Record<string, string>;
   sessions: Record<string, SessionRecord>;
+  /** Discord thread id -> session id */
+  discordThreads: Record<string, string>;
+  /** Discord channel id -> session id */
+  discordChannels: Record<string, string>;
+  discordSessions: Record<string, DiscordSessionRecord>;
 }
 
-const EMPTY: State = { topics: {}, chats: {}, sessions: {} };
+const emptyState = (): State => ({ topics: {}, chats: {}, sessions: {}, discordThreads: {}, discordChannels: {}, discordSessions: {} });
 
 export class Store {
   private data: State;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly file: string) {
-    this.data = { ...EMPTY };
+    this.data = emptyState();
     if (!existsSync(file)) return;
     try {
       const raw = readFileSync(file, "utf8").replace(/^\uFEFF/, "");
-      this.data = { ...EMPTY, ...(JSON.parse(raw) as Partial<State>) };
+      const parsed = JSON.parse(raw) as Partial<State>;
+      const base = emptyState();
+      this.data = {
+        ...base,
+        ...parsed,
+        // Older state.json has no Discord maps: default them to empty objects.
+        discordThreads: parsed.discordThreads ?? {},
+        discordChannels: parsed.discordChannels ?? {},
+        discordSessions: parsed.discordSessions ?? {},
+      };
     } catch {
       // Corrupted state must not prevent the bot from starting.
-      this.data = { ...EMPTY };
+      this.data = emptyState();
     }
   }
 
@@ -110,6 +130,84 @@ export class Store {
     }
     const rec = this.data.sessions[sessionID];
     if (rec?.chatId) return { chatId: rec.chatId, threadId: rec.threadId };
+    return {};
+  }
+
+  // --------------------------------------------------------------- discord
+
+  byDiscordThread(threadId: string): string | undefined {
+    return this.data.discordThreads[threadId];
+  }
+
+  byDiscordChannel(channelId: string): string | undefined {
+    return this.data.discordChannels[channelId];
+  }
+
+  bindDiscordThread(threadId: string, sessionID: string, chatId?: string): void {
+    // One session lives in exactly one Discord thread.
+    for (const [key, id] of Object.entries(this.data.discordThreads)) {
+      if (id === sessionID && key !== threadId) delete this.data.discordThreads[key];
+    }
+    for (const [key, id] of Object.entries(this.data.discordChannels)) {
+      if (id === sessionID) delete this.data.discordChannels[key];
+    }
+    this.data.discordThreads[threadId] = sessionID;
+    this.data.discordSessions[sessionID] = {
+      ...this.data.discordSessions[sessionID],
+      threadId,
+      ...(chatId ? { chatId } : {}),
+    };
+    this.save();
+  }
+
+  bindDiscordChannel(channelId: string, sessionID: string): void {
+    for (const [key, id] of Object.entries(this.data.discordChannels)) {
+      if (id === sessionID && key !== channelId) delete this.data.discordChannels[key];
+    }
+    for (const [key, id] of Object.entries(this.data.discordThreads)) {
+      if (id === sessionID) delete this.data.discordThreads[key];
+    }
+    this.data.discordChannels[channelId] = sessionID;
+    this.data.discordSessions[sessionID] = { ...this.data.discordSessions[sessionID], chatId: channelId };
+    this.save();
+  }
+
+  unbindDiscordThread(threadId: string): void {
+    delete this.data.discordThreads[threadId];
+    this.save();
+  }
+
+  unbindDiscordChannel(channelId: string): void {
+    delete this.data.discordChannels[channelId];
+    this.save();
+  }
+
+  clearDiscord(sessionID: string): void {
+    for (const [key, id] of Object.entries(this.data.discordThreads)) {
+      if (id === sessionID) delete this.data.discordThreads[key];
+    }
+    for (const [key, id] of Object.entries(this.data.discordChannels)) {
+      if (id === sessionID) delete this.data.discordChannels[key];
+    }
+    delete this.data.discordSessions[sessionID];
+    this.save();
+  }
+
+  setDiscordTitle(sessionID: string, title: string): void {
+    const record = this.data.discordSessions[sessionID];
+    if (record) record.title = title;
+    this.save();
+  }
+
+  locateDiscord(sessionID: string): { chatId?: string; threadId?: string } {
+    for (const [threadId, id] of Object.entries(this.data.discordThreads)) {
+      if (id === sessionID) return { threadId, chatId: this.data.discordSessions[sessionID]?.chatId };
+    }
+    for (const [channelId, id] of Object.entries(this.data.discordChannels)) {
+      if (id === sessionID) return { chatId: channelId };
+    }
+    const rec = this.data.discordSessions[sessionID];
+    if (rec) return { chatId: rec.chatId, threadId: rec.threadId };
     return {};
   }
 

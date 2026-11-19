@@ -1,4 +1,5 @@
 import { App, openBrowser } from "./app.ts";
+import { isDiscordConfigured } from "./config.ts";
 import { log } from "./log.ts";
 import { startServer } from "./web/server.ts";
 import pkg from "../package.json";
@@ -59,7 +60,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
-  if (app.cfg.telegram.token) {
+  if (app.cfg.telegram.token || isDiscordConfigured(app.cfg)) {
     await app.startBot().catch((error: Error) => log.error("autostart:", error.message));
     if (forceUi && !noBrowser) openBrowser(uiUrl);
   } else {

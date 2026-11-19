@@ -217,6 +217,15 @@ export class OcClient {
     return data.data;
   }
 
+  /** Configured models (provider/model + human display name) for status lines. */
+  async listModels(): Promise<Array<{ id: string; modelID?: string; providerID: string; name?: string }>> {
+    const data = await this.call<{ data: Array<{ id: string; modelID?: string; providerID: string; name?: string }> }>(
+      "GET",
+      "/api/model",
+    );
+    return data.data;
+  }
+
   /** Subscribes to the SSE event bus. Returns an abort function. */
   subscribe(types: string[], onEvent: (event: OcEvent) => void, onState?: (state: "open" | "closed") => void): () => void {
     const controller = new AbortController();

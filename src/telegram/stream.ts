@@ -16,25 +16,48 @@ export interface StreamerOptions {
   onThreadGone?: (sessionID: string) => void;
 }
 
+type ToolResult = "running" | "ok" | "fail";
+
+interface ToolState {
+  callID: string;
+  icon: string;
+  label: string;
+  startedAt: number;
+  state: ToolResult;
+  finishedAt?: number;
+  count: number;
+}
+
 interface State {
   sessionID: string;
   target: Target;
   text: string;
-  tools: string[];
+  tools: ToolState[];
   messageIds: number[];
   timer?: ReturnType<typeof setTimeout>;
   typing?: ReturnType<typeof setInterval>;
+  spinner?: ReturnType<typeof setInterval>;
+  frame: number;
+  model: string;
   startedAt: number;
   lastEditAt: number;
+  flushing: boolean;
   finished: boolean;
 }
 
 const PLACEHOLDER = "⏳ Думаю…";
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/** Finished tool lines fade out of the status block after this long. */
+const TOOL_TTL_MS = 10_000;
+const STATUS_TICK_MS = 1200;
+const MAX_STATUS_TOOLS = 2;
 
 export class Streamer {
   private readonly states = new Map<string, State>();
   /** Flipped to false permanently once Telegram rejects a rich message. */
   private rich: boolean;
+  /** model display name currently used by a session's live block. */
+  private readonly models = new Map<string, string>();
 
   constructor(private readonly api: Api, private readonly options: StreamerOptions) {
     this.rich = options.format !== "html";
@@ -49,7 +72,11 @@ export class Streamer {
     return state ? Date.now() - state.startedAt : undefined;
   }
 
-  async begin(sessionID: string, target: Target): Promise<void> {
+  modelOf(sessionID: string): string {
+    return this.models.get(sessionID) ?? "OpenCode";
+  }
+
+  async begin(sessionID: string, target: Target, model?: string): Promise<void> {
     if (this.states.has(sessionID)) return;
     const state: State = {
       sessionID,
@@ -57,40 +84,80 @@ export class Streamer {
       text: "",
       tools: [],
       messageIds: [],
+      frame: 0,
+      model: model || this.models.get(sessionID) || "OpenCode",
       startedAt: Date.now(),
       lastEditAt: 0,
+      flushing: false,
       finished: false,
     };
+    this.models.set(sessionID, state.model);
     this.states.set(sessionID, state);
-    const messageId = await this.send(sessionID, state, PLACEHOLDER);
+    const messageId = await this.send(sessionID, state, this.composeMarkdown(state));
     if (messageId) state.messageIds.push(messageId);
+    state.lastEditAt = Date.now();
     state.typing = setInterval(() => {
       void this.api.sendChatAction(target.chatId, "typing").catch(() => undefined);
     }, 5000);
     state.typing.unref?.();
+    // Animate the status line only while the turn is running.
+    state.spinner = setInterval(() => {
+      if (state.finished) return;
+      state.frame = (state.frame + 1) % SPINNER.length;
+      this.schedule(state, STATUS_TICK_MS);
+    }, STATUS_TICK_MS);
+    state.spinner.unref?.();
   }
 
   append(sessionID: string, delta: string): void {
     const state = this.states.get(sessionID);
     if (!state || !delta) return;
     state.text += delta;
-    this.schedule(sessionID, state);
+    this.schedule(state);
   }
 
   setText(sessionID: string, text: string): void {
     const state = this.states.get(sessionID);
     if (!state || !text) return;
     state.text = text;
-    this.schedule(sessionID, state);
+    this.schedule(state);
   }
 
-  tool(sessionID: string, label: string): void {
+  /** `session.tool.called`: remember the tool for the live status block. */
+  toolCalled(sessionID: string, callID: string, name: string, input: unknown): void {
     const state = this.states.get(sessionID);
     if (!state || this.options.showTools === "off") return;
-    if (state.tools[state.tools.length - 1] === label) return;
-    state.tools.push(label);
-    if (state.tools.length > 6) state.tools.shift();
-    this.schedule(sessionID, state);
+    const presentation = toolPresentation(name, input);
+    const existing = state.tools.find((tool) => tool.label === presentation.label);
+    if (existing) {
+      existing.count += 1;
+      existing.startedAt = Date.now();
+      existing.state = "running";
+      existing.finishedAt = undefined;
+      if (callID) existing.callID = callID;
+    } else {
+      state.tools.push({
+        callID,
+        icon: presentation.icon,
+        label: presentation.label,
+        startedAt: Date.now(),
+        state: "running",
+        count: 1,
+      });
+      if (state.tools.length > 24) state.tools.shift();
+    }
+    this.schedule(state, STATUS_TICK_MS);
+  }
+
+  /** `session.tool.success` / `session.tool.failed`. */
+  toolFinished(sessionID: string, callID: string, ok: boolean): void {
+    const state = this.states.get(sessionID);
+    if (!state) return;
+    const tool = callID ? state.tools.find((entry) => entry.callID === callID) : undefined;
+    if (!tool || tool.state !== "running") return;
+    tool.state = ok ? "ok" : "fail";
+    tool.finishedAt = Date.now();
+    this.schedule(state, STATUS_TICK_MS);
   }
 
   async end(sessionID: string, footer?: string): Promise<void> {
@@ -99,6 +166,7 @@ export class Streamer {
     state.finished = true;
     if (state.timer) clearTimeout(state.timer);
     if (state.typing) clearInterval(state.typing);
+    if (state.spinner) clearInterval(state.spinner);
 
     let delivered = false;
     for (let attempt = 0; attempt < 3 && !delivered; attempt += 1) {
@@ -126,47 +194,76 @@ export class Streamer {
     this.states.delete(sessionID);
   }
 
-  private schedule(sessionID: string, state: State): void {
+  private schedule(state: State, overrideInterval?: number): void {
     if (state.timer) return;
-    const wait = Math.max(0, this.options.editIntervalMs - (Date.now() - state.lastEditAt));
+    const interval = overrideInterval ?? this.options.editIntervalMs;
+    const wait = Math.max(0, interval - (Date.now() - state.lastEditAt));
     state.timer = setTimeout(() => {
       state.timer = undefined;
-      void this.flush(sessionID, state).catch((error) => log.warn("stream flush failed:", (error as Error).message));
+      void this.flush(state.sessionID, state).catch((error) => log.warn("stream flush failed:", (error as Error).message));
     }, wait);
     state.timer.unref?.();
   }
 
   private composeMarkdown(state: State, footer?: string): string {
     const parts: string[] = [];
-    if (state.tools.length && this.options.showTools !== "off") parts.push(`_${state.tools.join(" · ")}_`);
+    const status = state.finished ? "" : this.statusBlock(state);
+    if (status) parts.push(status);
     if (state.text.trim()) parts.push(state.text.trim());
-    if (footer) parts.push(footer.split("\n").map((line) => `_${line}_`).join("\n"));
+    if (footer) parts.push(`_${footer}_`);
     return parts.join("\n\n") || PLACEHOLDER;
   }
 
   private composeHtml(state: State, footer?: string): string {
     const parts: string[] = [];
-    if (state.tools.length && this.options.showTools !== "off") parts.push(`<i>${state.tools.join(" · ")}</i>`);
+    const status = state.finished ? "" : this.statusBlock(state);
+    if (status) parts.push(status);
     if (state.text.trim()) parts.push(markdownToHtml(state.text));
-    if (footer) parts.push(footer.split("\n").map((line) => `<i>${line}</i>`).join("\n"));
+    if (footer) parts.push(`<i>${footer}</i>`);
     return parts.join("\n\n") || PLACEHOLDER;
   }
 
-  private async flush(sessionID: string, state: State, footer?: string): Promise<void> {
-    if (this.rich) {
-      try {
-        await this.flushRich(state, footer);
-        state.lastEditAt = Date.now();
-        return;
-      } catch (error) {
-        if (!isRichUnsupported(error)) throw error;
-        this.rich = false;
-        log.warn("rich messages rejected by Telegram, switching to HTML:", (error as Error).message);
+  /** Variant B status block: model + elapsed, up to two recent tools. */
+  private statusBlock(state: State): string {
+    const frame = SPINNER[state.frame % SPINNER.length] ?? "⠋";
+    const elapsed = formatElapsed(Date.now() - state.startedAt);
+    const lines = [`${frame} ${state.model} · thinking… ${elapsed}`];
+    if (this.options.showTools !== "off") {
+      const now = Date.now();
+      const visible = state.tools
+        .filter((tool) => tool.state === "running" || !tool.finishedAt || now - tool.finishedAt <= TOOL_TTL_MS)
+        .slice(-MAX_STATUS_TOOLS);
+      for (const tool of visible) {
+        const mark = tool.state === "ok" ? " ✓" : tool.state === "fail" ? " ✗" : "";
+        const count = tool.count > 1 ? ` ×${tool.count}` : "";
+        const duration = formatElapsed((tool.finishedAt ?? now) - tool.startedAt);
+        lines.push(`${tool.icon} ${tool.label}${count} · ${duration}${mark}`);
       }
     }
-    await this.flushHtml(state, footer);
-    state.lastEditAt = Date.now();
-    void sessionID;
+    return lines.join("\n");
+  }
+
+  private async flush(sessionID: string, state: State, footer?: string): Promise<void> {
+    if (state.flushing) return;
+    state.flushing = true;
+    try {
+      if (this.rich) {
+        try {
+          await this.flushRich(state, footer);
+          state.lastEditAt = Date.now();
+          return;
+        } catch (error) {
+          if (!isRichUnsupported(error)) throw error;
+          this.rich = false;
+          log.warn("rich messages rejected by Telegram, switching to HTML:", (error as Error).message);
+        }
+      }
+      await this.flushHtml(state, footer);
+      state.lastEditAt = Date.now();
+      void sessionID;
+    } finally {
+      state.flushing = false;
+    }
   }
 
   private async flushRich(state: State, footer?: string): Promise<void> {
@@ -288,6 +385,64 @@ export class Streamer {
 
   async shutdown(): Promise<void> {
     await Promise.all([...this.states.keys()].map((id) => this.end(id)));
+  }
+}
+
+/** `42s`, `1m 23s` — same shape as the stats footer. */
+export function formatElapsed(ms: number): string {
+  const total = Math.max(1, Math.round(ms / 1000));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function toolPresentation(name: string, input: unknown): { icon: string; label: string } {
+  const toolName = (name || "tool").replace(/^[a-z]+_/i, "").toLowerCase() || "tool";
+  const args = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+  const pick = (...keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const value = args[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return undefined;
+  };
+  const file = pick("filePath", "file_path", "path", "filename", "file");
+  const command = pick("command", "cmd");
+  const pattern = pick("pattern", "query", "search");
+  const url = pick("url", "href");
+  const description = pick("description", "task");
+
+  if (command) return { icon: "💻", label: `${toolName} ${short(command, 36)}` };
+  if (file) {
+    const icon = /write|edit|patch|create/.test(toolName) ? "🛠" : "🔍";
+    return { icon, label: `${toolName} ${baseName(file)}` };
+  }
+  if (pattern) {
+    const icon = /grep|search|glob|find|list/.test(toolName) ? "🔍" : "🛠";
+    const arg = /grep|search/.test(toolName) ? `"${short(pattern, 30)}"` : short(pattern, 32);
+    return { icon, label: `${toolName} ${arg}` };
+  }
+  if (url) return { icon: "🌐", label: `${toolName} ${hostOf(url)}` };
+  if (description) return { icon: "🤖", label: `${toolName} ${short(description, 36)}` };
+  return { icon: /bash|shell|exec|run/.test(toolName) ? "💻" : "🛠", label: toolName };
+}
+
+function short(value: string, max: number): string {
+  const line = value.split("\n")[0]?.replace(/\s+/g, " ").trim() ?? "";
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
+function baseName(path: string): string {
+  const clean = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return clean.split("/").pop() || clean;
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return short(url, 24);
   }
 }
 

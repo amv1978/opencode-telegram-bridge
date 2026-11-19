@@ -1,6 +1,6 @@
 # OpenCode Telegram Bridge: документация
 
-Мост между Telegram и OpenCode 2.x. Демон на Bun, оболочка Electron, CLI на .NET 10
+Мост между Telegram (и Discord) и OpenCode 2.x. Демон на Bun, оболочка Electron, CLI на .NET 10
 и установщик Inno Setup.
 
 ## Разделы
@@ -10,6 +10,7 @@
 | [architecture.md](architecture.md) | Компоненты, поток данных, порты, файлы на диске |
 | [opencode-integration.md](opencode-integration.md) | Эндпоинты OpenCode, события SSE, особенности |
 | [telegram.md](telegram.md) | Команды, режимы, темы, права, медиа и голос |
+| [discord.md](discord.md) | Discord: Dev Portal, интенты, треды, команды, лимиты |
 | [voice.md](voice.md) | Голосовые: ffmpeg, HEX, Labs, задержки |
 | [ui.md](ui.md) | Темы, язык, Electron-оболочка, трей |
 | [cli.md](cli.md) | Все команды `ocbridge-cli` с примерами вывода |
@@ -18,7 +19,7 @@
 
 ## Быстрые ссылки
 
-- Установка: `dist\ocbridge-setup-0.2.0.exe` или сборка из исходников
+- Установка: `dist\ocbridge-setup-0.3.0.exe` или сборка из исходников
   (см. [build-and-release.md](build-and-release.md)).
 - Панель управления: `http://127.0.0.1:7788` (только localhost).
 - Данные: `%APPDATA%\opencode-telegram-bridge\` — там же `bridge.log`.

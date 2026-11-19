@@ -8,7 +8,7 @@ permission requests arrive as inline buttons.
 
 | Path | What it is |
 |---|---|
-| `src/` | Bun/TypeScript daemon `ocbridge.exe`: OpenCode HTTP+SSE client, grammY bot, web UI on `127.0.0.1:7788` |
+| `src/` | Bun/TypeScript daemon `ocbridge.exe`: OpenCode HTTP+SSE client, grammY bot, Discord adapter (`src/discord/`), web UI on `127.0.0.1:7788` |
 | `desktop/` | Electron shell: window, tray, autostart, title-bar theme sync |
 | `cli/` | .NET 10 CLI `ocbridge-cli.exe` over the local JSON API (no NuGet deps) |
 | `installer/` | Inno Setup script + RU/EN wizard messages |
@@ -34,6 +34,8 @@ CLI: see `docs/build-and-release.md`. Installer: `ISCC installer\ocbridge.iss`.
   `%APPDATA%\opencode-telegram-bridge\`; the token exists only there.
 - OpenCode SSE is volatile. Event handling must be **serial** (`eventChain`): a mirrored
   user message has to reach Telegram before the answer. Each handler is capped at 20 s.
+- Discord lives only in `src/discord/` and must not import `src/telegram/*`. Its bot
+  token is secret: log/UI expose only `tokenTail`; `MESSAGE_CONTENT` is privileged.
 - `session.idle` never fires. End of turn is `session.execution.succeeded|failed|interrupted`.
 - Prefer Telegram rich markdown (`sendRichMessage`); fall back to HTML. Do not use MarkdownV2.
 - The forum's General chat is never a reply target: sessions live in topics only.
@@ -45,4 +47,4 @@ CLI: see `docs/build-and-release.md`. Installer: `ISCC installer\ocbridge.iss`.
 ## Docs
 
 Start at `docs/README.md`. Details: `architecture.md`, `opencode-integration.md`,
-`telegram.md`, `voice.md`, `ui.md`, `cli.md`, `build-and-release.md`, `troubleshooting.md`.
+`telegram.md`, `discord.md`, `voice.md`, `ui.md`, `cli.md`, `build-and-release.md`, `troubleshooting.md`.

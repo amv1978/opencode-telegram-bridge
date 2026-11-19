@@ -10,6 +10,18 @@ export interface UserConfig {
   name?: string;
 }
 
+export interface DiscordConfig {
+  enabled: boolean;
+  /** Bot token. Secret: never logged, only the last 4 chars leave the process. */
+  token?: string;
+  /** Guild (server) ids the bot serves; empty = none allowed. */
+  allowedGuilds?: string[];
+  /** User ids allowed to drive the bot; empty = nobody. */
+  allowedUsers?: string[];
+  /** v1 supports threads only. */
+  mode?: "threads";
+}
+
 export interface BridgeConfig {
   telegram: {
     token: string;
@@ -19,6 +31,7 @@ export interface BridgeConfig {
     /** Force a specific Bot API IP (when the DNS-provided one is blocked). */
     apiIp?: string;
   };
+  discord?: DiscordConfig;
   opencode: {
     /** Empty = auto discover the shared background service. */
     baseUrl?: string;
@@ -54,6 +67,7 @@ export interface BridgeConfig {
 
 const DEFAULT_CONFIG: BridgeConfig = {
   telegram: { token: "", allowedUsers: [] },
+  discord: { enabled: false, token: "", allowedGuilds: [], allowedUsers: [], mode: "threads" },
   opencode: {},
   mode: "both",
   web: { port: 7788 },
@@ -149,6 +163,13 @@ export function loadConfig(paths: Paths): BridgeConfig {
       proxy: raw.telegram?.proxy,
       apiIp: raw.telegram?.apiIp,
     },
+    discord: {
+      enabled: Boolean(raw.discord?.enabled),
+      token: raw.discord?.token ?? "",
+      allowedGuilds: readIdList(raw.discord?.allowedGuilds),
+      allowedUsers: readIdList(raw.discord?.allowedUsers),
+      mode: "threads",
+    },
     opencode: { baseUrl: raw.opencode?.baseUrl, password: raw.opencode?.password },
     mode: raw.mode ?? DEFAULT_CONFIG.mode,
     topicsChatId: raw.topicsChatId,
@@ -163,6 +184,17 @@ export function loadConfig(paths: Paths): BridgeConfig {
 /** True once a bot token is present; the bot itself can start. */
 export function isConfigured(cfg: BridgeConfig): boolean {
   return Boolean(cfg.telegram.token);
+}
+
+/** Discord is opt-in: enabled checkbox + token. */
+export function isDiscordConfigured(cfg: BridgeConfig): boolean {
+  return Boolean(cfg.discord?.enabled && cfg.discord.token);
+}
+
+/** Snowflake ids may arrive as strings or numbers (hand-edited config). */
+function readIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item).trim()).filter(Boolean);
 }
 
 export function saveConfig(paths: Paths, cfg: BridgeConfig): void {
