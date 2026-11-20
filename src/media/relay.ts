@@ -93,10 +93,15 @@ export function mediaFromPayload(value: unknown): MediaItem[] {
   return items;
 }
 
-const MB = 1024 * 1024;const TELEGRAM_DOCUMENT_MB = 50;
+const MB = 1024 * 1024;
+const TELEGRAM_DOCUMENT_MB = 50;
 const TELEGRAM_PHOTO_MB = 10;
 const DISCORD_MB = 10;
 const DEDUPE_TTL_MS = 10 * 60 * 1000;
+/** Per-destination retry schedule: three attempts, 2 s / 5 s backoff. */
+const RETRY_DELAYS_MS = [2000, 5000];
+const ATTEMPT_TIMEOUT_MS = 8000;
+const RELAY_DEADLINE_MS = 30_000;
 
 /**
  * Relays media between every chat a session is bound to (Telegram topic/chat
@@ -108,56 +113,153 @@ export class MediaRelay {
 
   constructor(private readonly options: MediaRelayOptions) {}
 
-  relay(sessionID: string, items: MediaItem[], origin: MediaOrigin): Promise<void> {
-    return this.run(sessionID, items, origin).catch((error) =>
+  relay(
+    sessionID: string,
+    items: MediaItem[],
+    origin: MediaOrigin,
+    dedupeKey?: string,
+    originTarget?: RelayTarget,
+  ): Promise<void> {
+    return this.run(sessionID, items, origin, dedupeKey, originTarget).catch((error) =>
       log.warn("media relay failed:", (error as Error).message),
     );
   }
 
   /**
-   * Awaitable relay with a hard timeout, used before a turn starts. Failures and
-   * timeouts are logged and never block the prompt.
+   * Ordered relay before a turn: await only the first attempt (max 5 s); retries
+   * continue in the background (3 attempts, 2/5 s backoff, 30 s deadline) so the
+   * prompt is never blocked. Failures are logged and reported to the origin chat.
    */
-  async relayBeforeTurn(sessionID: string, items: MediaItem[], origin: MediaOrigin, ms = 10_000): Promise<void> {
-    if (!items.length) return;
+  async relayBeforeTurn(
+    sessionID: string,
+    items: MediaItem[],
+    origin: MediaOrigin,
+    dedupeKey?: string,
+    originTarget?: RelayTarget,
+    firstAttemptMs = 5000,
+  ): Promise<void> {
+    if (!items.length) {
+      log.info("media relay skipped: no items");
+      return;
+    }
+    const task = this.relay(sessionID, items, origin, dedupeKey, originTarget);
     try {
-      await withTimeout(this.relay(sessionID, items, origin), ms, "media relay timeout");
+      await withTimeout(task, firstAttemptMs, "media relay first attempt timeout");
     } catch (error) {
-      log.warn("media relay before turn failed:", (error as Error).message);
+      log.warn("media relay first attempt slow, retries continue in background:", (error as Error).message);
     }
   }
 
-  private async run(sessionID: string, items: MediaItem[], origin: MediaOrigin): Promise<void> {
+  private async run(
+    sessionID: string,
+    items: MediaItem[],
+    origin: MediaOrigin,
+    dedupeKey?: string,
+    originTarget?: RelayTarget,
+  ): Promise<void> {
     const mode = this.options.media().relay ?? "all";
-    if (mode === "none") return;
-    if (mode === "user" && origin === "agent") return;
-    if (!items.length) return;
+    if (mode === "none") {
+      log.info("media relay skipped: mode none");
+      return;
+    }
+    if (mode === "user" && origin === "agent") {
+      log.info("media relay skipped: mode user excludes agent output");
+      return;
+    }
+    if (!items.length) {
+      log.info("media relay skipped: no items");
+      return;
+    }
 
     const targets = listTargets(this.options.store, sessionID, this.options.topicsChatId());
     const allowed = targets.filter((target) => target.platform !== origin);
-    if (!allowed.length) return;
+    if (!allowed.length) {
+      log.info(`media relay skipped: no destination (origin=${origin}, targets=${targets.length})`);
+      return;
+    }
 
     let index = 0;
     for (const raw of items) {
       index += 1;
       const item = await this.prepare(raw);
-      if (!item) continue;
-      const key = `${sessionID}:${itemKey(item)}`;
-      if (this.recentlySent(key)) {
-        log.info(`media relay: skip duplicate ${item.name}`);
+      if (!item) {
+        log.info(`media relay skipped: no bytes for ${raw.name}`);
         continue;
       }
-      this.sent.set(key, Date.now());
-      for (const target of allowed) {
-        try {
-          await this.deliver(target, item);
-        } catch (error) {
-          log.warn(`media relay → ${target.platform} failed (${item.name}):`, (error as Error).message);
+      // Agent output: content-hash dedupe prevents echo loops. User attachments:
+      // per inbound message id, so sending the same image again is relayed again.
+      let key: string | undefined;
+      if (origin === "agent") key = `${sessionID}:hash:${itemKey(item)}`;
+      else if (dedupeKey) key = `${sessionID}:msg:${dedupeKey}:${index}`;
+      if (key) {
+        if (this.recentlySent(key)) {
+          log.info(`media relay skipped: duplicate (${origin}, ${dedupeKey ?? "hash"})`);
+          continue;
         }
+        this.sent.set(key, Date.now());
+      }
+      for (const target of allowed) {
+        await this.deliverWithRetry(sessionID, target, item, origin, originTarget);
       }
       if (index >= 20) break; // sanity cap per event
     }
     this.prune();
+  }
+
+  /** Three attempts per destination with 2 s / 5 s backoff, 30 s deadline. */
+  private async deliverWithRetry(
+    sessionID: string,
+    target: RelayTarget,
+    item: MediaItem,
+    origin: MediaOrigin,
+    originTarget?: RelayTarget,
+  ): Promise<void> {
+    const deadline = Date.now() + RELAY_DEADLINE_MS;
+    let reason = "send failed";
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        reason = "timeout";
+        break;
+      }
+      try {
+        await withTimeout(this.deliver(target, item), Math.min(ATTEMPT_TIMEOUT_MS, remaining), "send timeout");
+        return;
+      } catch (error) {
+        reason = (error as Error).message;
+        log.warn(`media relay → ${target.platform} attempt ${attempt}/3 failed (${item.name}): ${reason}`);
+        if (attempt < 3) {
+          const wait = Math.min(RETRY_DELAYS_MS[attempt - 1] ?? 5000, Math.max(0, deadline - Date.now()));
+          if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+        }
+      }
+    }
+    log.error(`media relay → ${target.platform} gave up (${item.name}): ${reason}`);
+    await this.notifyFailure(sessionID, origin, originTarget, target, item, reason);
+  }
+
+  /** Tells the origin chat that a relay failed, so the user is not left guessing. */
+  private async notifyFailure(
+    sessionID: string,
+    origin: MediaOrigin,
+    originTarget: RelayTarget | undefined,
+    target: RelayTarget,
+    item: MediaItem,
+    reason: string,
+  ): Promise<void> {
+    if (!originTarget) return;
+    const label = target.platform === "telegram" ? "Telegram" : "Discord";
+    const text = `⚠️ не удалось переслать файл в ${label}: ${reason.slice(0, 120)}`;
+    try {
+      if (origin === "telegram" && originTarget.platform === "telegram") {
+        await this.options.senders.telegram?.sendText(originTarget, text);
+      } else if (origin === "discord" && originTarget.platform === "discord") {
+        await this.options.senders.discord?.sendText(originTarget, text);
+      }
+      log.info(`media relay: failure notice sent for ${item.name} (${sessionID.slice(0, 16)})`);
+    } catch (error) {
+      log.warn("media relay: failure notice failed:", (error as Error).message);
+    }
   }
 
   /** Resolves bytes for buffers, data URLs, http(s) URLs and local paths. */
@@ -214,7 +316,10 @@ export class MediaRelay {
 
     // Oversize or no bytes locally: send a link/absolute path instead.
     const link = linkFor(item);
-    if (!link) return;
+    if (!link) {
+      log.info(`media relay skipped: no link/path for ${item.name}`);
+      return;
+    }
     const text = `📎 ${item.name}: ${link}`;
     if (target.platform === "telegram") await this.options.senders.telegram?.sendText(target, text);
     else await this.options.senders.discord?.sendText(target, text);

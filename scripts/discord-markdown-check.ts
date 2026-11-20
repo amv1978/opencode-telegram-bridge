@@ -5,7 +5,7 @@ const cases: Array<{ name: string; input: string; expected: string }> = [
   {
     name: "simple table",
     input: ["| A | B |", "|---|---|", "| 1 | 22 |"].join("\n"),
-    expected: ["```", "| A   | B   |", "| --- | --- |", "| 1   | 22  |", "```"].join("\n"),
+    expected: ["```", "| A   | B   |", "|---|---|", "| 1   | 22  |", "```"].join("\n"),
   },
   {
     name: "table inside text",
@@ -24,7 +24,7 @@ const cases: Array<{ name: string; input: string; expected: string }> = [
       "",
       "```",
       "| Name | Value |",
-      "| ---- | ----- |",
+      "|:-----|------:|",
       "| a    | 42    |",
       "| bb   | 7     |",
       "```",
@@ -59,6 +59,18 @@ const cases: Array<{ name: string; input: string; expected: string }> = [
       "- Component: media-relay-worker · Owner: platform-team · Description: Handles every attachment relayed between bound chats",
     ].join("\n"),
   },
+  {
+    name: "screenshot two-column table with long URL",
+    input: [
+      "| Коммит | b34b1f7, запушен |",
+      "|---|---|",
+      "| Релиз | https://github.com/amv1978/opencode-telegram-bridge/releases/tag/v0.4.2 |",
+    ].join("\n"),
+    expected: [
+      "**Коммит** — b34b1f7, запушен",
+      "**Релиз** — https://github.com/amv1978/opencode-telegram-bridge/releases/tag/v0.4.2",
+    ].join("\n"),
+  },
 ];
 
 let failed = 0;
@@ -74,6 +86,21 @@ for (const testCase of cases) {
   } else {
     console.log(`✓ ${testCase.name}`);
   }
+}
+
+// Screenshot case: no wrapped separator, no empty rows, no code fence.
+const screenshot = toDiscordMarkdown(
+  [
+    "| Коммит | b34b1f7, запушен |",
+    "|---|---|",
+    "| Релиз | https://github.com/amv1978/opencode-telegram-bridge/releases/tag/v0.4.2 |",
+  ].join("\n"),
+);
+if (screenshot.includes("```") || screenshot.split("\n").some((line) => !line.trim()) || screenshot.includes("---")) {
+  failed += 1;
+  console.error(`✗ screenshot table: separator/empty rows leaked\n${indent(screenshot)}`);
+} else {
+  console.log("✓ screenshot table has no wrapped separator or empty rows");
 }
 
 // Chunker: a wrapped table must stay intact inside one chunk when it fits, and

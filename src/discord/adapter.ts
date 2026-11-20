@@ -379,7 +379,10 @@ export class DiscordBridge {
     if (!promptText) return;
     if (promptText.length > DISCORD_CHUNK * 8) promptText = promptText.slice(0, DISCORD_CHUNK * 8);
 
-    await this.options.relay?.relayBeforeTurn(sessionID, media, "discord");
+    await this.options.relay?.relayBeforeTurn(sessionID, media, "discord", message.id, {
+      platform: "discord",
+      channelId: destination,
+    });
     await this.streamer?.begin(sessionID, destination, await modelLabel(this.oc, sessionID));
     log.info(`discord prompt → ${sessionID.slice(0, 16)}: ${promptText.slice(0, 80).replace(/\s+/g, " ")}`);
     try {

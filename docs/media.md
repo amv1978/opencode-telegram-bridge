@@ -40,9 +40,15 @@ are visible in the `/api/state` snapshot (`config.media`).
 - If a file exceeds the platform limit (Telegram 50 MB, Discord 10 MB), a text link
   is sent instead: for `https://…` — the URL as is, for a local file — the absolute
   path.
-- Repeated relay of the same bytes (sha256) into the same session is suppressed for
-  10 minutes so the mirror cannot loop.
+- User attachments are deduplicated per inbound message id, so sending the same
+  image again later is relayed again. Content-hash dedupe (10 minutes) applies
+  only to agent-produced files, to avoid echo loops.
 - Upload/download errors are only logged: the event loop never crashes.
+- Delivery is retried: 3 attempts per platform with 2 s / 5 s backoff, 30 s
+  overall deadline. The first attempt is awaited for at most 5 s before the prompt
+  (order: text → media → answer); further attempts run in the background and do
+  not block the turn. If all attempts fail, the origin chat gets
+  `⚠️ failed to relay file to Telegram/Discord: <reason>`.
 
 ## What counts as an agent attachment
 

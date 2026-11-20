@@ -114,17 +114,20 @@ function wrapCell(value: string, limit: number): string[] {
       current = rest;
     }
   }
-  if (current || !lines.length) lines.push(current);
+  if (current) lines.push(current);
+  else if (!lines.length) lines.push("");
   return lines;
 }
 
 /**
- * Wide tables do not fit a Discord code block, so they become a compact list:
+ * Wide tables do not fit a Discord code block, so they become a compact list;
+ * a two-column table becomes key/value lines:
  *
- *   **A · B · C**
- *   - A: 1 · B: 2 · C: 3
+ *   **Commit** — b34b1f7
+ *   **Release** — https://…
  *
- * Narrow tables stay aligned in a fenced block with cells wrapped to 32 chars.
+ * Narrow tables stay aligned in a fenced block with cells wrapped to 32 chars;
+ * the separator row is passed through verbatim and never wrapped.
  */
 function renderTable(rows: string[]): string[] {
   const grid = rows.map(tableCells);
@@ -132,24 +135,24 @@ function renderTable(rows: string[]): string[] {
   const columns = Math.max(headers.length, ...grid.map((cells) => cells.length));
   const body = grid.slice(2).map((cells) => Array.from({ length: columns }, (_, index) => cells[index] ?? ""));
 
-  const widths: number[] = [];
+  // Width the table would need without the 32-char cap; decides table vs list.
+  const natural: number[] = [];
   for (let column = 0; column < columns; column += 1) {
     let width = 3;
     const cells = [headers[column] ?? "", ...body.map((row) => row[column] ?? "")];
-    for (const cell of cells) {
-      for (const line of wrapCell(cell, TABLE_CELL_LIMIT)) width = Math.max(width, line.length);
-    }
-    widths.push(Math.min(TABLE_CELL_LIMIT, width));
+    for (const cell of cells) width = Math.max(width, cell.replace(/\s+/g, " ").trim().length);
+    natural.push(width);
   }
-
-  const total = 1 + widths.reduce((sum, width) => sum + width, 0) + 3 * columns;
+  const total = 1 + natural.reduce((sum, width) => sum + width, 0) + 3 * columns;
   if (columns > TABLE_MAX_COLUMNS || total > TABLE_TOTAL_LIMIT) return renderTableList(headers, body, columns);
 
+  const widths = natural.map((width) => Math.min(TABLE_CELL_LIMIT, width));
   const out = ["```"];
   const headerCells = Array.from({ length: columns }, (_, index) => headers[index] ?? "");
-  const headerLines = renderWrappedRow(headerCells, widths);
-  out.push(...headerLines);
-  out.push(`| ${widths.map((width) => "-".repeat(width)).join(" | ")} |`);
+  out.push(...renderWrappedRow(headerCells, widths));
+  // Verbatim separator: no wrapping, no truncation, no extra lines.
+  const separator = (rows[1] ?? "").trim();
+  out.push(separator.startsWith("|") ? separator : `| ${widths.map((width) => "-".repeat(width)).join(" | ")} |`);
   for (const row of body) out.push(...renderWrappedRow(row, widths));
   out.push("```");
   return out;
@@ -169,6 +172,13 @@ function renderWrappedRow(cells: string[], widths: number[]): string[] {
 
 function renderTableList(headers: string[], body: string[][], columns: number): string[] {
   const labels = Array.from({ length: columns }, (_, index) => (headers[index] ?? "").replace(/\s+/g, " ").trim());
+  if (columns === 2) {
+    return [headers, ...body].map((row) => {
+      const key = (row[0] ?? "").replace(/\s+/g, " ").trim();
+      const value = (row[1] ?? "").replace(/\s+/g, " ").trim();
+      return `**${key}** — ${value}`;
+    });
+  }
   const out = [`**${labels.filter(Boolean).join(" · ")}**`];
   for (const row of body) {
     const cells = row.map((cell, index) => {

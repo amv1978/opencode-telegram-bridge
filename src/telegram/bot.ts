@@ -486,6 +486,7 @@ export class Bridge {
     log.info(`task: ${text.slice(0, 80).replace(/\s+/g, " ")}${files ? ` [+${files.length} file]` : ""}`);
     const threadId = (ctx.message as { message_thread_id?: number } | undefined)?.message_thread_id;
     const chatId = ctx.chat?.id;
+    const messageID = ctx.message?.message_id ? String(ctx.message.message_id) : undefined;
 
     // In the bound forum, a task in the general chat starts its own topic.
     if (chatId && chatId === this.cfg.topicsChatId && !threadId && this.cfg.autoTopics !== false) {
@@ -496,7 +497,11 @@ export class Bridge {
         this.store.bindThread(topic.message_thread_id, session.id);
         this.store.upsert({ id: session.id, title: session.title, chatId, threadId: topic.message_thread_id });
         const target = { chatId, threadId: topic.message_thread_id };
-        await this.options.relay?.relayBeforeTurn(session.id, media, "telegram");
+        await this.options.relay?.relayBeforeTurn(session.id, media, "telegram", messageID, {
+          platform: "telegram",
+          chatId,
+          threadId: topic.message_thread_id,
+        });
         await this.streamer.begin(session.id, target, await this.modelLabel(session.id));
         await this.oc.prompt(session.id, text, { source: "telegram" }, files);
         log.info(`auto-topic ${topic.message_thread_id} → ${session.id.slice(0, 16)}`);
@@ -520,7 +525,11 @@ export class Bridge {
       await ctx.reply("Не понимаю, куда отвечать. Настройте topicsChatId или пишите боту в личку.");
       return;
     }
-    await this.options.relay?.relayBeforeTurn(sessionID, media, "telegram");
+    await this.options.relay?.relayBeforeTurn(sessionID, media, "telegram", messageID, {
+      platform: "telegram",
+      chatId: target.chatId,
+      threadId: target.threadId,
+    });
     await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
     log.info(`prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
