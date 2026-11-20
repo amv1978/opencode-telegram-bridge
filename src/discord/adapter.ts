@@ -21,6 +21,7 @@ import { transcribeAudio } from "../audio/transcribe.ts";
 import { registerCommands } from "./commands.ts";
 import {
   collectAgentFiles,
+  mediaFromPayload,
   promptFilesFromMedia,
   type DiscordMediaTarget,
   type MediaItem,
@@ -378,11 +379,11 @@ export class DiscordBridge {
     if (!promptText) return;
     if (promptText.length > DISCORD_CHUNK * 8) promptText = promptText.slice(0, DISCORD_CHUNK * 8);
 
+    await this.options.relay?.relayBeforeTurn(sessionID, media, "discord");
     await this.streamer?.begin(sessionID, destination, await modelLabel(this.oc, sessionID));
     log.info(`discord prompt → ${sessionID.slice(0, 16)}: ${promptText.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
       await this.oc.prompt(sessionID, promptText, { source: "discord" }, files.length ? files : undefined);
-      this.options.relay?.relay(sessionID, media, "discord");
     } catch (error) {
       await this.streamer?.end(sessionID, `⚠️ ${(error as Error).message.slice(0, 200)}`);
     }
@@ -796,6 +797,7 @@ export class DiscordBridge {
     const target = this.targetFor(sessionID);
     if (!target) return;
     await this.send(target, quoteBlock("👤 **Вы** · OpenCode", text));
+    await this.options.relay?.relayBeforeTurn(sessionID, mediaFromPayload(envelope), "agent");
     log.info(`discord mirror user → ${sessionID.slice(0, 16)}`);
   }
 

@@ -9,10 +9,10 @@
     <RootNamespace>OcbridgeCli</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
     <LangVersion>latest</LangVersion>
-    <Version>0.4.1</Version>
-    <FileVersion>0.4.1</FileVersion>
-    <AssemblyVersion>0.4.1.0</AssemblyVersion>
-    <InformationalVersion>0.4.1</InformationalVersion>
+    <Version>0.4.2</Version>
+    <FileVersion>0.4.2</FileVersion>
+    <AssemblyVersion>0.4.2.0</AssemblyVersion>
+    <InformationalVersion>0.4.2</InformationalVersion>
     <!-- PublishSingleFile / SelfContained are passed on the command line, see README.md. -->
   </PropertyGroup>
 

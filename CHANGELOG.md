@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.2 — 2026-11-20
+
+Медиа в пункте назначения появляется до ответа агента.
+
+### Исправлено
+
+- Входящие вложения Telegram и Discord релеятся **до** prompt: `await
+  relayBeforeTurn(...)`, затем `streamer.begin` и `oc.prompt`. Раньше картинка
+  из Discord уходила в Telegram после ответа и выглядела не по порядку.
+- Файлы зеркалированного пользовательского сообщения (`session.inbox.enqueued`)
+  отправляются сразу после текстовой цитаты, в той же последовательной цепочке
+  событий — до `execution.started`.
+- `relayBeforeTurn` ограничен 10 секундами, ошибки/таймаут пишутся в журнал и не
+  блокируют ход.
+
+### Сборка
+
+- Версия `0.4.2` в `package.json`, `desktop/package.json`,
+  `installer/ocbridge.iss`, `cli/cli.csproj` и `Program.Version`.
+
 ## 0.4.1 — 2026-11-20
 
 Три production-фикса: таблицы Discord, слэш-команды, файлы Telegram.

@@ -9,6 +9,7 @@ import { Streamer, type Target } from "./stream.ts";
 import { enableHexFileTranscription, transcribeAudio } from "../audio/transcribe.ts";
 import {
   collectAgentFiles,
+  mediaFromPayload,
   promptFilesFromMedia,
   type MediaItem,
   type MediaRelay,
@@ -495,9 +496,9 @@ export class Bridge {
         this.store.bindThread(topic.message_thread_id, session.id);
         this.store.upsert({ id: session.id, title: session.title, chatId, threadId: topic.message_thread_id });
         const target = { chatId, threadId: topic.message_thread_id };
+        await this.options.relay?.relayBeforeTurn(session.id, media, "telegram");
         await this.streamer.begin(session.id, target, await this.modelLabel(session.id));
         await this.oc.prompt(session.id, text, { source: "telegram" }, files);
-        this.options.relay?.relay(session.id, media, "telegram");
         log.info(`auto-topic ${topic.message_thread_id} → ${session.id.slice(0, 16)}`);
         return;
       } catch (error) {
@@ -519,11 +520,11 @@ export class Bridge {
       await ctx.reply("Не понимаю, куда отвечать. Настройте topicsChatId или пишите боту в личку.");
       return;
     }
+    await this.options.relay?.relayBeforeTurn(sessionID, media, "telegram");
     await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
     log.info(`prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
       await this.oc.prompt(sessionID, text, { source: "telegram" }, files);
-      this.options.relay?.relay(sessionID, media, "telegram");
     } catch (error) {
       await this.streamer.end(sessionID, `⚠️ ${(error as Error).message.slice(0, 200)}`);
     }
@@ -994,6 +995,7 @@ export class Bridge {
       await this.bot.api.sendMessage(target.chatId, `👤 Вы (OpenCode):\n${text}`, options).catch(() => undefined);
     }
     this.rememberMirror(target.chatId, text);
+    await this.options.relay?.relayBeforeTurn(sessionID, mediaFromPayload(envelope), "agent");
     log.info(`mirror user → ${sessionID.slice(0, 16)}`);
   }
 

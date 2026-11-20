@@ -59,6 +59,40 @@ export function promptFilesFromMedia(items: MediaItem[]): Array<{ uri: string; n
   });
 }
 
+/** Attachments from a mirrored `session.inbox.enqueued` payload (shape is defensive). */
+export function mediaFromPayload(value: unknown): MediaItem[] {
+  if (!value || typeof value !== "object") return [];
+  const source = value as Record<string, any>;
+  const lists = [
+    source.files,
+    source.attachments,
+    source.payload?.files,
+    source.payload?.attachments,
+    source.item?.files,
+    source.item?.payload?.files,
+  ];
+  const items: MediaItem[] = [];
+  const seen = new Set<string>();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const entry of list) {
+      if (!entry || typeof entry !== "object") continue;
+      const file = entry as Record<string, any>;
+      const uri = file.uri ?? file.url ?? file.path ?? file.src;
+      if (typeof uri !== "string" || !uri.trim()) continue;
+      if (seen.has(uri)) continue;
+      seen.add(uri);
+      const name = file.name ?? file.filename ?? file.fileName ?? basename(uri) ?? "file";
+      items.push({
+        uri: uri.trim(),
+        mime: typeof file.mime === "string" ? file.mime : typeof file.mimeType === "string" ? file.mimeType : undefined,
+        name: String(name),
+      });
+    }
+  }
+  return items;
+}
+
 const MB = 1024 * 1024;const TELEGRAM_DOCUMENT_MB = 50;
 const TELEGRAM_PHOTO_MB = 10;
 const DISCORD_MB = 10;
@@ -74,10 +108,23 @@ export class MediaRelay {
 
   constructor(private readonly options: MediaRelayOptions) {}
 
-  relay(sessionID: string, items: MediaItem[], origin: MediaOrigin): void {
-    void this.run(sessionID, items, origin).catch((error) =>
+  relay(sessionID: string, items: MediaItem[], origin: MediaOrigin): Promise<void> {
+    return this.run(sessionID, items, origin).catch((error) =>
       log.warn("media relay failed:", (error as Error).message),
     );
+  }
+
+  /**
+   * Awaitable relay with a hard timeout, used before a turn starts. Failures and
+   * timeouts are logged and never block the prompt.
+   */
+  async relayBeforeTurn(sessionID: string, items: MediaItem[], origin: MediaOrigin, ms = 10_000): Promise<void> {
+    if (!items.length) return;
+    try {
+      await withTimeout(this.relay(sessionID, items, origin), ms, "media relay timeout");
+    } catch (error) {
+      log.warn("media relay before turn failed:", (error as Error).message);
+    }
   }
 
   private async run(sessionID: string, items: MediaItem[], origin: MediaOrigin): Promise<void> {
@@ -302,8 +349,7 @@ function mediaFromPart(part: Record<string, unknown>): MediaItem | undefined {
   };
 }
 
-function itemKey(item: MediaItem): string {
-  if (item.buffer?.length) return `sha256:${createHash("sha256").update(item.buffer).digest("hex")}`;
+function itemKey(item: MediaItem): string {  if (item.buffer?.length) return `sha256:${createHash("sha256").update(item.buffer).digest("hex")}`;
   return `uri:${item.uri ?? item.name}`;
 }
 
@@ -363,4 +409,21 @@ export function localSize(item: MediaItem): number | undefined {
     }
   }
   return undefined;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
