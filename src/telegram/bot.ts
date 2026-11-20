@@ -483,8 +483,7 @@ export class Bridge {
   ): Promise<void> {
     // Single conversion point: prompt attachments are always { uri, name }.
     if (media.length) files = promptFilesFromMedia(media);
-    log.info(`task: ${text.slice(0, 80).replace(/\s+/g, " ")}${files ? ` [+${files.length} file]` : ""}`);
-    const threadId = (ctx.message as { message_thread_id?: number } | undefined)?.message_thread_id;
+    log.info(`task: ${text.slice(0, 80).replace(/\s+/g, " ")}${files ? ` [+${files.length} file]` : ""}`);    const threadId = (ctx.message as { message_thread_id?: number } | undefined)?.message_thread_id;
     const chatId = ctx.chat?.id;
     const messageID = ctx.message?.message_id ? String(ctx.message.message_id) : undefined;
 
@@ -662,10 +661,16 @@ export class Bridge {
 
     try {
       const buffer = await this.download(ctx, fileId, size);
-      const mime = document?.mime_type ?? "image/jpeg";
-      const name = document?.file_name ?? `photo-${Date.now()}.jpg`;
+      const items = telegramMediaItems(message, buffer);
+      if (!items.length) {
+        log.info(`photo branch: keys=${Object.keys(message).join(",")}`);
+        await ctx.reply("⚠️ Не удалось получить вложение из сообщения.").catch(() => undefined);
+        return;
+      }
+      const files = promptFilesFromMedia(items);
+      log.info(`photo branch: items=${items.length} files=${files.length} name=${items[0]?.name}`);
       const caption = (message.caption ?? "").trim() || "Посмотри это изображение.";
-      await this.submitTask(ctx, caption, undefined, [{ buffer, mime, name }]);
+      await this.submitTask(ctx, caption, files, items);
     } catch (error) {
       log.warn("media download failed:", (error as Error).message);
       await ctx.reply(`⚠️ Не смог скачать файл: ${(error as Error).message.slice(0, 120)}`).catch(() => undefined);
@@ -1186,6 +1191,17 @@ export class Bridge {
     if (location.threadId && this.cfg.topicsChatId) return { chatId: this.cfg.topicsChatId, threadId: location.threadId };
     return undefined;
   }
+}
+
+/** Inbound Telegram photo/document → one MediaItem (same bytes for prompt and relay). */
+export function telegramMediaItems(
+  message: { photo?: Array<{ file_size?: number }>; document?: { mime_type?: string; file_name?: string } },
+  buffer: Buffer,
+): MediaItem[] {
+  if (!buffer?.length) return [];
+  const mime = message.document?.mime_type ?? "image/jpeg";
+  const name = message.document?.file_name ?? `photo-${Date.now()}.jpg`;
+  return [{ buffer, mime, name }];
 }
 
 function formatTokens(count: number): string {

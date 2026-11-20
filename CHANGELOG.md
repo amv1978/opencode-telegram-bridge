@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.4 — 2026-11-20
+
+Надёжный релей фото/документов из Telegram.
+
+### Исправлено
+
+- Фото/документ Telegram один раз превращается в `MediaItem[]`
+  (`telegramMediaItems`) и используется и для `prompt.files`
+  (`data:<mime>;base64,…`), и для `relayBeforeTurn` до `streamer.begin`/
+  prompt. Ветка документа (не картинки) идёт тем же путём.
+- Если массив пуст, в журнал пишутся ключи сообщения
+  (`photo branch: keys=…`), а пользователь получает предупреждение.
+- `scripts/telegram-photo-check.ts` проверяет: фото → 1 элемент, у prompt
+  есть `files[0].uri`; документ обрабатывается так же.
+- Уточнение по логам 0.4.3: строка `media relay skipped: no items` относилась
+  к зеркалу промпта в Discord, а вложение релеилось строкой
+  `media relay: photo-… → discord`.
+
+### Сборка
+
+- Версия `0.4.4` в `package.json`, `desktop/package.json`,
+  `installer/ocbridge.iss`, `cli/cli.csproj` и `Program.Version`.
+
 ## 0.4.3 — 2026-11-20
 
 Разделитель таблиц Discord и повторные картинки.
