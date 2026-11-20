@@ -60,6 +60,14 @@ export const PAGE = /* html */ `<!doctype html>
   <span id="who" class="pill"></span>
   <span id="ver" class="pill version" hidden></span>
 </header>
+<div id="updateBanner" class="card" hidden>
+  <div class="row">
+    <span id="updateText" style="flex:1"></span>
+    <button id="updateDownload" class="primary" type="button" data-i18n="update.download">Скачать</button>
+    <button id="updateInstall" type="button" data-i18n="update.install">Установить</button>
+  </div>
+  <progress id="updateProgress" max="100" value="0" style="width:100%;margin-top:10px" hidden></progress>
+</div>
 <main>
   <section class="card" id="onboarding" hidden>
     <h2 data-i18n="onb.title">Первый запуск</h2>
@@ -196,6 +204,26 @@ export const PAGE = /* html */ `<!doctype html>
           <label data-i18n="cfg.media.photo">Фото до, МБ</label>
           <input id="mediaPhotoMb" type="number" min="1" max="10" step="1" />
         </div>
+        <div>
+          <label style="display:flex;gap:8px;align-items:center;margin-top:24px;color:var(--fg)">
+            <input type="checkbox" id="updateCheck" style="width:16px;height:16px" />
+            <span data-i18n="cfg.update.check">Проверять обновления при запуске</span>
+          </label>
+        </div>
+        <div>
+          <label data-i18n="cfg.update.hours">Интервал проверки, ч</label>
+          <input id="updateHours" type="number" min="1" max="168" step="1" />
+        </div>
+        <div>
+          <label style="display:flex;gap:8px;align-items:center;margin-top:24px;color:var(--fg)">
+            <input type="checkbox" id="updateAuto" style="width:16px;height:16px" />
+            <span data-i18n="cfg.update.auto">Скачивать автоматически</span>
+          </label>
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button id="updateCheckBtn" type="button" data-i18n="update.check">Проверить обновления</button>
+        </div>
       </div>
       <div class="divider"></div>
       <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 14px">Discord</h3>
@@ -312,6 +340,13 @@ const I18N = {
     "cfg.showSubagents": "Показывать субагентов",
     "cfg.media.relay": "Пересылка файлов",
     "cfg.media.photo": "Фото до, МБ",
+    "cfg.update.check": "Проверять обновления при запуске",
+    "cfg.update.hours": "Интервал проверки, ч",
+    "cfg.update.auto": "Скачивать автоматически",
+    "update.check": "Проверить обновления",
+    "update.download": "Скачать",
+    "update.install": "Установить",
+    "update.available": "Доступна версия",
     "cfg.discord.enabled": "Включить Discord",
     "cfg.discord.token": "Токен бота Discord",
     "cfg.discord.guilds": "ID серверов (через запятую)",
@@ -384,6 +419,13 @@ const I18N = {
     "cfg.showSubagents": "Show subagents",
     "cfg.media.relay": "File relay",
     "cfg.media.photo": "Photo max, MB",
+    "cfg.update.check": "Check for updates on start",
+    "cfg.update.hours": "Check interval, hours",
+    "cfg.update.auto": "Download automatically",
+    "update.check": "Check for updates",
+    "update.download": "Download",
+    "update.install": "Install",
+    "update.available": "Version available",
     "cfg.discord.enabled": "Enable Discord",
     "cfg.discord.token": "Discord bot token",
     "cfg.discord.guilds": "Server IDs (comma separated)",
@@ -534,6 +576,11 @@ function fill(s) {
     $("showSubagents").checked = s.config.showSubagents;
     $("mediaRelay").value = s.config.media.relay;
     $("mediaPhotoMb").value = s.config.media.maxPhotoMb;
+    if (s.config.update) {
+      $("updateCheck").checked = s.config.update.checkOnStart;
+      $("updateHours").value = s.config.update.intervalHours;
+      $("updateAuto").checked = s.config.update.autoDownload;
+    }
     $("proxy").value = s.config.proxy || "";
     $("apiIp").value = s.config.apiIp || "";
     const dcfg = s.discord || {};
@@ -544,6 +591,17 @@ function fill(s) {
   $("autostart").checked = s.autostart;
   $("autostart").disabled = !s.autostartSupported;
   $("onboarding").hidden = s.configured;
+
+  const u = s.update || {};
+  const banner = $("updateBanner");
+  banner.hidden = !u.available && !u.downloading;
+  if (!banner.hidden) {
+    $("updateText").textContent = t("update.available") + " " + (u.latest || "") + (u.notes ? " — " + String(u.notes).split("\n")[0].slice(0, 120) : "");
+    $("updateDownload").disabled = Boolean(u.downloading);
+    $("updateInstall").disabled = !(u.progress >= 100);
+    $("updateProgress").hidden = !u.downloading;
+    $("updateProgress").value = u.progress || 0;
+  }
 
   $("users").innerHTML = s.config.allowedUsers.length
     ? s.config.allowedUsers.map((u) => "<div><code>" + u.id + "</code> " + (u.name || "") + " · " + (u.role || "user") + "</div>").join("")
@@ -593,6 +651,11 @@ $("form").addEventListener("submit", async (event) => {
     autoTopics: $("autoTopics").checked,
     showSubagents: $("showSubagents").checked,
     media: { relay: $("mediaRelay").value, maxPhotoMb: Number($("mediaPhotoMb").value) },
+    update: {
+      checkOnStart: $("updateCheck").checked,
+      intervalHours: Number($("updateHours").value),
+      autoDownload: $("updateAuto").checked,
+    },
     stream: { editIntervalMs: Number($("editIntervalMs").value), showTools: $("showTools").value, format: $("format").value },
     discord: {
       enabled: $("dcEnabled").checked,
@@ -612,8 +675,23 @@ $("form").addEventListener("submit", async (event) => {
   }
 });
 
-$("btnStart").addEventListener("click", async () => {
-  try { await api("/api/bot/start", { method: "POST" }); toast(t("toast.started"), "ok"); }
+$("updateCheckBtn").addEventListener("click", async () => {
+  try { await api("/api/update/check", { method: "POST" }); toast(t("toast.saved"), "ok"); }
+  catch (e) { toast(e.message, "err"); }
+  refresh();
+});
+$("updateDownload").addEventListener("click", async () => {
+  try { await api("/api/update/download", { method: "POST" }); toast(t("toast.started"), "ok"); }
+  catch (e) { toast(e.message, "err"); }
+  refresh();
+});
+$("updateInstall").addEventListener("click", async () => {
+  try { await api("/api/update/install", { method: "POST" }); toast(t("toast.started"), "ok"); }
+  catch (e) { toast(e.message, "err"); }
+  refresh();
+});
+
+$("btnStart").addEventListener("click", async () => {  try { await api("/api/bot/start", { method: "POST" }); toast(t("toast.started"), "ok"); }
   catch (e) { toast(e.message, "err"); }
   refresh();
 });

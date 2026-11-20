@@ -31,6 +31,12 @@ export interface MediaConfig {
   maxPhotoMb?: number;
 }
 
+export interface UpdateConfig {
+  checkOnStart?: boolean;
+  intervalHours?: number;
+  autoDownload?: boolean;
+}
+
 export interface BridgeConfig {
   telegram: {
     token: string;
@@ -53,6 +59,8 @@ export interface BridgeConfig {
   showSubagents?: boolean;
   /** Media relay between bound chats (default all). */
   media?: MediaConfig;
+  /** GitHub auto-update settings. */
+  update?: UpdateConfig;
   /** Forum supergroup chat id used in "topics" mode. */
   topicsChatId?: number;
   /** Default directory for new sessions (empty = current working directory). */
@@ -85,6 +93,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   mode: "both",
   showSubagents: true,
   media: { relay: "all", maxPhotoMb: 10 },
+  update: { checkOnStart: true, intervalHours: 6, autoDownload: false },
   web: { port: 7788 },
   stream: { editIntervalMs: 1800, showReasoning: false, showTools: "compact", format: "rich" },
 };
@@ -191,6 +200,11 @@ export function loadConfig(paths: Paths): BridgeConfig {
     media: {
       relay: raw.media?.relay === "none" || raw.media?.relay === "user" ? raw.media.relay : "all",
       maxPhotoMb: clampNumber(raw.media?.maxPhotoMb, 1, 10, 10),
+    },
+    update: {
+      checkOnStart: raw.update?.checkOnStart !== false,
+      intervalHours: clampNumber(raw.update?.intervalHours, 1, 168, 6),
+      autoDownload: raw.update?.autoDownload === true,
     },
     topicsChatId: raw.topicsChatId,
     defaultDirectory: raw.defaultDirectory,

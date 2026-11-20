@@ -177,6 +177,8 @@ const TEXTS = {
     stop: "Остановить",
     restart: "Перезапустить",
     reconnect: "Переподключить OpenCode",
+    checkUpdate: "Проверить обновления",
+    installUpdate: "Установить",
     settings: "Настройки",
     log: "Журнал",
     autostart: "Автозапуск",
@@ -195,6 +197,8 @@ const TEXTS = {
     stop: "Stop",
     restart: "Restart",
     reconnect: "Reconnect OpenCode",
+    checkUpdate: "Check for updates",
+    installUpdate: "Install",
     settings: "Settings",
     log: "Log",
     autostart: "Launch at login",
@@ -252,6 +256,47 @@ function buildMenu(state) {
         try {
           await api("/api/bot/restart", { method: "POST" });
           await refresh();
+        } catch (error) {
+          showError(error);
+        }
+      },
+    },
+    {
+      label: state?.update?.available ? `${t("installUpdate")} ${state.update.latest}` : t("checkUpdate"),
+      click: async () => {
+        try {
+          if (state?.update?.available) {
+            const answer = await dialog.showMessageBox({
+              type: "question",
+              message: `Установить ${state.update.latest}?`,
+              buttons: [t("installUpdate"), "Отмена"],
+              defaultId: 0,
+              cancelId: 1,
+            });
+            if (answer.response === 0) {
+              await api("/api/update/install", { method: "POST" });
+              quit();
+            }
+            return;
+          }
+          const result = await api("/api/update/check", { method: "POST" });
+          await refresh();
+          if (result.update?.available) {
+            const answer = await dialog.showMessageBox({
+              type: "question",
+              message: `Доступна версия ${result.update.latest}`,
+              detail: "Установить сейчас?",
+              buttons: [t("installUpdate"), "Позже"],
+              defaultId: 0,
+              cancelId: 1,
+            });
+            if (answer.response === 0) {
+              await api("/api/update/install", { method: "POST" });
+              quit();
+            }
+          } else {
+            await dialog.showMessageBox({ type: "info", message: t("checkUpdate"), detail: "Установлена последняя версия." });
+          }
         } catch (error) {
           showError(error);
         }

@@ -88,6 +88,7 @@ stream is volatile. Details: [docs/opencode-integration.md](docs/opencode-integr
 | [docs/ui.md](docs/ui.md) | Themes, language, Electron |
 | [docs/cli.md](docs/cli.md) | `ocbridge-cli` |
 | [docs/build-and-release.md](docs/build-and-release.md) | Build and release |
+| [docs/update.md](docs/update.md) | GitHub auto-update |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common problems |
 
 Russian documentation: [docs/ru/README.md](docs/ru/README.md).

@@ -9,6 +9,7 @@ import { Bridge } from "./telegram/bot.ts";
 import { setupTelegramNetwork, type TelegramNet } from "./telegram/net.ts";
 import { DiscordBridge } from "./discord/adapter.ts";
 import { MediaRelay } from "./media/relay.ts";
+import { Updater, type UpdateCache } from "./updater.ts";
 
 export type BotState = "stopped" | "starting" | "running" | "error";
 
@@ -32,6 +33,7 @@ export interface Snapshot {
     autoTopics: boolean;
     showSubagents: boolean;
     media: { relay: "none" | "user" | "all"; maxPhotoMb: number };
+    update: { checkOnStart: boolean; intervalHours: number; autoDownload: boolean };
     ui: { theme: "opencode" | "matrix"; scheme: "system" | "light" | "dark"; lang: "system" | "ru" | "en" };
     proxy?: string;
     apiIp?: string;
@@ -53,6 +55,7 @@ export interface Snapshot {
   autostartSupported: boolean;
   configPath: string;
   sessions: Array<{ id: string; title: string; directory?: string }>;
+  update: ReturnType<Updater["snapshot"]>;
 }
 
 export class App {
@@ -63,6 +66,8 @@ export class App {
   private bridge?: Bridge;
   private discord?: DiscordBridge;
   private relay?: MediaRelay;
+  readonly updater: Updater;
+  private updateTimer?: ReturnType<typeof setInterval>;
   private net?: TelegramNet;
   private state: BotState = "stopped";
   private error = "";
@@ -76,6 +81,12 @@ export class App {
     initLog(this.paths.logFile);
     this.cfg = loadConfig(this.paths);
     this.store = new Store(this.paths.stateFile);
+    this.updater = new Updater({
+      packaged: isCompiled(),
+      dataDir: dirname(this.paths.configFile),
+      onCache: (cache) => this.store.setUpdateCache(cache as unknown as Record<string, unknown>),
+    });
+    this.updater.restore(this.store.updateCache() as UpdateCache | undefined);
   }
 
   snapshot(): Snapshot {
@@ -102,6 +113,11 @@ export class App {
           relay: this.cfg.media?.relay ?? "all",
           maxPhotoMb: this.cfg.media?.maxPhotoMb ?? 10,
         },
+        update: {
+          checkOnStart: this.cfg.update?.checkOnStart !== false,
+          intervalHours: this.cfg.update?.intervalHours ?? 6,
+          autoDownload: this.cfg.update?.autoDownload === true,
+        },
         ui: {
           theme: this.cfg.ui?.theme ?? "opencode",
           scheme: this.cfg.ui?.scheme ?? "system",
@@ -127,6 +143,7 @@ export class App {
       autostartSupported: process.platform === "win32" && isCompiled(),
       configPath: this.paths.configFile,
       sessions: [],
+      update: this.updater.snapshot(),
     };
   }
 
@@ -175,6 +192,7 @@ export class App {
       await this.startDiscord();
       this.state = "running";
       this.startedAt = Date.now();
+      this.startUpdateLoop();
       log.info("bridge running");
     } catch (error) {
       this.state = "error";
@@ -292,14 +310,23 @@ export class App {
     if (typeof patch.defaultDirectory === "string") this.cfg.defaultDirectory = patch.defaultDirectory.trim() || undefined;
     if (typeof patch.autoTopics === "boolean") this.cfg.autoTopics = patch.autoTopics;
     if (typeof patch.showSubagents === "boolean") this.cfg.showSubagents = patch.showSubagents;
-    const media = (patch.media ?? {}) as Record<string, unknown>;
-    if (media.relay === "none" || media.relay === "user" || media.relay === "all") {
+    const media = (patch.media ?? {}) as Record<string, unknown>;    if (media.relay === "none" || media.relay === "user" || media.relay === "all") {
       this.cfg.media = { ...(this.cfg.media ?? {}), relay: media.relay };
     }
     if (typeof media.maxPhotoMb === "number" && Number.isFinite(media.maxPhotoMb)) {
       this.cfg.media = {
         ...(this.cfg.media ?? {}),
         maxPhotoMb: Math.min(10, Math.max(1, Math.round(media.maxPhotoMb))),
+      };
+    }
+
+    const update = (patch.update ?? {}) as Record<string, unknown>;
+    if (typeof update.checkOnStart === "boolean") this.cfg.update = { ...(this.cfg.update ?? {}), checkOnStart: update.checkOnStart };
+    if (typeof update.autoDownload === "boolean") this.cfg.update = { ...(this.cfg.update ?? {}), autoDownload: update.autoDownload };
+    if (typeof update.intervalHours === "number" && Number.isFinite(update.intervalHours)) {
+      this.cfg.update = {
+        ...(this.cfg.update ?? {}),
+        intervalHours: Math.min(168, Math.max(1, Math.round(update.intervalHours))),
       };
     }
     const ui = (patch.ui ?? {}) as Record<string, unknown>;
@@ -346,8 +373,33 @@ export class App {
     }
   }
 
-  setAutostart(enabled: boolean): void {
-    if (process.platform !== "win32" || !isCompiled()) throw new Error("Автозапуск поддерживается в собранной версии для Windows");
+  private startUpdateLoop(): void {
+    if (this.updateTimer) return;
+    const settings = this.cfg.update ?? {};
+    if (settings.checkOnStart !== false) void this.checkUpdate(true);
+    const hours = Math.min(168, Math.max(1, settings.intervalHours ?? 6));
+    this.updateTimer = setInterval(() => void this.checkUpdate(true), hours * 60 * 60 * 1000);
+    this.updateTimer.unref?.();
+  }
+
+  async checkUpdate(auto = false): Promise<ReturnType<Updater["snapshot"]>> {
+    const snapshot = await this.updater.check();
+    if (auto && snapshot.available && this.cfg.update?.autoDownload === true && !snapshot.downloading) {
+      log.info(`update ${snapshot.latest}: auto-download enabled`);
+      void this.updater.download();
+    }
+    return snapshot;
+  }
+
+  async downloadUpdate(): Promise<ReturnType<Updater["snapshot"]>> {
+    return this.updater.download();
+  }
+
+  async installUpdate(): Promise<ReturnType<Updater["snapshot"]>> {
+    return this.updater.install();
+  }
+
+  setAutostart(enabled: boolean): void {    if (process.platform !== "win32" || !isCompiled()) throw new Error("Автозапуск поддерживается в собранной версии для Windows");
     const exe = process.execPath;
     const args = enabled
       ? ["add", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "OpenCodeTelegramBridge", "/t", "REG_SZ", "/d", `"${exe}" --no-browser`, "/f"]

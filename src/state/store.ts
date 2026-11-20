@@ -25,6 +25,8 @@ export interface State {
   /** Discord channel id -> session id */
   discordChannels: Record<string, string>;
   discordSessions: Record<string, DiscordSessionRecord>;
+  /** Last GitHub update check (cache for the UI and 6 h timer). */
+  update?: Record<string, unknown>;
 }
 
 const emptyState = (): State => ({ topics: {}, chats: {}, sessions: {}, discordThreads: {}, discordChannels: {}, discordSessions: {} });
@@ -196,6 +198,15 @@ export class Store {
   setDiscordTitle(sessionID: string, title: string): void {
     const record = this.data.discordSessions[sessionID];
     if (record) record.title = title;
+    this.save();
+  }
+
+  updateCache(): Record<string, unknown> | undefined {
+    return this.data.update;
+  }
+
+  setUpdateCache(cache: Record<string, unknown>): void {
+    this.data.update = cache;
     this.save();
   }
 

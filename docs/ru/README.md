@@ -86,6 +86,7 @@ Telegram ⇄ grammY (long polling) ⇄ Bridge ⇄ OpenCode HTTP API
 | [ui.md](ui.md) | Темы, язык, Electron |
 | [cli.md](cli.md) | `ocbridge-cli` |
 | [build-and-release.md](build-and-release.md) | Сборка и релиз |
+| [update.md](update.md) | Автообновление GitHub: проверка, загрузка, SHA256, установка |
 | [troubleshooting.md](troubleshooting.md) | Частые проблемы |
 
 English documentation: [../README.md](../README.md).

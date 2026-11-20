@@ -18,6 +18,7 @@ shell, a .NET 10 CLI and an Inno Setup installer.
 | [ui.md](ui.md) | Themes, language, Electron shell, tray |
 | [cli.md](cli.md) | All `ocbridge-cli` commands with output examples |
 | [build-and-release.md](build-and-release.md) | Build, versions, installer, signing |
+| [update.md](update.md) | GitHub auto-update: checks, download, SHA256, install |
 | [troubleshooting.md](troubleshooting.md) | 409, Telegram blocking, deleted topic, timeouts |
 
 Russian mirrors: [docs/ru/](ru/README.md).

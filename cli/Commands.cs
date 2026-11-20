@@ -26,8 +26,39 @@ internal static class Commands
         return 0;
     }
 
-    // ------------------------------------------------------------- bot control
+    // ------------------------------------------------------------- update
 
+    public static async Task<int> UpdateAsync(ApiClient api, List<string> args)
+    {
+        var mode = args.Count > 0 ? args[0].ToLowerInvariant() : "--check";
+        if (mode == "--install")
+        {
+            var install = await api.PostAsync("/api/update/install");
+            var error = Text(install?["update"]?["error"]);
+            if (error.Length > 0)
+            {
+                Console.Error.WriteLine("Ошибка: " + error);
+                return 1;
+            }
+            Console.WriteLine("Установщик запускается, мост будет перезапущен.");
+            return 0;
+        }
+
+        var result = await api.PostAsync("/api/update/check");
+        var update = result?["update"];
+        WriteRow("Текущая", Text(update?["current"]));
+        WriteRow("Последняя", Text(update?["latest"]));
+        WriteRow("Доступна", update?["available"]?.GetValue<bool>() == true ? "да" : "нет");
+        var notes = Text(update?["notes"]);
+        if (notes.Length > 0)
+            Console.WriteLine("Заметки:       " + notes.Split('\n')[0]);
+        var downloadError = Text(update?["error"]);
+        if (downloadError.Length > 0)
+            Console.Error.WriteLine("Ошибка: " + downloadError);
+        return 0;
+    }
+
+    // ------------------------------------------------------------- bot control
     public static async Task<int> BotAsync(ApiClient api, string action)
     {
         await api.PostAsync("/api/bot/" + action);

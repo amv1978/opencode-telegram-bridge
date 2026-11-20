@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.0 — 2026-11-20
+
+Автообновление из GitHub Releases.
+
+### Добавлено
+
+- `src/updater.ts`: проверка `releases/latest`, semver-сравнение, загрузка
+  установщика в `%TEMP%\ocbridge-update\setup.exe` с прогрессом 0–100 %,
+  таймаутом 30 мин и проверкой `*.sha256`; установка через
+  `/VERYSILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS`.
+  Только для собранной версии; данные в `%APPDATA%` не трогаются.
+- Настройки `update.checkOnStart` (по умолчанию true), `intervalHours` (6),
+  `autoDownload` (false); авто-проверка при старте и каждые 6 ч, кэш в
+  `state.json`.
+- API: `POST /api/update/check|download|install`, поле `update` в `/api/state`.
+- Веб-панель: баннер «Доступна версия X — Скачать / Установить», прогресс,
+  кнопка «Проверить обновления» и поля настроек.
+- Трей: «Проверить обновления» → «Установить X.Y.Z»; CLI:
+  `ocbridge-cli update [--check|--install]`.
+- Релизный пайплайн: вместе с установщиком публикуется
+  `ocbridge-setup-X.exe.sha256`.
+
+### Сборка
+
+- Версия `0.5.0` в `package.json`, `desktop/package.json`,
+  `installer/ocbridge.iss`, `cli/cli.csproj` и `Program.Version`.
+
 ## 0.4.4 — 2026-11-20
 
 Надёжный релей фото/документов из Telegram.

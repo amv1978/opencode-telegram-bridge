@@ -70,6 +70,18 @@ async function handle(app: App, request: Request): Promise<Response> {
       return json({ ok: true });
     }
 
+    if (request.method === "POST" && url.pathname === "/api/update/check") {
+      return json({ update: await app.checkUpdate() });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/update/download") {
+      return json({ update: await app.downloadUpdate() });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/update/install") {
+      return json({ update: await app.installUpdate() });
+    }
+
     if (request.method === "POST" && url.pathname === "/api/autostart") {
       const body = (await request.json()) as { enabled?: boolean };
       app.setAutostart(Boolean(body.enabled));
