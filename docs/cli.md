@@ -1,37 +1,39 @@
+[English](cli.md) · [Русский](ru/cli.md)
+
 # CLI: ocbridge-cli
 
-Консольный клиент локального API демона. .NET 10, без внешних зависимостей.
+A console client for the daemon's local API. .NET 10, no external dependencies.
 
 ```powershell
-ocbridge-cli.exe [--url URL] <команда> [параметры]
+ocbridge-cli.exe [--url URL] <command> [options]
 ```
 
-`--url` или переменная `OCBRIDGE_URL`; по умолчанию `http://127.0.0.1:7788`.
-HTTP-таймаут — 10 с.
+`--url` or the `OCBRIDGE_URL` variable; default `http://127.0.0.1:7788`.
+HTTP timeout — 10 s.
 
 ## status
 
 ```
 > ocbridge-cli status
-Состояние     running
-Пользователь  @my_bot
+State         running
+User          @my_bot
 OpenCode      2.3.2 (http://127.0.0.1:28894)
 Telegram      pinned 149.154.167.220
-Uptime        2ч 14м
-Сессий        4
+Uptime        2h 14m
+Sessions      4
 ```
 
-При ошибке добавляется строка `Ошибка: …`. Uptime: `12с`, `5м 3с`, `2ч 14м`, `1д 3ч 8м`.
+On error an `Error: …` line is added. Uptime: `12s`, `5m 3s`, `2h 14m`, `1d 3h 8m`.
 
 ## start / stop / restart
 
 ```
 > ocbridge-cli restart
-Бот перезапускается.
-Состояние: running
+Bot is restarting.
+State: running
 ```
 
-Состояние печатается после паузы 300 мс, если API успел ответить.
+The state is printed after a 300 ms pause if the API has answered by then.
 
 ## sessions
 
@@ -43,7 +45,7 @@ ses_01JABCDEF0123456789ABCDEF   Refactor API                   D:\work\api
 ses_01JABCDEF9876543210FEDCBA   Telegram session               D:\work\api
 ```
 
-`--json` (или `-j`) — сырой массив из `/api/sessions`. Пусто — «Сессий нет.»
+`--json` (or `-j`) — the raw array from `/api/sessions`. Empty — “No sessions.”
 
 ## logs
 
@@ -54,8 +56,8 @@ ses_01JABCDEF9876543210FEDCBA   Telegram session               D:\work\api
 2026-11-19T09:12:04.301Z INFO  bot @my_bot started (mode=both)
 ```
 
-`-n N` — строки, по умолчанию 100, максимум 1000. `--follow` / `-f` — печатать новое
-каждые 2 с (Ctrl+C — выход; служебная строка идёт в stderr).
+`-n N` — lines, default 100, maximum 1000. `--follow` / `-f` — print new lines every
+2 s (Ctrl+C to exit; the service line goes to stderr).
 
 ## config
 
@@ -64,16 +66,16 @@ ses_01JABCDEF9876543210FEDCBA   Telegram session               D:\work\api
 both
 
 > ocbridge-cli config get telegram.proxy
-(не задано)
+(not set)
 
 > ocbridge-cli config set stream.editIntervalMs=1800
-Готово: stream.editIntervalMs = 1800
+Done: stream.editIntervalMs = 1800
 
 > ocbridge-cli config set ui.theme=matrix
-Готово: ui.theme = matrix
+Done: ui.theme = matrix
 ```
 
-`config get` без ключа печатает pretty-JSON снимка конфига:
+`config get` without a key prints the pretty-JSON config snapshot:
 
 ```json
 {
@@ -84,6 +86,8 @@ both
   "showTools": "compact",
   "format": "rich",
   "autoTopics": true,
+  "showSubagents": true,
+  "media": { "relay": "all", "maxPhotoMb": 10 },
   "ui": { "theme": "opencode", "scheme": "system", "lang": "system" },
   "allowedUsers": [{ "id": 123456789, "role": "admin", "name": "Mike" }],
   "hasToken": true,
@@ -91,62 +95,62 @@ both
 }
 ```
 
-Допустимые ключи `config set`: `mode` (`topics|private|both`), `topicsChatId`,
+Accepted `config set` keys: `mode` (`topics|private|both`), `topicsChatId`,
 `defaultDirectory`, `autoTopics` (`true|false`), `stream.editIntervalMs`
 (500…10000), `stream.showTools` (`off|compact|full`), `stream.format` (`rich|html`),
 `telegram.proxy`, `telegram.apiIp`, `ui.theme` (`opencode|matrix`),
-`ui.scheme` (`system|light|dark`). Короткие формы (`editIntervalMs`, `showTools`,
-`format`, `proxy`, `apiIp`) тоже принимаются.
+`ui.scheme` (`system|light|dark`). Short forms (`editIntervalMs`, `showTools`,
+`format`, `proxy`, `apiIp`) are accepted too.
 
-Токен через CLI **не задаётся** — только в панели.
+The token is **not** set via the CLI — only in the panel.
 
 ## autostart
 
 ```
 > ocbridge-cli autostart status
-Автозапуск     включён
-Поддержка      да
+Autostart      enabled
+Supported      yes
 
 > ocbridge-cli autostart on
-Автозапуск включён.
+Autostart enabled.
 ```
 
 ## doctor
 
 ```
 > ocbridge-cli doctor
-✔ API: http://127.0.0.1:7788 доступен
-✔ Состояние: running
+✔ API: http://127.0.0.1:7788 reachable
+✔ State: running
 ✔ OpenCode: 2.3.2 (http://127.0.0.1:28894)
 ✔ Telegram: @my_bot
-✔ Конфиг: C:\Users\me\AppData\Roaming\opencode-telegram-bridge\config.json
-✔ Автозапуск: включён, поддерживается
-✔ Токен Telegram: задан (…AbCd)
+✔ Config: C:\Users\me\AppData\Roaming\opencode-telegram-bridge\config.json
+✔ Autostart: enabled, supported
+✔ Telegram token: set (…AbCd)
 
-Все проверки пройдены.
+All checks passed.
 ```
 
-Если демон не запущен, doctor сразу завершается с кодом 3 и подсказкой.
+If the daemon is not running, doctor exits immediately with code 3 and a hint.
 
 ## version / help
 
 ```
 > ocbridge-cli version
-ocbridge-cli 0.2.0
-API: 0.2.0
+ocbridge-cli 0.4.1
+API: 0.4.1
 OpenCode: 2.3.2
 
 > ocbridge-cli help logs
-logs [-n N] [--follow] — хвост лога демона.
--n N      сколько строк показать (по умолчанию 100, максимум 1000).
---follow  опрашивать API каждые 2 с и печатать только новые строки (Ctrl+C — выход).
+logs [-n N] [--follow] — daemon log tail.
+-n N      number of lines (default 100, maximum 1000).
+--follow  poll the API every 2 s and print only new lines (Ctrl+C to exit).
 ```
 
-## Коды выхода
+## Exit codes
 
-| Код | Значение |
+| Code | Meaning |
 |---|---|
-| 0 | Успех |
-| 1 | Ошибка API/HTTP или провайдера |
-| 2 | Ошибка аргументов |
-| 3 | Демон не запущен (`connection refused`) |
+| 0 | Success |
+| 1 | API/HTTP or provider error |
+| 2 | Argument error |
+| 3 | Daemon is not running (`connection refused`) |

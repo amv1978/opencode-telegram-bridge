@@ -114,6 +114,16 @@ function basic(password: string): string {
   return "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
 }
 
+/** Keeps only valid `{uri,name}` attachments; anything else is dropped and logged. */
+function promptFiles(files?: Array<{ uri: string; name?: string }>): Array<{ uri: string; name?: string }> {
+  if (!files?.length) return [];
+  return files.flatMap((file) => {
+    const uri = typeof file?.uri === "string" ? file.uri.trim() : "";
+    if (!uri) return [];
+    return [{ uri, ...(file.name ? { name: String(file.name) } : {}) }];
+  });
+}
+
 export class OcClient {
   private readonly auth: string;
 
@@ -181,7 +191,21 @@ export class OcClient {
     metadata?: Record<string, unknown>,
     files?: Array<{ uri: string; name?: string }>,
   ): Promise<void> {
-    await this.call("POST", `/api/session/${sessionID}/prompt`, { text, metadata, files });
+    const payload = promptFiles(files);
+    if (files?.length && payload.length !== files.length) {
+      log.error(`prompt files dropped (missing uri): ${JSON.stringify(files.map((file) => Object.keys(file ?? {})))}`);
+    }
+    try {
+      await this.call("POST", `/api/session/${sessionID}/prompt`, { text, metadata, files: payload });
+    } catch (error) {
+      const message = (error as Error).message;
+      if (/\b400\b/.test(message)) {
+        log.error(
+          `prompt 400 files=${JSON.stringify(payload.map((file) => Object.keys(file)))} names=${JSON.stringify(payload.map((file) => file.name))}`,
+        );
+      }
+      throw error;
+    }
   }
 
   async interrupt(sessionID: string): Promise<{ interrupted: boolean }> {

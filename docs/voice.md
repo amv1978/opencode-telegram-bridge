@@ -1,77 +1,79 @@
-# Голосовые сообщения
+[English](voice.md) · [Русский](ru/voice.md)
 
-Распознавание локальное: Telegram → ffmpeg → WAV → HEX CLI → текст в сессию.
-Облачные сервисы не используются.
+# Voice messages
 
-## Пайплайн
+Recognition is local: Telegram → ffmpeg → WAV → HEX CLI → text into the session.
+No cloud services are used.
+
+## Pipeline
 
 ```
 voice/audio (OGG/Opus, MP3, WAV, MP4, WebM)
-        │  Bot API getFile (до 20 МБ)
+        │  Bot API getFile (up to 20 MB)
         ▼
-ffmpeg -ar 16000 -ac 1 → WAV      (временная папка, удаляется)
+ffmpeg -ar 16000 -ac 1 → WAV      (temp folder, deleted afterwards)
         ▼
 hex transcribe --json voice.wav
         ▼
-"🎤 <текст>\n⏱ 0.3 с"  →  prompt в OpenCode
+"🎤 <text>\n⏱ 0.3 s"  →  prompt into OpenCode
 ```
 
-WAV пишется во временный файл: потоковый WAV с заголовком HEX не принимает.
+WAV is written to a temp file: HEX does not accept a streaming WAV with a header.
 
-## Где ищется HEX
+## Where HEX is found
 
-Порядок (`src/audio/transcribe.ts`):
+Order (`src/audio/transcribe.ts`):
 
-1. `HEX_CLI` — полный путь к `hex.com` (переменная окружения).
-2. `%APPDATA%\hex\current-version` → `%APPDATA%\hex\versions\<версия>\hex.com`.
+1. `HEX_CLI` — full path to `hex.com` (environment variable).
+2. `%APPDATA%\hex\current-version` → `%APPDATA%\hex\versions\<version>\hex.com`.
 3. `%APPDATA%\hex\bin\hex.com`.
 
-Если ничего не найдено, бот отвечает: «HEX не найден. Установите HEX или укажите
-путь в HEX_CLI».
+If nothing is found, the bot replies: “HEX not found. Install HEX or set the path in
+HEX_CLI”.
 
-## Labs-флаг
+## Labs flag
 
-HEX не транскрибирует файлы, пока не включён Labs-флаг `transcribe-files`.
-При первом голосовом бот предлагает кнопку **Включить** (согласие пользователя),
-она выполняет:
+HEX does not transcribe files until the Labs flag `transcribe-files` is enabled.
+On the first voice message the bot offers an **Enable** button (user consent); it runs:
 
 ```
 hex labs on transcribe-files
 ```
 
-Эквивалент вручную: HEX → Labs → **Transcribe files**. Если флаг выключен,
-`hex transcribe` возвращает JSON со `status: "error"`, `code: "disabled"`.
+Manual equivalent: HEX → Labs → **Transcribe files**. If the flag is off,
+`hex transcribe` returns JSON with `status: "error"`, `code: "disabled"`.
 
-## Где ищется ffmpeg
+## Where ffmpeg is found
 
 1. `FFMPEG_PATH`;
-2. `ffmpeg.exe` рядом с `ocbridge.exe`;
-3. `dist\ffmpeg.exe` в текущей папке (dev-режим);
-4. `ffmpeg` из `PATH`.
+2. `ffmpeg.exe` next to `ocbridge.exe`;
+3. `dist\ffmpeg.exe` in the current folder (dev mode);
+4. `ffmpeg` from `PATH`.
 
-Установщик кладёт `ffmpeg.exe` рядом с `ocbridge.exe`, отдельно ставить не нужно.
+The installer puts `ffmpeg.exe` next to `ocbridge.exe`; no separate install is needed.
 
-## Команда и разбор ответа
+## Command and response parsing
 
 ```
-hex transcribe --json <путь к wav>
+hex transcribe --json <wav path>
 ```
 
-Мост принимает текст из полей `text`, `transcript`, `transcription`, `result`
-(включая вложенный `result.text`). Ненулевой код выхода или пустой ответ считается
-ошибкой. Модель и язык HEX выбирает сам по своим настройкам — мост их не передаёт.
+The bridge takes text from `text`, `transcript`, `transcription`, `result` fields
+(including nested `result.text`). A non-zero exit code or an empty response is an
+error. HEX chooses the model and language from its own settings — the bridge does not
+pass them.
 
-## Задержки
+## Latency
 
-На Windows 11 с HEX 3.4.0 типичный цикл «скачать → ffmpeg → распознать» занимает
-**200–300 мс** для короткой фразы; в чате показывается округлённое время (`⏱ 0.3 с`).
-Длинные голосовые обрабатываются дольше пропорционально длительности.
+On Windows 11 with HEX 3.4.0 a typical “download → ffmpeg → transcribe” cycle takes
+**200–300 ms** for a short phrase; the chat shows the rounded time (`⏱ 0.3 s`).
+Longer voice messages take proportionally longer.
 
-## Ошибки
+## Errors
 
-| Ответ | Причина |
+| Reply | Cause |
 |---|---|
-| «Для голосовых нужно включить распознавание файлов в HEX» | Нет Labs-флага |
-| «HEX не найден» | Не найден `hex.com`, задайте `HEX_CLI` |
-| «Речь не распознана» | HEX вернул `no-speech` |
-| «Ошибка обработки аудио» | ffmpeg не запустился или файл повреждён |
+| “Voice needs file transcription enabled in HEX” | Labs flag is off |
+| “HEX not found” | `hex.com` not found, set `HEX_CLI` |
+| “Speech not recognised” | HEX returned `no-speech` |
+| “Audio processing error” | ffmpeg failed to start or the file is corrupt |

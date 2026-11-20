@@ -9,6 +9,7 @@ import { Streamer, type Target } from "./stream.ts";
 import { enableHexFileTranscription, transcribeAudio } from "../audio/transcribe.ts";
 import {
   collectAgentFiles,
+  promptFilesFromMedia,
   type MediaItem,
   type MediaRelay,
   type MediaSendLimits,
@@ -479,6 +480,8 @@ export class Bridge {
     files?: Array<{ uri: string; name?: string }>,
     media: MediaItem[] = [],
   ): Promise<void> {
+    // Single conversion point: prompt attachments are always { uri, name }.
+    if (media.length) files = promptFilesFromMedia(media);
     log.info(`task: ${text.slice(0, 80).replace(/\s+/g, " ")}${files ? ` [+${files.length} file]` : ""}`);
     const threadId = (ctx.message as { message_thread_id?: number } | undefined)?.message_thread_id;
     const chatId = ctx.chat?.id;
@@ -652,9 +655,7 @@ export class Bridge {
       const mime = document?.mime_type ?? "image/jpeg";
       const name = document?.file_name ?? `photo-${Date.now()}.jpg`;
       const caption = (message.caption ?? "").trim() || "Посмотри это изображение.";
-      await this.submitTask(ctx, caption, [{ uri: `data:${mime};base64,${buffer.toString("base64")}`, name }], [
-        { buffer, mime, name },
-      ]);
+      await this.submitTask(ctx, caption, undefined, [{ buffer, mime, name }]);
     } catch (error) {
       log.warn("media download failed:", (error as Error).message);
       await ctx.reply(`⚠️ Не смог скачать файл: ${(error as Error).message.slice(0, 120)}`).catch(() => undefined);

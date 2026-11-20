@@ -1,15 +1,16 @@
-# Медиа и пересылка файлов
+[English](media.md) · [Русский](ru/media.md)
 
-Мост пересылает файлы между всеми чатами, к которым привязана сессия:
+# Media and file relay
 
-- Telegram: тема форума (`topicsChatId` + `threadId`) или личный чат;
-- Discord: публичный тред или канал.
+The bridge relays files between every chat a session is bound to:
 
-Чат-источник исключается: файл, отправленный в Telegram, не возвращается в
-Telegram, но уходит в Discord (и наоборот). Файлы, созданные агентом, уходят
-во все привязанные чаты.
+- Telegram: a forum topic (`topicsChatId` + `threadId`) or a private chat;
+- Discord: a public thread or channel.
 
-## Настройка
+The origin chat is excluded: a file sent in Telegram is not returned to Telegram but
+goes to Discord (and vice versa). Files produced by the agent go to all bound chats.
+
+## Configuration
 
 ```json
 {
@@ -20,49 +21,48 @@ Telegram, но уходит в Discord (и наоборот). Файлы, соз
 }
 ```
 
-| Поле | Значения | По умолчанию |
+| Field | Values | Default |
 |---|---|---|
-| `relay` | `all` — пользователи + вывод агента; `user` — только присланное пользователями; `none` — выключено | `all` |
-| `maxPhotoMb` | до какого размера изображение отправляется как фото (1–10) | `10` |
+| `relay` | `all` — users + agent output; `user` — only user-sent media; `none` — off | `all` |
+| `maxPhotoMb` | images up to this size are sent as photos (1–10) | `10` |
 
-Оба поля есть в UI: **Настройки → Пересылка файлов** и **Фото до, МБ**;
-значения видны в снимке `/api/state` (`config.media`).
+Both fields are in the UI: **Settings → File relay** and **Photo max, MB**; values
+are visible in the `/api/state` snapshot (`config.media`).
 
-## Лимиты и fallback
+## Limits and fallback
 
-| Платформа | Фото | Документ |
+| Platform | Photo | Document |
 |---|---|---|
-| Telegram | 10 МБ (`maxPhotoMb` ≤ 10) | 50 МБ |
-| Discord | — | 10 МБ |
+| Telegram | 10 MB (`maxPhotoMb` ≤ 10) | 50 MB |
+| Discord | — | 10 MB |
 
-- Изображение в пределах `maxPhotoMb` уходит как фото, больше — как документ.
-- Если файл больше лимита платформы (Telegram 50 МБ, Discord 10 МБ), вместо
-  загрузки отправляется текстом ссылка: для `https://…` — URL как есть, для
-  локального файла — абсолютный путь.
-- Повторная пересылка тех же байтов (sha256) в ту же сессию подавляется на
-  10 минут, чтобы зеркало не зациклилось.
-- Ошибки загрузки/скачивания только пишутся в журнал: событийный цикл не
-  падает.
+- An image within `maxPhotoMb` goes as a photo, larger — as a document.
+- If a file exceeds the platform limit (Telegram 50 MB, Discord 10 MB), a text link
+  is sent instead: for `https://…` — the URL as is, for a local file — the absolute
+  path.
+- Repeated relay of the same bytes (sha256) into the same session is suppressed for
+  10 minutes so the mirror cannot loop.
+- Upload/download errors are only logged: the event loop never crashes.
 
-## Что считается вложением агента
+## What counts as an agent attachment
 
-На `session.execution.succeeded` и `session.tool.success` мост читает
-последние сообщения (`limit=5,order=desc`) и смотрит:
+On `session.execution.succeeded` and `session.tool.success` the bridge reads the
+latest messages (`limit=5,order=desc`) and looks at:
 
-- части `content[]` типа `file`;
-- части типа `tool`, у которых `state.content[]` содержит записи `file`.
+- `content[]` parts of type `file`;
+- `tool` parts whose `state.content[]` contains `file` entries.
 
-Формат, наблюдаемый в OpenCode 2.3.2:
+The format observed in OpenCode 2.3.2:
 
 ```json
 { "type": "file", "uri": "data:image/png;base64,…" }
 ```
 
-Поддерживаются также `url`/`path`; локальный путь читается с диска, а если файл
-больше лимита — уходит текстом. Первый встреченный вариант формата пишется в
-журнал строкой `agent file part: …`.
+`url`/`path` are also supported; a local path is read from disk, and if the file
+exceeds the limit it is sent as text. The first encountered format variant is logged
+as `agent file part: …`.
 
-## Голосовые
+## Voice
 
-Аудио распознаётся и в чат уходит расшифровка (см. [voice.md](voice.md));
-сам аудиофайл в релей не попадает.
+Audio is recognised and the transcript goes to the chat (see [voice.md](voice.md));
+the audio file itself is not relayed.

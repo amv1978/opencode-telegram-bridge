@@ -1,3 +1,5 @@
+[English](AGENTS.md) · [Русский](docs/ru/AGENTS.md)
+
 # AGENTS.md
 
 Bridge between Telegram and OpenCode 2.x: tasks from chat go to real OpenCode

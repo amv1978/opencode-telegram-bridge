@@ -1,90 +1,95 @@
-# Интеграция с OpenCode
+[English](opencode-integration.md) · [Русский](ru/opencode-integration.md)
 
-Проверено на OpenCode 2.3.2. Используется общий фоновый сервис (`opencode service start`
-или Desktop), поэтому мост видит те же сессии, что TUI и приложение.
+# OpenCode integration
 
-## Эндпоинты
+Tested with OpenCode 2.3.2. The shared background service is used (`opencode service
+start` or Desktop), so the bridge sees the same sessions as TUI and the desktop app.
 
-| Метод | Путь | Назначение |
+## Endpoints
+
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/info` | Версия и проверка доступности |
-| GET | `/api/session?limit=&search=` | Список сессий (`{ data: [...] }`) |
-| POST | `/api/session` | Создать: `title`, `location.directory`, `permissions` |
-| GET | `/api/session/{id}` | Одна сессия |
-| PATCH | `/api/session/{id}` | Переименование (`title`) |
-| GET | `/api/session/{id}/message?limit=&order=` | История сообщений |
+| GET | `/api/info` | Version and availability check |
+| GET | `/api/session?limit=&search=` | Session list (`{ data: [...] }`) |
+| POST | `/api/session` | Create: `title`, `location.directory`, `permissions` |
+| GET | `/api/session/{id}` | One session |
+| PATCH | `/api/session/{id}` | Rename (`title`) |
+| GET | `/api/session/{id}/message?limit=&order=` | Message history |
 | POST | `/api/session/{id}/prompt` | `{ text, metadata, files }` |
-| POST | `/api/session/{id}/interrupt` | Прервать ход |
-| GET | `/api/session/{id}/permission` | Ожидающие разрешения |
+| POST | `/api/session/{id}/interrupt` | Interrupt the turn |
+| GET | `/api/session/{id}/permission` | Pending permissions |
 | POST | `/api/session/{id}/permission/{requestID}/reply` | `{ decision, message }` |
 | POST | `/api/session/{id}/model` | `{ model: { providerID, id, variant? } }` |
 | POST | `/api/session/{id}/agent` | `{ agent }` |
-| GET | `/api/agent` | Список агентов |
-| GET | `/api/event?types=…` | SSE-поток |
+| GET | `/api/agent` | Agent list |
+| GET | `/api/event?types=…` | SSE stream |
 
-Авторизация — Basic `opencode:<password>`; пароль из `service.json`, конфига или
-`OPENCODE_PASSWORD`.
+Auth is Basic `opencode:<password>`; the password comes from `service.json`, the
+config or `OPENCODE_PASSWORD`.
 
-## События SSE
+## SSE events
 
-Подписка (`src/opencode/client.ts`) запрашивает только нужные типы:
+The subscription (`src/opencode/client.ts`) asks only for the needed types:
 
 ```
 /api/event?types=session.text.delta&types=session.execution.succeeded&...
 ```
 
-Повторяющийся параметр `types` обязателен: список через запятую OpenCode не понимает.
+The repeated `types` parameter is mandatory: OpenCode does not accept a comma list.
 
-| Событие | Обработка |
+| Event | Handling |
 |---|---|
-| `session.inbox.enqueued` | Зеркалит prompt из Desktop/TUI в Telegram |
-| `session.execution.started` | Начинает стрим, если его ещё нет |
-| `session.text.started` / `delta` | Добавляет текст к сообщению |
-| `session.text.ended` | Заменяет текст финальным |
-| `session.tool.called` | Строка инструментов (до 6, режим `showTools`) |
-| `session.execution.succeeded/failed/interrupted` | Завершает ход, пишет футер |
-| `permission.asked` | Отправляет сообщение с кнопками |
-| `session.renamed` | Переименовывает тему форума |
-| `session.created` | Кэширует `parentID`/`agent`/`title` новой сессии |
-| `session.synthetic` | Отчёт субагента (`<subagent>`) в чат родителя |
+| `session.inbox.enqueued` | Mirrors a Desktop/TUI prompt into Telegram |
+| `session.execution.started` | Starts the stream if it does not exist yet |
+| `session.text.started` / `delta` | Appends text to the message |
+| `session.text.ended` | Replaces text with the final version |
+| `session.tool.called` | Tool line (up to 6, `showTools` mode) |
+| `session.execution.succeeded/failed/interrupted` | Ends the turn, writes the footer |
+| `permission.asked` | Sends a message with buttons |
+| `session.renamed` | Renames the forum topic |
+| `session.created` | Caches `parentID`/`agent`/`title` of a new session |
+| `session.synthetic` | Subagent report (`<subagent>`) into the parent chat |
 
-`session.idle` не приходит вообще — конец хода определяется только `session.execution.*`.
+`session.idle` never arrives — the end of a turn is defined only by `session.execution.*`.
 
-## Особенности
+## Specifics
 
-**Строгая очередь.** Все события обрабатываются последовательно (`eventChain`), иначе
-зеркалированный вопрос мог бы прийти в чат после ответа. Каждый обработчик ограничен
-20 секундами; зависший обработчик пропускается с записью в журнал.
+**Strict queue.** All events are processed serially (`eventChain`), otherwise a
+mirrored question could reach the chat after the answer. Every handler is capped at
+20 seconds; a stuck handler is skipped and logged.
 
-**Поток волатильный.** SSE не хранит историю и не переигрывает пропущенное. При обрыве
-клиент переподключается с экспоненциальной паузой (1–30 с) и заново получает `session.text.*`.
-Текст, потерянный посреди хода, может остаться неполным до `session.text.ended`.
+**Volatile stream.** SSE keeps no history and does not replay missed events. On a
+disconnect the client reconnects with exponential backoff (1–30 s) and receives
+`session.text.*` again. Text lost mid-turn may stay incomplete until
+`session.text.ended`.
 
-**Удалённая тема.** Если Telegram отвечает `message thread not found`, `Streamer` очищает
-привязку (`store.clearThread`) и отправляет финальный текст в корень чата, чтобы ответ
-не потерялся.
+**Deleted topic.** If Telegram answers `message thread not found`, `Streamer` clears
+the binding (`store.clearThread`) and sends the final text to the chat root so the
+answer is not lost.
 
-**Переименование в две стороны.** Переименование темы в Telegram обновляет `title`
-сессии. `session.renamed` переименовывает тему. Защита от цикла — `appliedTitles`:
-событие, вызванное собственным переименованием, игнорируется.
+**Two-way renaming.** Renaming a topic in Telegram updates the session `title`.
+`session.renamed` renames the topic. Loop protection is `appliedTitles`: an event
+caused by our own rename is ignored.
 
-**Субагенты.** Сессии с `parentID` не зеркалятся и не принимают сообщения: тема,
-привязанная к внутренней сессии, отвечает просьбой выбрать другую. При
-`showSubagents` (по умолчанию) дочерний ход добавляет строку `🧩 <agent>` в
-живой блок родителя, а отчёт `session.synthetic` уходит цитатой в чат родителя.
+**Subagents.** Sessions with `parentID` are not mirrored and do not accept messages:
+a topic bound to a child session asks the user to pick another one. With
+`showSubagents` (default) a child turn adds a `🧩 <agent>` line to the parent live
+block, and the `session.synthetic` report is posted as a quote in the parent chat.
 
-**Футер статистики.** Считается как `SessionTurn` в `packages/util/src/session-turn.ts`:
+**Stats footer.** Computed like `SessionTurn` in `packages/util/src/session-turn.ts`:
 
-- `duration` = `time.completed` последнего assistant − `time.created` prompt;
-- `tok/s` = сумма `output + reasoning` шагов хода / сумма (`streamed − firstToken`);
-  показывается, только если окно генерации больше 200 мс;
-- `context` = `input + cache.read + output + reasoning` последнего assistant.
+- `duration` = `time.completed` of the last assistant − `time.created` of the prompt;
+- `tok/s` = sum of `output + reasoning` over the turn / sum of (`streamed − firstToken`);
+  shown only when the generation window is longer than 200 ms;
+- `context` = `input + cache.read + output + reasoning` of the last assistant.
 
-Если история недоступна, длительность берётся из локального таймера стрима.
+If history is unavailable, duration comes from the local stream timer.
 
-**Лимиты и пагинация.** Список сессий запрашивается с `limit` 8 (панель), 10 (`/sessions`)
-и 50 (`/attach`); история — `limit=60&order=desc`, затем разворачивается в хронологию.
-Глубокой пагинации нет: более старые сессии ищутся через `search`.
+**Limits and pagination.** Session lists use `limit` 8 (panel), 10 (`/sessions`) and
+50 (`/attach`); history uses `limit=60&order=desc`, then is reversed into
+chronological order. There is no deep pagination: older sessions are found via
+`search`.
 
-**Файлы.** Вложение уходит в `prompt` как `files: [{ uri: "data:<mime>;base64,…", name }]`.
-Метаданные `{ source: "telegram" }` позволяют не зеркалить собственные сообщения обратно.
+**Files.** An attachment goes into `prompt` as
+`files: [{ uri: "data:<mime>;base64,…", name }]`. Metadata `{ source: "telegram" }`
+prevents mirroring our own messages back.

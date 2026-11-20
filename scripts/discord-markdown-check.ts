@@ -42,6 +42,23 @@ const cases: Array<{ name: string; input: string; expected: string }> = [
     input: ["# One", "## Two", "### Three", "#### Four", "##### Five", "###### Six"].join("\n"),
     expected: ["# One", "## Two", "### Three", "**Four**", "**Five**", "**Six**"].join("\n"),
   },
+  {
+    name: "wide table becomes a list",
+    input: ["| A | B | C | D | E |", "|---|---|---|---|---|", "| 1 | 2 | 3 | 4 | 5 |"].join("\n"),
+    expected: ["**A · B · C · D · E**", "- A: 1 · B: 2 · C: 3 · D: 4 · E: 5"].join("\n"),
+  },
+  {
+    name: "long table becomes a list",
+    input: [
+      "| Component | Owner | Description |",
+      "|---|---|---|",
+      "| media-relay-worker | platform-team | Handles every attachment relayed between bound chats |",
+    ].join("\n"),
+    expected: [
+      "**Component · Owner · Description**",
+      "- Component: media-relay-worker · Owner: platform-team · Description: Handles every attachment relayed between bound chats",
+    ].join("\n"),
+  },
 ];
 
 let failed = 0;

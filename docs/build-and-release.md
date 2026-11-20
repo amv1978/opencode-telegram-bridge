@@ -1,14 +1,16 @@
-# Сборка и релиз
+[English](build-and-release.md) · [Русский](ru/build-and-release.md)
 
-## Что нужно
+# Build and release
 
-- Bun 1.3+ (сборка демона и компиляция в exe);
-- Node.js 20+ и npm (Electron-оболочка);
+## Prerequisites
+
+- Bun 1.3+ (daemon build and exe compilation);
+- Node.js 20+ and npm (Electron shell);
 - .NET SDK 10 (CLI);
-- Inno Setup 6 (установщик);
-- `ffmpeg.exe` — в репозиторий не входит, положите его в `dist\`.
+- Inno Setup 6 (installer);
+- `ffmpeg.exe` — not in the repository, put it into `dist\`.
 
-## 1. Демон
+## 1. Daemon
 
 ```bash
 bun install
@@ -17,10 +19,10 @@ bun run build                 # dist\ocbridge.exe
 ```
 
 `bun run build` = `bun build src/index.ts --compile --outfile dist/ocbridge.exe`.
-Кросс-сборка: `bun run build:linux`, `bun run build:mac` (артефакты без `.exe`).
+Cross-builds: `bun run build:linux`, `bun run build:mac` (artifacts without `.exe`).
 
-Скопируйте `ffmpeg.exe` в `dist\ffmpeg.exe` — установщик берёт его оттуда,
-а демон ищет рядом с собой.
+Copy `ffmpeg.exe` to `dist\ffmpeg.exe` — the installer takes it from there, and the
+daemon looks for it next to itself.
 
 ## 2. CLI
 
@@ -31,9 +33,9 @@ dotnet publish -c Release -r win-x64 --self-contained true `
   -o ..\dist\cli
 ```
 
-Результат: `dist\cli\ocbridge-cli.exe`, single-file, ~74 МБ.
+Result: `dist\cli\ocbridge-cli.exe`, single-file, ~74 MB.
 
-## 3. Electron-оболочка
+## 3. Electron shell
 
 ```powershell
 cd desktop
@@ -41,70 +43,70 @@ npm install
 npm run pack                  # electron-builder --win --dir
 ```
 
-Результат: `desktop\release\win-unpacked\` (~357 МБ), внутри `OpenCode Bridge.exe`.
-Target только `dir` — отдельный portable-exe Electron не собирается.
+Result: `desktop\release\win-unpacked\` (~357 MB) with `OpenCode Bridge.exe` inside.
+Target `dir` only — no separate portable Electron exe is built.
 
-## 4. Установщик
+## 4. Installer
 
 ```powershell
 winget install JRSoftware.InnoSetup
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\ocbridge.iss
 ```
 
-Выход: `dist\ocbridge-setup-<version>.exe`, сжатие lzma2, итог ~180 МБ.
+Output: `dist\ocbridge-setup-<version>.exe`, lzma2 compression, ~180 MB.
 
-Состав:
+Contents:
 
-| Что | Откуда | Размер |
+| What | From | Size |
 |---|---|---|
-| `ocbridge.exe` | `dist\` | ~115 МБ |
-| `ffmpeg.exe` | `dist\` | ~83 МБ |
-| `ocbridge-cli.exe` | `dist\cli\` (если есть) | ~74 МБ |
-| `desktop\*` | `desktop\release\win-unpacked\` | ~357 МБ |
-| `README.md`, `INSTALL.txt` | корень / `docs\` | мало |
+| `ocbridge.exe` | `dist\` | ~115 MB |
+| `ffmpeg.exe` | `dist\` | ~83 MB |
+| `ocbridge-cli.exe` | `dist\cli\` (if present) | ~74 MB |
+| `desktop\*` | `desktop\release\win-unpacked\` | ~357 MB |
+| `README.md`, `INSTALL.txt` | root / `docs\` | small |
 
-Установщик: простой режим пишет только `ui.lang` (существующий конфиг не трогает),
-расширенный — токен, режим, папку. Перед установкой процессы с путём
-`*OpenCodeTelegramBridge*` завершаются. Ярлыки: приложение, CLI, удаление,
-опционально рабочий стол. Автозапуск — задача установщика.
-При удалении `%APPDATA%\opencode-telegram-bridge\` сохраняется.
+Installer: simple mode writes only `ui.lang` (an existing config is untouched);
+advanced mode writes token, mode and folder. Before installing, processes with
+`*OpenCodeTelegramBridge*` in their path are terminated. Shortcuts: app, CLI,
+uninstall, optionally desktop. Autostart is an installer task.
+On uninstall `%APPDATA%\opencode-telegram-bridge\` is preserved.
 
-## 5. Версии: четыре места
+## 5. Versions: four places
 
-| Файл | Поле |
+| File | Field |
 |---|---|
 | `package.json` | `"version"` |
 | `desktop/package.json` | `"version"` |
-| `installer/ocbridge.iss` | `#define AppVersion "0.3.0"` |
+| `installer/ocbridge.iss` | `#define AppVersion "0.4.1"` |
 | `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` |
 
-Дополнительно: `cli/Program.cs`, константа `Program.Version` — её печатает
-`ocbridge-cli version`; держите равной версии csproj. Версия API берётся из
-`package.json` автоматически.
+Additionally: `cli/Program.cs`, the `Program.Version` constant — it is printed by
+`ocbridge-cli version`; keep it equal to the csproj version. The API version is taken
+from `package.json` automatically.
 
-Имя установщика формируется из `AppVersion`: `ocbridge-setup-0.3.0.exe`.
-После смены версии пересоберите **все** артефакты — старый exe внутри нового
-установщика иначе покажет прежнюю версию.
+The installer name is derived from `AppVersion`: `ocbridge-setup-0.4.1.exe`.
+After a version change rebuild **all** artifacts — otherwise the old exe inside the
+new installer will still report the previous version.
 
-## Чек-лист релиза
+## Release checklist
 
-1. Поднять версию в четырёх местах (+ `Program.cs`).
-2. `bun run typecheck` и `bun run src/doctor.ts`.
-3. Пересобрать демон, CLI, оболочку, установщик.
-4. Запустить установщик на чистой машине: окно, трей, `/start`, тема, голос.
-5. Проверить, что в git нет `config.json`, `state.json`, `*.log`, `dist/`, `*.exe`.
-6. Тег `v0.3.0`, к релизу приложить `ocbridge-setup-0.3.0.exe` и исходники.
+1. Bump the version in four places (+ `Program.cs`).
+2. `bun run typecheck` and `bun run src/doctor.ts`.
+3. Rebuild daemon, CLI, shell, installer.
+4. Run the installer on a clean machine: window, tray, `/start`, theme, voice.
+5. Check that git has no `config.json`, `state.json`, `*.log`, `dist/`, `*.exe`.
+6. Tag `v0.4.1`, attach `ocbridge-setup-0.4.1.exe` and the sources to the release.
 
-## Подпись кода
+## Code signing
 
-Сейчас binaries не подписаны: SmartScreen покажет предупреждение «Неизвестный издатель».
-При наличии сертификата подпишите сначала `ocbridge.exe`, `ocbridge-cli.exe` и
-`OpenCode Bridge.exe`, затем сам установщик:
+Binaries are currently unsigned: SmartScreen shows the “Unknown publisher” warning.
+With a certificate, sign `ocbridge.exe`, `ocbridge-cli.exe` and `OpenCode Bridge.exe`
+first, then the installer itself:
 
 ```powershell
-signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <файл>
+signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <file>
 ```
 
-Подпись установщика после сборки не меняет его содержимое, но меняет хеш —
-пересчитывайте контрольные суммы после подписи. CI и workflows в репозитории нет:
-сборка ручная, на Windows.
+Signing the installer after the build does not change its contents but changes the
+hash — recompute checksums after signing. There is no CI or workflows in the
+repository: the build is manual, on Windows.

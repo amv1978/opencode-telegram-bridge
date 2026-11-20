@@ -1,71 +1,75 @@
-# Интерфейс
+[English](ui.md) · [Русский](ru/ui.md)
 
-## Веб-панель
+# Interface
 
-Одна страница, которую отдаёт демон: `http://127.0.0.1:7788`. Слушает только
-loopback; при занятом порте берётся следующий (до +9).
+## Web panel
 
-Разделы: статус бота и OpenCode, токен, режим, ID форум-группы, папка по умолчанию,
-троттлинг, инструменты, сеть (прокси/IP), пользователи, последние сессии, журнал,
-кнопки «Запустить / Остановить / Перезапустить», автозапуск.
+A single page served by the daemon: `http://127.0.0.1:7788`. It listens on loopback
+only; if the port is busy the next one is used (up to +9).
 
-## Темы
+Sections: bot and OpenCode status, token, mode, forum group ID, default folder,
+throttling, tools, media relay, network (proxy/IP), users, recent sessions, log,
+“Start / Stop / Restart” buttons, autostart.
 
-Две темы × три схемы:
+## Themes
 
-| Тема | Схема | Характер |
+Two themes × three schemes:
+
+| Theme | Scheme | Character |
 |---|---|---|
-| `opencode` | `system` / `light` / `dark` | Нейтральная, как интерфейс OpenCode |
-| `matrix` | `system` / `light` / `dark` | Зелёный монохром на тёмном/светлом |
+| `opencode` | `system` / `light` / `dark` | Neutral, like the OpenCode UI |
+| `matrix` | `system` / `light` / `dark` | Green monochrome on dark/light |
 
-Реализация — атрибуты на `<html>`: `data-theme` и `data-scheme`; значения CSS-переменных
-(`--bg`, `--card`, `--line`, `--fg`, `--muted`, `--acc`, `--ok`, `--err`) заданы в
-`src/web/ui.ts`. `system` разрешается через `prefers-color-scheme` и слушает изменение.
+Implementation: attributes on `<html>` (`data-theme`, `data-scheme`); CSS variable
+values (`--bg`, `--card`, `--line`, `--fg`, `--muted`, `--acc`, `--ok`, `--err`) live
+in `src/web/ui.ts`. `system` resolves via `prefers-color-scheme` and listens for
+changes.
 
-Выбор хранится в `ui.theme`, `ui.scheme` конфига и дублируется в `localStorage`
-(`ocbridge.theme`, `ocbridge.scheme`). При смене страница отправляет фон и признак
-тёмной схемы в Electron через `window.ocbridgeDesktop.setTheme`.
+The choice is stored in `ui.theme`/`ui.scheme` and duplicated in `localStorage`
+(`ocbridge.theme`, `ocbridge.scheme`). On change the page sends the background and
+dark-scheme flag to Electron via `window.ocbridgeDesktop.setTheme`.
 
-## Язык
+## Language
 
-`ui.lang`: `system`, `ru`, `en`. `system` определяется по `navigator.language`.
-Строки лежат в двух словарях в `src/web/ui.ts`; разметка использует
-`data-i18n`, `data-i18n-html`, `data-i18n-title`. Новый ключ добавляется в оба словаря.
-Установщик при простой установке пишет только `ui.lang`, не трогая остальной конфиг.
+`ui.lang`: `system`, `ru`, `en`. `system` is detected from `navigator.language`.
+Strings live in two dictionaries in `src/web/ui.ts`; markup uses `data-i18n`,
+`data-i18n-html`, `data-i18n-title`. A new key must be added to both dictionaries.
+During a simple install the installer writes only `ui.lang` and leaves the rest of
+the config untouched.
 
-## Electron-оболочка
+## Electron shell
 
-`desktop/main.js` + `desktop/preload.js`, пакет `desktop/package.json`
+`desktop/main.js` + `desktop/preload.js`, package `desktop/package.json`
 (electron-builder, target `dir`).
 
-**Окно.** По умолчанию 1120×840, минимум 780×560. Размер и позиция сохраняются в
-`window.json` в `userData` Electron и восстанавливаются при следующем запуске.
-Заголовок скрыт (`titleBarStyle: "hidden"`), вместо него overlay высотой 34 px;
-его цвет и цвет символов обновляются по IPC `theme` при смене темы.
+**Window.** 1120×840 by default, minimum 780×560. Size and position are saved to
+`window.json` in Electron `userData` and restored on the next launch. The title bar
+is hidden (`titleBarStyle: "hidden"`); a 34 px overlay takes its place, and its
+colour and symbol colour update over the `theme` IPC when the theme changes.
 
-**Drag region.** Шапка страницы имеет `-webkit-app-region: drag`; кнопки, ссылки и
-индикаторы внутри — `no-drag`, иначе их нельзя нажать.
+**Drag region.** The page header has `-webkit-app-region: drag`; buttons, links and
+indicators inside use `no-drag`, otherwise they cannot be clicked.
 
-**Трей.** Кружок 16 px: зелёный — работает, жёлтый — подключение, красный — ошибка
-или остановлен. Меню: статус, «Открыть панель», «Открыть в браузере», старт/стоп,
-перезапуск, «Переподключить OpenCode», настройки, журнал, автозапуск, ссылка на бота,
-выход. Состояние опрашивается каждые 2.5 с; двойной клик открывает окно.
-Закрытие окна не завершает приложение — оно остаётся в трее.
+**Tray.** A 16 px dot: green — running, yellow — connecting, red — error or stopped.
+Menu: status, “Open panel”, “Open in browser”, start/stop, restart, “Reconnect
+OpenCode”, settings, log, autostart, bot link, quit. State is polled every 2.5 s;
+double-click opens the window. Closing the window does not quit the app — it stays in
+the tray.
 
-**Запуск демона.** Оболочка сама поднимает `ocbridge.exe --no-browser`, если API
-не отвечает; ищет exe рядом с собой (`..\ocbridge.exe`) или в `dist\` (dev).
-Переменные: `OCBRIDGE_EXE` — путь к демону, `OCBRIDGE_PORT` — порт API (7788).
-Аргумент `--hidden` запускает без окна (используется автозапуском установщика).
-Второй экземпляр окна блокируется single-instance lock.
+**Daemon launch.** The shell starts `ocbridge.exe --no-browser` itself if the API does
+not respond; it looks for the exe next to itself (`..\ocbridge.exe`) or in `dist\`
+(dev). Variables: `OCBRIDGE_EXE` — daemon path, `OCBRIDGE_PORT` — API port (7788).
+`--hidden` starts without a window (used by installer autostart). A second window
+instance is blocked by a single-instance lock.
 
-## Автозапуск
+## Autostart
 
-Два независимых пути, оба пишут в
+Two independent paths, both write to
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`:
 
-- галочка в трее/панели → значение `OpenCodeTelegramBridge` = `"<ocbridge.exe>" --no-browser`
-  (демон без окна; панель доступна в браузере);
-- установщик → `"<app>\desktop\OpenCode Bridge.exe" --hidden` (оболочка и трей).
+- tray/panel checkbox → value `OpenCodeTelegramBridge` = `"<ocbridge.exe>" --no-browser`
+  (daemon without a window; the panel is available in a browser);
+- installer → `"<app>\desktop\OpenCode Bridge.exe" --hidden` (shell and tray).
 
-Автозапуск поддерживается только собранной Windows-версией; в dev-режиме пункт меню
-неактивен. Проверить: `ocbridge-cli autostart status`.
+Autostart is supported only by the compiled Windows build; in dev mode the menu item
+is disabled. Check with: `ocbridge-cli autostart status`.

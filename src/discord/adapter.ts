@@ -21,6 +21,7 @@ import { transcribeAudio } from "../audio/transcribe.ts";
 import { registerCommands } from "./commands.ts";
 import {
   collectAgentFiles,
+  promptFilesFromMedia,
   type DiscordMediaTarget,
   type MediaItem,
   type MediaRelay,
@@ -85,6 +86,8 @@ export class DiscordBridge {
   private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
   /** Last agent-files scan per session, so tool.success + turn end don't double-fetch. */
   private readonly agentFilesAt = new Map<string, number>();
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private reconnectAttempt = 0;
   private eventChain: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void) | undefined;
   private state: DiscordState = "stopped";
@@ -122,16 +125,33 @@ export class DiscordBridge {
       },
     });
 
-    try {
-      await client.login(token);
-      if (!client.isReady()) {
-        await new Promise<void>((resolve) => client.once(Events.ClientReady, () => resolve()));
+    const delays = [5000, 15000, 30000, 60000, 300000];
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt < delays.length; attempt += 1) {
+      try {
+        await withTimeout(client.login(token), 30_000, "login timeout");
+        if (!client.isReady()) {
+          await withTimeout(
+            new Promise<void>((resolve) => client.once(Events.ClientReady, () => resolve())),
+            30_000,
+            "ready timeout",
+          );
+        }
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error as Error;
+        const wait = delays[attempt] ?? 300000;
+        log.warn(`discord login attempt ${attempt + 1}/${delays.length} failed: ${lastError.message}; retry in ${Math.round(wait / 1000)}s`);
+        await client.destroy().catch(() => undefined);
+        if (attempt < delays.length - 1) await new Promise((resolve) => setTimeout(resolve, wait));
       }
-    } catch (error) {
-      this.setState("error", (error as Error).message);
+    }
+    if (lastError) {
+      this.setState("error", lastError.message);
       await client.destroy().catch(() => undefined);
       this.client = undefined;
-      throw error;
+      throw lastError;
     }
 
     this.username = client.user?.username ?? "";
@@ -215,6 +235,43 @@ export class DiscordBridge {
     });
     client.on(Events.Error, (error) => log.error("discord client error:", error.message));
     client.on(Events.Warn, (message) => log.warn("discord warning:", message));
+    client.on(Events.ShardDisconnect, (event, id) => {
+      log.warn(`discord shard ${id} disconnected (${event.code}); scheduling reconnect`);
+      this.scheduleReconnect();
+    });
+    client.on(Events.ShardReconnecting, (id) => log.info(`discord shard ${id} reconnecting…`));
+    client.on(Events.ShardResume, (id, replayed) => log.info(`discord shard ${id} resumed (${replayed} replayed)`));
+  }
+
+  /** Exponential backoff (5 s → 5 min) without restarting the whole bridge. */
+  private scheduleReconnect(): void {
+    const token = this.cfg.discord?.token?.trim();
+    if (!token || !this.client || this.reconnectTimer || this.client.isReady()) return;
+    const delay = Math.min(300000, 5000 * 2 ** this.reconnectAttempt);
+    this.reconnectAttempt += 1;
+    log.warn(`discord gateway down; reconnect attempt ${this.reconnectAttempt} in ${Math.round(delay / 1000)}s`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.reconnect(token);
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
+
+  private async reconnect(token: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    if (client.isReady()) {
+      this.reconnectAttempt = 0;
+      return;
+    }
+    try {
+      await client.login(token);
+      this.reconnectAttempt = 0;
+      log.info("discord reconnected");
+    } catch (error) {
+      log.warn(`discord reconnect failed: ${(error as Error).message}`);
+      this.scheduleReconnect();
+    }
   }
 
   private async onMessage(message: Message): Promise<void> {
@@ -257,7 +314,6 @@ export class DiscordBridge {
     }
 
     const isVoice = attachments.some((attachment) => this.isAudio(attachment));
-    const files: Array<{ uri: string; name?: string }> = [];
     const media: MediaItem[] = [];
     let promptText = text;
 
@@ -270,12 +326,12 @@ export class DiscordBridge {
       try {
         const buffer = await this.download(attachment);
         const mime = attachment.contentType ?? "application/octet-stream";
-        files.push({ uri: `data:${mime};base64,${buffer.toString("base64")}`, name: attachment.name });
         media.push({ buffer, mime, name: attachment.name });
       } catch (error) {
         await this.send(destination, `⚠️ Не смог скачать «${attachment.name}»: ${(error as Error).message.slice(0, 160)}`);
       }
     }
+    const files = promptFilesFromMedia(media);
 
     if (isVoice) {
       const audio = attachments.find((attachment) => this.isAudio(attachment));
@@ -352,13 +408,19 @@ export class DiscordBridge {
 
     try {
       await interaction.deferReply();
-    } catch {
+    } catch (error) {
+      if (isExpiredInteraction(error)) log.info(`discord /${interaction.commandName}: interaction expired before defer`);
+      else log.warn(`discord /${interaction.commandName}: defer failed: ${(error as Error).message}`);
       return;
     }
 
     try {
       await this.runCommand(interaction);
     } catch (error) {
+      if (isExpiredInteraction(error)) {
+        log.info(`discord /${interaction.commandName}: interaction expired, reply skipped`);
+        return;
+      }
       log.warn(`discord /${interaction.commandName}: ${(error as Error).message}`);
       await interaction.editReply({ content: `⚠️ ${(error as Error).message.slice(0, 300)}` }).catch(() => undefined);
     }
@@ -952,8 +1014,31 @@ function threadParent(channel: unknown): ThreadParent | undefined {
   return candidate as unknown as ThreadParent;
 }
 
-/** Text of a `session.synthetic` event; the payload shape has varied across builds. */
-function syntheticText(data: unknown): string {
+/** Rejects when a gateway promise hangs; prevents an endless "starting" state. */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Discord interaction is unknown/expired (3 s ack window missed) or already acked. */function isExpiredInteraction(error: unknown): boolean {
+  const value = error as { code?: number; message?: string };
+  if (value?.code === 10062 || value?.code === 40060) return true;
+  return /unknown interaction|already acknowledged|interaction (has )?expired/i.test(value?.message ?? "");
+}
+
+/** Text of a `session.synthetic` event; the payload shape has varied across builds. */function syntheticText(data: unknown): string {
   if (!data || typeof data !== "object") return "";
   const source = data as Record<string, any>;
   const item = source.item as Record<string, any> | undefined;

@@ -86,33 +86,98 @@ function isSeparatorRow(line: string): boolean {
   return /^\s*\|?[\s:|-]+\|/.test(line) && line.includes("-") && line.includes("|");
 }
 
+const TABLE_CELL_LIMIT = 32;
+const TABLE_TOTAL_LIMIT = 72;
+const TABLE_MAX_COLUMNS = 4;
+
+/** Wraps a cell by words into lines of at most `limit` characters. */
+function wrapCell(value: string, limit: number): string[] {
+  const text = value.replace(/\s+/g, " ").trim();
+  if (!text) return [""];
+  const lines: string[] = [];
+  let current = "";
+  for (const word of text.split(" ")) {
+    let rest = word;
+    while (rest.length > limit) {
+      if (current) {
+        lines.push(current);
+        current = "";
+      }
+      lines.push(rest.slice(0, limit));
+      rest = rest.slice(limit);
+    }
+    if (!rest) continue;
+    if (!current) current = rest;
+    else if (current.length + 1 + rest.length <= limit) current += ` ${rest}`;
+    else {
+      lines.push(current);
+      current = rest;
+    }
+  }
+  if (current || !lines.length) lines.push(current);
+  return lines;
+}
+
 /**
- * Pads every cell to the widest value of its column and wraps the table in a
- * fenced code block, because Discord does not render Markdown tables.
+ * Wide tables do not fit a Discord code block, so they become a compact list:
+ *
+ *   **A · B · C**
+ *   - A: 1 · B: 2 · C: 3
+ *
+ * Narrow tables stay aligned in a fenced block with cells wrapped to 32 chars.
  */
 function renderTable(rows: string[]): string[] {
   const grid = rows.map(tableCells);
-  const columns = Math.max(...grid.map((cells) => cells.length));
+  const headers = grid[0] ?? [];
+  const columns = Math.max(headers.length, ...grid.map((cells) => cells.length));
+  const body = grid.slice(2).map((cells) => Array.from({ length: columns }, (_, index) => cells[index] ?? ""));
+
   const widths: number[] = [];
   for (let column = 0; column < columns; column += 1) {
     let width = 3;
-    grid.forEach((cells, row) => {
-      if (row === 1) return; // separator row is regenerated
-      width = Math.max(width, (cells[column] ?? "").length);
-    });
-    widths.push(width);
-  }
-  const out = ["```"];
-  grid.forEach((cells, row) => {
-    const padded: string[] = [];
-    for (let column = 0; column < columns; column += 1) {
-      const width = widths[column] ?? 3;
-      if (row === 1) padded.push("-".repeat(width));
-      else padded.push((cells[column] ?? "").padEnd(width));
+    const cells = [headers[column] ?? "", ...body.map((row) => row[column] ?? "")];
+    for (const cell of cells) {
+      for (const line of wrapCell(cell, TABLE_CELL_LIMIT)) width = Math.max(width, line.length);
     }
-    out.push(`| ${padded.join(" | ")} |`);
-  });
+    widths.push(Math.min(TABLE_CELL_LIMIT, width));
+  }
+
+  const total = 1 + widths.reduce((sum, width) => sum + width, 0) + 3 * columns;
+  if (columns > TABLE_MAX_COLUMNS || total > TABLE_TOTAL_LIMIT) return renderTableList(headers, body, columns);
+
+  const out = ["```"];
+  const headerCells = Array.from({ length: columns }, (_, index) => headers[index] ?? "");
+  const headerLines = renderWrappedRow(headerCells, widths);
+  out.push(...headerLines);
+  out.push(`| ${widths.map((width) => "-".repeat(width)).join(" | ")} |`);
+  for (const row of body) out.push(...renderWrappedRow(row, widths));
   out.push("```");
+  return out;
+}
+
+/** One logical row as several physical lines of `| cell |` text. */
+function renderWrappedRow(cells: string[], widths: number[]): string[] {
+  const wrapped = cells.map((cell, index) => wrapCell(cell, widths[index] ?? TABLE_CELL_LIMIT));
+  const height = Math.max(...wrapped.map((lines) => lines.length));
+  const out: string[] = [];
+  for (let line = 0; line < height; line += 1) {
+    const parts = wrapped.map((lines, index) => (lines[line] ?? "").padEnd(widths[index] ?? TABLE_CELL_LIMIT));
+    out.push(`| ${parts.join(" | ")} |`);
+  }
+  return out;
+}
+
+function renderTableList(headers: string[], body: string[][], columns: number): string[] {
+  const labels = Array.from({ length: columns }, (_, index) => (headers[index] ?? "").replace(/\s+/g, " ").trim());
+  const out = [`**${labels.filter(Boolean).join(" · ")}**`];
+  for (const row of body) {
+    const cells = row.map((cell, index) => {
+      const value = cell.replace(/\s+/g, " ").trim();
+      const label = labels[index];
+      return label ? `${label}: ${value}` : value;
+    });
+    out.push(`- ${cells.filter(Boolean).join(" · ")}`);
+  }
   return out;
 }
 

@@ -1,7 +1,9 @@
-# Диагностика
+[English](troubleshooting.md) · [Русский](ru/troubleshooting.md)
 
-Сначала — журнал: панель → **Журнал**, либо
-`%APPDATA%\opencode-telegram-bridge\bridge.log`. Быстрая проверка:
+# Troubleshooting
+
+Start with the log: panel → **Log**, or
+`%APPDATA%\opencode-telegram-bridge\bridge.log`. Quick check:
 `ocbridge-cli doctor`.
 
 ## 409 Conflict
@@ -10,81 +12,81 @@
 TelegramError: 409 Conflict: terminated by other getUpdates request
 ```
 
-С одним токеном работают два экземпляра. Что происходит и что делать:
+Two instances are running with the same token. What happens and what to do:
 
-- при старте демон ищет соседние порты (`7788…7795`) и просит найденный экземпляр
-  завершиться через `POST /api/shutdown`;
-- если тот запущен от администратора, остановить его нельзя: Диспетчер задач →
-  `ocbridge.exe` / «OpenCode Bridge» → **Снять задачу**;
-- проверьте автозапуск: два разных ключа (`ocbridge.exe --no-browser` и
-  `OpenCode Bridge.exe --hidden`) не должны указывать на разные копии;
-- после остановки нажмите **Перезапустить** в панели или `ocbridge-cli restart`.
+- on start the daemon probes neighbouring ports (`7788…7795`) and asks the instance
+  it finds to exit via `POST /api/shutdown`;
+- if that instance runs as administrator it cannot be stopped: Task Manager →
+  `ocbridge.exe` / “OpenCode Bridge” → **End task**;
+- check autostart: two different keys (`ocbridge.exe --no-browser` and
+  `OpenCode Bridge.exe --hidden`) must not point at different copies;
+- after stopping, press **Restart** in the panel or run `ocbridge-cli restart`.
 
-## Telegram недоступен (блокировка IP)
+## Telegram unreachable (IP blocking)
 
-Симптом: «Не удалось связаться с Telegram Bot API», в журнале подряд
-`telegram: pinned … — no answer` и `direct — …`.
+Symptom: “Could not reach Telegram Bot API”, with repeated
+`telegram: pinned … — no answer` and `direct — …` in the log.
 
-Мост сам перебирает известные IP Telegram через локальный CONNECT-прокси и
-пишет рабочий в конфиг (`telegram.apiIp`). Если не помогло:
+The bridge probes known Telegram IPs through a local CONNECT proxy and writes the
+working one into the config (`telegram.apiIp`). If that does not help:
 
 ```jsonc
 "telegram": {
-  "proxy": "socks5://127.0.0.1:1080",  // или http://127.0.0.1:8080
+  "proxy": "socks5://127.0.0.1:1080",  // or http://127.0.0.1:8080
   "apiIp": "149.154.167.220"
 }
 ```
 
-Те же поля есть в панели, блок «Сеть». При заданном `telegram.proxy` он пробуется
-первым; при `apiIp` — первым среди IP. После изменения конфиг перезапускает бота.
-Проверка вручную: `curl https://api.telegram.org` (или через тот же прокси).
+The same fields are in the panel, “Network” block. With `telegram.proxy` set it is
+tried first; with `apiIp` that IP is tried first. After a change the config restarts
+the bot. Manual check: `curl https://api.telegram.org` (or through the same proxy).
 
-## Удалённая тема
+## Deleted topic
 
-Если тему удалили в Telegram, отправка отвечает `message thread not found`.
-Мост очищает привязку `thread → session`, финальный ответ уходит в корень чата,
-а следующее сообщение в новой теме создаёт новую сессию. Сессия OpenCode при этом
-жива — её можно вернуть через `/attach` или `/sessions`.
+If a topic was deleted in Telegram, sending answers `message thread not found`.
+The bridge clears the `thread → session` binding, the final answer goes to the chat
+root, and the next message in a new topic creates a new session. The OpenCode session
+is still alive — bring it back with `/attach` or `/sessions`.
 
-## Таймауты
+## Timeouts
 
-| Что | Лимит |
+| What | Limit |
 |---|---|
-| Обработчик одного SSE-события | 20 с (зависший пропускается) |
-| Проверка `/api/info` при поиске OpenCode | 2.5 с на адрес |
-| Скачивание файла из Telegram | 60 с |
-| Запрос CLI к API | 10 с (connect 5 с) |
-| Ожидание API оболочкой при старте | 30 с |
+| One SSE event handler | 20 s (a stuck one is skipped) |
+| `/api/info` check during OpenCode discovery | 2.5 s per address |
+| Telegram file download | 60 s |
+| CLI request to the API | 10 s (connect 5 s) |
+| Shell wait for the API on start | 30 s |
 
-Если ход «завис»: `/stop`, затем `/status`. Если не отвечает панель — смотрите
-`bridge.log`; процесс мог упасть.
+If a turn is “stuck”: `/stop`, then `/status`. If the panel does not respond, check
+`bridge.log`; the process may have crashed.
 
-## Нет подтверждений прочтения
+## No read receipts
 
-Их и не будет: Bot API не отдаёт статусы прочтения и не позволяет боту писать
-от имени пользователя. «Печатает…» — это `sendChatAction("typing")`, который мост
-повторяет каждые 5 с, пока идёт ход. Отсутствие галочек — норма, не ошибка.
+There will not be any: the Bot API does not expose read statuses and does not let a
+bot write as a user. “Typing…” is `sendChatAction("typing")`, which the bridge repeats
+every 5 s while a turn runs. Missing checkmarks are normal, not an error.
 
-## Кракозябры в журнале
+## Garbled log
 
-`bridge.log` пишется в UTF-8 без BOM. Windows PowerShell 5.1 читает файл в ANSI
-(cp1251), поэтому кириллица выглядит мусором. Откройте правильно:
+`bridge.log` is written in UTF-8 without BOM. Windows PowerShell 5.1 reads the file
+as ANSI (cp1251), so Cyrillic looks like garbage. Open it correctly:
 
 ```powershell
 Get-Content "$env:APPDATA\opencode-telegram-bridge\bridge.log" -Encoding UTF8 -Tail 50
 ```
 
-или `chcp 65001` перед `type`. В PowerShell 7 `-Encoding utf8` стоит по умолчанию.
-В самом приложении журнал читается через API и отображается корректно.
+or run `chcp 65001` before `type`. In PowerShell 7 `-Encoding utf8` is the default.
+The app itself reads the log through the API and displays it correctly.
 
-## Прочее
+## Other
 
-| Симптом | Решение |
+| Symptom | Solution |
 |---|---|
-| «Токен бота недействителен» | Проверьте токен у @BotFather; 401/404 означают неверный токен |
-| «OpenCode server not found» | Запустите OpenCode (`opencode service start` или Desktop) и проверьте `~/.config/opencode/service.json` |
-| Панель не открывается | Порт занят: демон берёт следующий; точный адрес — в `bridge.log` (`web ui: http://…`) |
-| Бот молчит в группе | Бот не админ или включён privacy mode: сделайте админом либо BotFather → `/setprivacy` → Disable |
-| Бот не создаёт темы | Нет права «Управление темами» |
-| Автозапуск недоступен | Dev-режим или не Windows; работает только собранная Windows-версия |
-| Голос не распознаётся | Нет HEX или Labs-флага — см. [voice.md](voice.md) |
+| “Bot token is invalid” | Check the token with @BotFather; 401/404 means a wrong token |
+| “OpenCode server not found” | Start OpenCode (`opencode service start` or Desktop) and check `~/.config/opencode/service.json` |
+| Panel does not open | Port is busy: the daemon takes the next one; the exact address is in `bridge.log` (`web ui: http://…`) |
+| Bot is silent in a group | The bot is not an admin or privacy mode is on: make it an admin or BotFather → `/setprivacy` → Disable |
+| Bot does not create topics | Missing “Manage Topics” permission |
+| Autostart unavailable | Dev mode or not Windows; only the compiled Windows build supports it |
+| Voice is not recognised | No HEX or Labs flag — see [voice.md](voice.md) |

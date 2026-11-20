@@ -43,8 +43,23 @@ export interface MediaRelayOptions {
   senders: MediaSenders;
 }
 
-const MB = 1024 * 1024;
-const TELEGRAM_DOCUMENT_MB = 50;
+/**
+ * Prompt payload for `oc.prompt`: every entry is `{ uri: "data:<mime>;base64,…", name }`.
+ * This is the single conversion point so buffers/names can never reach the API.
+ */
+export function promptFilesFromMedia(items: MediaItem[]): Array<{ uri: string; name: string }> {
+  return items.flatMap((item) => {
+    const name = item.name || `file-${Date.now()}`;
+    if (typeof item.uri === "string" && item.uri.trim()) return [{ uri: item.uri.trim(), name }];
+    if (item.buffer?.length) {
+      const mime = item.mime || "application/octet-stream";
+      return [{ uri: `data:${mime};base64,${item.buffer.toString("base64")}`, name }];
+    }
+    return [];
+  });
+}
+
+const MB = 1024 * 1024;const TELEGRAM_DOCUMENT_MB = 50;
 const TELEGRAM_PHOTO_MB = 10;
 const DISCORD_MB = 10;
 const DEDUPE_TTL_MS = 10 * 60 * 1000;

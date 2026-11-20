@@ -1,86 +1,97 @@
+[English](README.md) · [Русский](docs/ru/README.md)
+
 # OpenCode Telegram Bridge
 
-Управление сессиями **OpenCode 2.x** из Telegram: задача текстом или голосом, ответ
-с форматированием и статистикой, разрешения — кнопками. Мост подключается к тому же
-фоновому сервису OpenCode, что Desktop и TUI, поэтому видит **те же сессии**;
-плагин OpenCode не нужен.
+Drive **OpenCode 2.x** sessions from Telegram: a task by text or voice, a formatted
+answer with statistics, permissions as buttons. The bridge connects to the same
+OpenCode background service as Desktop and TUI, so it sees **the same sessions**; no
+OpenCode plugin is required.
 
-![Панель управления](docs/ui.png)
+![Control panel](docs/ui.png)
 
-## Возможности
+## Features
 
-- Форум-группа: **тема = сессия**, плюс личные чаты; режимы `both`, `private`, `topics`.
-- Стриминг ответа в одном сообщении, rich-разметка (таблицы, код, заголовки).
-- Футер хода: `⏱` длительность, `⚡` tok/s, `🧠` контекст — как в интерфейсе OpenCode.
-- Кнопки разрешений: «Разрешить», «Всегда», «Отклонить».
-- Голосовые: OGG/Opus → ffmpeg → HEX, локально, без облака.
-- Фото и документы до 20 МБ уходят в сессию.
-- Десктоп-оболочка: трей, автозапуск, темы OpenCode/Matrix, язык RU/EN.
-- CLI `ocbridge-cli` для статуса, логов, конфига и диагностики.
-- Обход блокировки Telegram: пиннинг рабочего IP или свой прокси.
+- Forum group: **topic = session**, plus private chats; modes `both`, `private`, `topics`.
+- Answer streaming in one message, rich markup (tables, code, headings).
+- Turn footer: `⏱` duration, `⚡` tok/s, `🧠` context — the same as the OpenCode UI.
+- Permission buttons: “Allow”, “Always”, “Deny”.
+- Voice: OGG/Opus → ffmpeg → HEX, locally, no cloud.
+- Photos and documents up to 20 MB go into the session.
+- Discord transport: public threads, the same sessions, both transports at once.
+- File relay between all bound chats (Telegram topic/chat and Discord thread/channel),
+  with link fallback over platform limits.
+- Desktop shell: tray, autostart, OpenCode/Matrix themes, RU/EN language.
+- `ocbridge-cli` for status, logs, config and diagnostics.
+- Telegram blocking workaround: pin a working IP or use your own proxy.
 
-## Быстрый старт
+## Quick start
 
-### Установщик (Windows 10/11)
+### Installer (Windows 10/11)
 
-1. Запустите `ocbridge-setup-0.3.0.exe`.
-2. Вставьте токен бота от [@BotFather](https://t.me/BotFather) — можно пропустить
-   и указать позже в панели `http://127.0.0.1:7788`.
-3. Напишите боту `/start` — первый пользователь становится администратором.
-4. Отправьте задачу.
+1. Run `ocbridge-setup-0.4.1.exe`.
+2. Paste the bot token from [@BotFather](https://t.me/BotFather) — you may skip this
+   and set it later in the panel `http://127.0.0.1:7788`.
+3. Send `/start` to the bot — the first user becomes administrator.
+4. Send a task.
 
-Автозапуск включается в установщике, в трее или в панели. Для форум-группы:
-включите темы, добавьте бота админом с правом «Управление темами» и отправьте
-`/chatid` — подробности в [docs/telegram.md](docs/telegram.md).
+Autostart is enabled in the installer, tray or panel. For a forum group: enable
+Topics, add the bot as an admin with “Manage Topics” and send `/chatid` — details in
+[docs/telegram.md](docs/telegram.md).
 
-### Из исходников
+### From source
 
 ```bash
 bun install
-bun run src/index.ts --ui     # dev-режим, открывает панель
+bun run src/index.ts --ui     # dev mode, opens the panel
 bun run typecheck
 bun run build                 # dist/ocbridge.exe
-bun run src/doctor.ts         # проверка связки с OpenCode
+bun run src/doctor.ts         # check the OpenCode connection
 ```
 
-Установщик и остальные компоненты: [docs/build-and-release.md](docs/build-and-release.md).
+Installer and other components: [docs/build-and-release.md](docs/build-and-release.md).
 
-## Как это работает
+## How it works
 
 ```
 Telegram ⇄ grammY (long polling) ⇄ Bridge ⇄ OpenCode HTTP API
                                      ├─ /api/session/{id}/prompt, /interrupt, /permission/*
                                      ├─ SSE /api/event (text.delta, execution.*, permission.asked)
-                                     └─ state.json (тема/чат ⇄ сессия)
+                                     └─ state.json (topic/chat ⇄ session)
 ```
 
-Проверено на OpenCode 2.3.2: конец хода — `session.execution.*` (`session.idle` не
-приходит), SSE-фильтр принимает повторяющиеся `types`, поток волатильный.
-Подробнее: [docs/opencode-integration.md](docs/opencode-integration.md).
+Tested with OpenCode 2.3.2: the end of a turn is `session.execution.*`
+(`session.idle` never arrives), the SSE filter accepts repeated `types`, and the
+stream is volatile. Details: [docs/opencode-integration.md](docs/opencode-integration.md).
 
-## Данные и безопасность
+## Data and security
 
-- Токен и настройки — только в `%APPDATA%\opencode-telegram-bridge\config.json`;
-  в репозиторий и сборки он не попадает.
-- Веб-панель слушает `127.0.0.1`, наружу не открывается.
-- Исходящие соединения: long polling к Telegram и localhost-запросы к OpenCode.
-- Доступ по allowlist; первый `/start` в пустом конфиге делает пользователя админом.
-- `config.json` содержит токен — не публикуйте его и не коммитьте.
+- The token and settings live only in
+  `%APPDATA%\opencode-telegram-bridge\config.json`; they never reach the repository
+  or the builds.
+- The web panel listens on `127.0.0.1` and is not exposed externally.
+- Outgoing connections: long polling to Telegram and localhost requests to OpenCode.
+- Access is allowlist-based; the first `/start` on an empty config makes the user an
+  admin.
+- `config.json` contains the token — do not publish or commit it.
 
-## Документация
+## Documentation
 
-| Раздел | Содержание |
+| Chapter | Contents |
 |---|---|
-| [docs/README.md](docs/README.md) | Индекс всех глав |
-| [docs/architecture.md](docs/architecture.md) | Компоненты, порты, файлы |
-| [docs/opencode-integration.md](docs/opencode-integration.md) | Эндпоинты и SSE |
-| [docs/telegram.md](docs/telegram.md) | Команды, режимы, права, медиа |
-| [docs/voice.md](docs/voice.md) | Голос и HEX |
-| [docs/ui.md](docs/ui.md) | Темы, язык, Electron |
+| [docs/README.md](docs/README.md) | Index of all chapters |
+| [docs/architecture.md](docs/architecture.md) | Components, ports, files |
+| [docs/opencode-integration.md](docs/opencode-integration.md) | Endpoints and SSE |
+| [docs/telegram.md](docs/telegram.md) | Commands, modes, permissions, media |
+| [docs/media.md](docs/media.md) | File relay: limits and fallback |
+| [docs/discord.md](docs/discord.md) | Discord transport and limits |
+| [docs/voice.md](docs/voice.md) | Voice and HEX |
+| [docs/ui.md](docs/ui.md) | Themes, language, Electron |
 | [docs/cli.md](docs/cli.md) | `ocbridge-cli` |
-| [docs/build-and-release.md](docs/build-and-release.md) | Сборка и релиз |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Частые проблемы |
+| [docs/build-and-release.md](docs/build-and-release.md) | Build and release |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Common problems |
 
-## Лицензия
+Russian documentation: [docs/ru/README.md](docs/ru/README.md).
 
-MIT — см. [LICENSE](LICENSE).
+## License
+
+MIT — see [LICENSE](LICENSE).
