@@ -27,6 +27,8 @@ export interface State {
   discordSessions: Record<string, DiscordSessionRecord>;
   /** Last GitHub update check (cache for the UI and 6 h timer). */
   update?: Record<string, unknown>;
+  /** Version replaced by the last successful bundle update ({app}\prev). */
+  prevVersion?: string;
 }
 
 const emptyState = (): State => ({ topics: {}, chats: {}, sessions: {}, discordThreads: {}, discordChannels: {}, discordSessions: {} });
@@ -208,6 +210,28 @@ export class Store {
   setUpdateCache(cache: Record<string, unknown>): void {
     this.data.update = cache;
     this.save();
+  }
+
+  /** Remembers which version sits in `{app}\prev` across the restart. */
+  setPrevVersion(version: string | undefined): void {
+    if (version) this.data.prevVersion = version;
+    else delete this.data.prevVersion;
+    this.saveNow();
+  }
+
+  getPrevVersion(): string | undefined {
+    return this.data.prevVersion;
+  }
+
+  /** Flush immediately: the process is about to be replaced by the updater. */
+  saveNow(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    try {
+      writeFileSync(this.file, JSON.stringify(this.data, null, 2), "utf8");
+    } catch {
+      /* state persistence is best-effort */
+    }
   }
 
   locateDiscord(sessionID: string): { chatId?: string; threadId?: string } {

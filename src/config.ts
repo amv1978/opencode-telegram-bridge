@@ -37,6 +37,13 @@ export interface UpdateConfig {
   autoDownload?: boolean;
 }
 
+/** Lifecycle notifications in chat (start/stop/update). */
+export interface NotifyConfig {
+  enabled?: boolean;
+  /** "admin" = first admin's private chat, "all" = every allowed user, or explicit chat ids. */
+  targets?: "admin" | "all" | string[];
+}
+
 export interface BridgeConfig {
   telegram: {
     token: string;
@@ -61,6 +68,8 @@ export interface BridgeConfig {
   media?: MediaConfig;
   /** GitHub auto-update settings. */
   update?: UpdateConfig;
+  /** Lifecycle chat notifications (default: enabled, first admin). */
+  notify?: NotifyConfig;
   /** Forum supergroup chat id used in "topics" mode. */
   topicsChatId?: number;
   /** Default directory for new sessions (empty = current working directory). */
@@ -71,6 +80,8 @@ export interface BridgeConfig {
     theme?: "opencode" | "matrix";
     scheme?: "system" | "light" | "dark";
     lang?: "system" | "ru" | "en";
+    /** Versions whose changelog modal was already acknowledged (Electron). */
+    seenChangelog?: string[];
   };
   web: {
     port: number;
@@ -94,6 +105,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   showSubagents: true,
   media: { relay: "all", maxPhotoMb: 10 },
   update: { checkOnStart: true, intervalHours: 6, autoDownload: false },
+  notify: { enabled: true, targets: "admin" },
   web: { port: 7788 },
   stream: { editIntervalMs: 1800, showReasoning: false, showTools: "compact", format: "rich" },
 };
@@ -206,10 +218,24 @@ export function loadConfig(paths: Paths): BridgeConfig {
       intervalHours: clampNumber(raw.update?.intervalHours, 1, 168, 6),
       autoDownload: raw.update?.autoDownload === true,
     },
+    notify: {
+      enabled: raw.notify?.enabled !== false,
+      targets:
+        raw.notify?.targets === "all"
+          ? "all"
+          : Array.isArray(raw.notify?.targets)
+            ? raw.notify.targets.map((id) => String(id).trim()).filter(Boolean)
+            : "admin",
+    },
     topicsChatId: raw.topicsChatId,
     defaultDirectory: raw.defaultDirectory,
     autoTopics: raw.autoTopics ?? true,
-    ui: { theme: raw.ui?.theme ?? "opencode", scheme: raw.ui?.scheme ?? "system", lang: raw.ui?.lang ?? "system" },
+    ui: {
+      theme: raw.ui?.theme ?? "opencode",
+      scheme: raw.ui?.scheme ?? "system",
+      lang: raw.ui?.lang ?? "system",
+      seenChangelog: Array.isArray(raw.ui?.seenChangelog) ? raw.ui.seenChangelog.map(String) : [],
+    },
     web: { port: raw.web?.port ?? DEFAULT_CONFIG.web.port },
     stream: { ...DEFAULT_CONFIG.stream, ...(raw.stream ?? {}) },
   };
@@ -235,6 +261,59 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, Math.round(number)));
+}
+
+/**
+ * The installer never rewrites config.json (it would drop unrelated sections).
+ * It leaves installer.json with optional overrides; they are merged once here.
+ */
+export function applyInstallerOverrides(paths: Paths, cfg: BridgeConfig, configExisted: boolean): boolean {
+  const file = join(dirname(paths.configFile), "installer.json");
+  if (!existsSync(file)) return false;
+  let raw: Record<string, any>;
+  try {
+    raw = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, "")) as Record<string, any>;
+  } catch {
+    return false;
+  }
+  const overrides = (raw.config ?? undefined) as Record<string, unknown> | undefined;
+  let changed = false;
+  if (overrides && !(raw.configOnlyIfNew === true && configExisted)) {
+    const token = typeof overrides.telegramToken === "string" ? overrides.telegramToken.trim() : "";
+    if (token && !/^[*•]+/.test(token)) {
+      cfg.telegram.token = token;
+      changed = true;
+    }
+    if (overrides.mode === "topics" || overrides.mode === "private" || overrides.mode === "both") {
+      cfg.mode = overrides.mode;
+      changed = true;
+    }
+    if (typeof overrides.defaultDirectory === "string" && overrides.defaultDirectory.trim()) {
+      cfg.defaultDirectory = overrides.defaultDirectory.trim();
+      changed = true;
+    }
+    const lang = overrides.lang;
+    if (lang === "ru" || lang === "en" || lang === "system") {
+      cfg.ui = { ...(cfg.ui ?? {}), lang };
+      changed = true;
+    }
+    const topics = Number(overrides.topicsChatId);
+    if (Number.isFinite(topics) && topics !== 0) {
+      cfg.topicsChatId = topics;
+      changed = true;
+    }
+    if (changed) saveConfig(paths, cfg);
+  }
+  // Keep install kind/directory/autostart for the next wizard run, drop one-shot overrides.
+  delete raw.config;
+  delete raw.configOnlyIfNew;
+  raw.configAppliedAt = new Date().toISOString();
+  try {
+    writeFileSync(file, JSON.stringify(raw, null, 2) + "\n", "utf8");
+  } catch {
+    /* best-effort */
+  }
+  return changed;
 }
 
 export function saveConfig(paths: Paths, cfg: BridgeConfig): void {

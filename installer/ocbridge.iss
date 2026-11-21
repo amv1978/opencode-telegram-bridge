@@ -3,7 +3,9 @@
 ; Produces: dist\ocbridge-setup-<version>.exe
 
 #define AppName "OpenCode Telegram Bridge"
-#define AppVersion "0.5.1"
+#ifndef AppVersion
+  #define AppVersion "0.6.0"
+#endif
 #define AppExe "ocbridge.exe"
 
 [Setup]
@@ -46,6 +48,8 @@ Source: "..\dist\ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\cli\ocbridge-cli.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\desktop\release\win-unpacked\*"; DestDir: "{app}\desktop"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\version.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Dirs]
 Name: "{app}"; Permissions: users-modify
@@ -70,5 +74,8 @@ Filename: "taskkill"; Parameters: "/IM ocbridge.exe /F"; Flags: runhidden; RunOn
 
 [UninstallDelete]
 Type: files; Name: "{app}\bridge.log"
+Type: filesandordirs; Name: "{app}\prev"
+Type: filesandordirs; Name: "{app}\new"
+Type: filesandordirs; Name: "{app}\failed"
 #include "messages.iss"
 #include "wizard.iss"

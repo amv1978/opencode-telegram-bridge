@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { isDiscordConfigured, loadConfig, resolvePaths, saveConfig, type BridgeConfig, type DiscordConfig } from "./config.ts";
+import {
+  applyInstallerOverrides,
+  isDiscordConfigured,
+  loadConfig,
+  resolvePaths,
+  saveConfig,
+  type BridgeConfig,
+  type DiscordConfig,
+} from "./config.ts";
 import pkg from "../package.json";
 import { initLog, log } from "./log.ts";
 import { discover, OcClient } from "./opencode/client.ts";
@@ -10,6 +19,7 @@ import { setupTelegramNetwork, type TelegramNet } from "./telegram/net.ts";
 import { DiscordBridge } from "./discord/adapter.ts";
 import { MediaRelay } from "./media/relay.ts";
 import { Updater, type UpdateCache } from "./updater.ts";
+import { changelogBetween } from "./changelog.ts";
 
 export type BotState = "stopped" | "starting" | "running" | "error";
 
@@ -34,7 +44,13 @@ export interface Snapshot {
     showSubagents: boolean;
     media: { relay: "none" | "user" | "all"; maxPhotoMb: number };
     update: { checkOnStart: boolean; intervalHours: number; autoDownload: boolean };
-    ui: { theme: "opencode" | "matrix"; scheme: "system" | "light" | "dark"; lang: "system" | "ru" | "en" };
+    notify: { enabled: boolean; targets: "admin" | "all" | string[] };
+    ui: {
+      theme: "opencode" | "matrix";
+      scheme: "system" | "light" | "dark";
+      lang: "system" | "ru" | "en";
+      seenChangelog: string[];
+    };
     proxy?: string;
     apiIp?: string;
     allowedUsers: Array<{ id: number; role?: string; name?: string }>;
@@ -79,17 +95,25 @@ export class App {
   private discordRetryTimer?: ReturnType<typeof setTimeout>;
   private ocVersion = "";
   private ocUrl = "";
+  private lastStartNotice = 0;
+  private lastFailureNotice = 0;
+  private suppressLifecycleNotice = false;
 
   constructor() {
     initLog(this.paths.logFile);
+    const configExisted = existsSync(this.paths.configFile);
     this.cfg = loadConfig(this.paths);
+    applyInstallerOverrides(this.paths, this.cfg, configExisted);
     this.store = new Store(this.paths.stateFile);
     this.updater = new Updater({
       packaged: isCompiled(),
       dataDir: dirname(this.paths.configFile),
+      installDir: dirname(process.execPath),
       onCache: (cache) => this.store.setUpdateCache(cache as unknown as Record<string, unknown>),
+      onBeforeInstall: (previous) => this.store.setPrevVersion(previous),
+      notify: (text) => this.notify(text),
     });
-    this.updater.restore(this.store.updateCache() as UpdateCache | undefined);
+    this.updater.restore(this.store.updateCache() as UpdateCache | undefined, this.store.getPrevVersion());
   }
 
   snapshot(): Snapshot {
@@ -121,10 +145,15 @@ export class App {
           intervalHours: this.cfg.update?.intervalHours ?? 6,
           autoDownload: this.cfg.update?.autoDownload === true,
         },
+        notify: {
+          enabled: this.cfg.notify?.enabled !== false,
+          targets: this.cfg.notify?.targets ?? "admin",
+        },
         ui: {
           theme: this.cfg.ui?.theme ?? "opencode",
           scheme: this.cfg.ui?.scheme ?? "system",
           lang: this.cfg.ui?.lang ?? "system",
+          seenChangelog: this.cfg.ui?.seenChangelog ?? [],
         },
         proxy: this.cfg.telegram.proxy,
         apiIp: this.cfg.telegram.apiIp,
@@ -200,10 +229,15 @@ export class App {
       this.startedAt = Date.now();
       this.startUpdateLoop();
       log.info("bridge running");
+      // Discord logs in asynchronously; give it a moment so the start notice
+      // can name both bots. 2-minute debounce keeps reconnect loops quiet.
+      const noticeTimer = setTimeout(() => void this.sendStartNotice(), 2500);
+      noticeTimer.unref?.();
     } catch (error) {
       this.state = "error";
       this.error = (error as Error).message;
       log.error("start failed:", this.error);
+      void this.sendFailureNotice(this.error);
       await this.bridge?.stop().catch(() => undefined);
       await this.discord?.stop().catch(() => undefined);
       this.net?.stop();
@@ -284,7 +318,7 @@ export class App {
     }
   }
 
-  async stopBot(): Promise<void> {
+  async stopBot(reason: "quit" | "restart" | "error" | "update" = "quit"): Promise<void> {
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = undefined;
@@ -292,6 +326,11 @@ export class App {
     if (this.discordRetryTimer) {
       clearTimeout(this.discordRetryTimer);
       this.discordRetryTimer = undefined;
+    }
+    if (!this.suppressLifecycleNotice && reason !== "restart" && reason !== "update" && this.state === "running") {
+      const uptime = this.startedAt ? formatUptime(Date.now() - this.startedAt) : "—";
+      const label = reason === "error" ? "ошибка" : "выход";
+      await this.notify(`🔴 остановлен · uptime ${uptime} · причина: ${label}`);
     }
     await this.bridge?.stop().catch((error) => log.warn("stop:", (error as Error).message));
     await this.discord?.stop().catch((error) => log.warn("discord stop:", (error as Error).message));
@@ -305,8 +344,14 @@ export class App {
   }
 
   async restartBot(): Promise<void> {
-    await this.stopBot();
-    await this.startBot();
+    // Config saves and tray restarts are not user-visible lifecycle transitions.
+    this.suppressLifecycleNotice = true;
+    try {
+      await this.stopBot("restart");
+      await this.startBot();
+    } finally {
+      this.suppressLifecycleNotice = false;
+    }
   }
 
   async updateConfig(patch: Record<string, unknown>): Promise<void> {
@@ -353,7 +398,23 @@ export class App {
         intervalHours: Math.min(168, Math.max(1, Math.round(update.intervalHours))),
       };
     }
+    const notify = (patch.notify ?? {}) as Record<string, unknown>;
+    if (typeof notify.enabled === "boolean") {
+      this.cfg.notify = { ...(this.cfg.notify ?? {}), enabled: notify.enabled };
+    }
+    if (notify.targets === "admin" || notify.targets === "all") {
+      this.cfg.notify = { ...(this.cfg.notify ?? {}), targets: notify.targets };
+    } else if (Array.isArray(notify.targets)) {
+      this.cfg.notify = {
+        ...(this.cfg.notify ?? {}),
+        targets: notify.targets.map((id) => String(id).trim()).filter(Boolean),
+      };
+    }
+
     const ui = (patch.ui ?? {}) as Record<string, unknown>;
+    if (Array.isArray(ui.seenChangelog)) {
+      this.cfg.ui = { ...(this.cfg.ui ?? {}), seenChangelog: ui.seenChangelog.map((v) => String(v).trim()).filter(Boolean) };
+    }
     if (ui.theme === "opencode" || ui.theme === "matrix") {
       this.cfg.ui = { ...(this.cfg.ui ?? {}), theme: ui.theme };
     }
@@ -397,6 +458,75 @@ export class App {
     }
   }
 
+  // ------------------------------------------------------------ notifications
+
+  /** Chat ids for lifecycle messages: first admin, everyone, or explicit ids. */
+  notifyTargets(): number[] {
+    const targets = this.cfg.notify?.targets ?? "admin";
+    const users = this.cfg.telegram.allowedUsers;
+    if (targets === "all") return users.map((user) => user.id);
+    if (Array.isArray(targets)) {
+      return targets.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id !== 0);
+    }
+    const admin = users.find((user) => user.role === "admin") ?? users[0];
+    return admin ? [admin.id] : [];
+  }
+
+  /** Sends through the active Telegram transport; failures never break the bridge. */
+  async notify(text: string): Promise<void> {
+    if (this.cfg.notify?.enabled === false) return;
+    const token = this.cfg.telegram.token;
+    if (!token) return;
+    // A pinned transport can hiccup right after a restart; retry once through it
+    // and once through the direct fetch, without ever blocking the caller for long.
+    const transports = [this.net?.fetch, globalThis.fetch].filter(Boolean) as Array<typeof globalThis.fetch>;
+    for (const chatId of this.notifyTargets()) {
+      let delivered = false;
+      for (let attempt = 0; attempt < 3 && !delivered; attempt += 1) {
+        const fetchImpl = transports[attempt % transports.length]!;
+        try {
+          const response = await fetchImpl(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (response.ok) delivered = true;
+          else log.warn(`notify: Telegram HTTP ${response.status}`);
+        } catch (error) {
+          log.warn("notify:", (error as Error).message);
+        }
+        if (!delivered) await new Promise((resolve) => setTimeout(resolve, 1200));
+      }
+    }
+  }
+
+  private async sendStartNotice(): Promise<void> {
+    if (this.suppressLifecycleNotice || this.state !== "running") return;
+    const now = Date.now();
+    if (now - this.lastStartNotice < 2 * 60_000) return;
+    this.lastStartNotice = now;
+    let sessions = 0;
+    try {
+      sessions = (await this.sessions()).length;
+    } catch {
+      /* optional */
+    }
+    const discord = this.discord?.status.username;
+    const text =
+      `🟢 OpenCode Bridge ${pkg.version} · OpenCode ${this.ocVersion || "—"} · ` +
+      `Telegram @${this.username || "—"} · Discord ${discord ? `@${discord}` : "—"} · сессий ${sessions}`;
+    await this.notify(text);
+  }
+
+  private async sendFailureNotice(message: string): Promise<void> {
+    if (this.suppressLifecycleNotice) return;
+    const now = Date.now();
+    if (now - this.lastFailureNotice < 2 * 60_000) return;
+    this.lastFailureNotice = now;
+    await this.notify(`⚠️ не удалось запустить: ${message}`);
+  }
+
   private startUpdateLoop(): void {
     if (this.updateTimer) return;
     const settings = this.cfg.update ?? {};
@@ -421,6 +551,27 @@ export class App {
 
   async installUpdate(): Promise<ReturnType<Updater["snapshot"]>> {
     return this.updater.install();
+  }
+
+  async rollbackUpdate(): Promise<ReturnType<Updater["snapshot"]>> {
+    const result = await this.updater.rollback();
+    if (!result.error) this.store.setPrevVersion(undefined);
+    return result;
+  }
+
+  /** CHANGELOG sections in `(from, to]` for the Electron modal. */
+  changelog(from: string | undefined, to: string): Array<{ version: string; heading: string; body: string }> {
+    return changelogBetween(from, to);
+  }
+
+  /** Marks a version's changelog as acknowledged; does not restart the bridge. */
+  markChangelogSeen(version: string): void {
+    const value = version.trim();
+    if (!value) return;
+    const seen = this.cfg.ui?.seenChangelog ?? [];
+    if (seen.includes(value)) return;
+    this.cfg.ui = { ...(this.cfg.ui ?? {}), seenChangelog: [...seen, value] };
+    saveConfig(this.paths, this.cfg);
   }
 
   setAutostart(enabled: boolean): void {    if (process.platform !== "win32" || !isCompiled()) throw new Error("Автозапуск поддерживается в собранной версии для Windows");
@@ -456,6 +607,16 @@ export function openBrowser(url: string): void {
   if (process.platform === "win32") spawnSync("cmd", ["/c", "start", "", url], { windowsHide: true });
   else if (process.platform === "darwin") spawnSync("open", [url]);
   else spawnSync("xdg-open", [url]);
+}
+
+function formatUptime(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}с`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}м`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours}ч ${rest}м` : `${hours}ч`;
 }
 
 /** Accepts an array (API) or a comma/space separated string (manual config edits). */

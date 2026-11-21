@@ -4,11 +4,14 @@
 
 ## Что нужно
 
-- Bun 1.3+ (сборка демона и компиляция в exe);
+- Bun 1.3+ (сборка демона и компиляция exe);
 - Node.js 20+ и npm (Electron-оболочка);
 - .NET SDK 10 (CLI);
-- Inno Setup 6 (установщик);
-- `ffmpeg.exe` — в репозиторий не входит, положите его в `dist\`.
+- Inno Setup 6 (`winget install JRSoftware.InnoSetup`; `ISCC.exe` появляется в
+  `%LOCALAPPDATA%\Programs\Inno Setup 6\`);
+- `ffmpeg.exe` — не в репозитории, положить в `dist\`.
+
+`scripts/build-release.ps1` выполняет все шаги ниже и создаёт релизные файлы.
 
 ## 1. Демон
 
@@ -19,10 +22,10 @@ bun run build                 # dist\ocbridge.exe
 ```
 
 `bun run build` = `bun build src/index.ts --compile --outfile dist/ocbridge.exe`.
-Кросс-сборка: `bun run build:linux`, `bun run build:mac` (артефакты без `.exe`).
+Кросс-сборки: `bun run build:linux`, `bun run build:mac` (без `.exe`).
 
-Скопируйте `ffmpeg.exe` в `dist\ffmpeg.exe` — установщик берёт его оттуда,
-а демон ищет рядом с собой.
+Скопируйте `ffmpeg.exe` в `dist\ffmpeg.exe` — его берут bundle и оба установщика,
+а демон ищет его рядом с собой.
 
 ## 2. CLI
 
@@ -33,7 +36,8 @@ dotnet publish -c Release -r win-x64 --self-contained true `
   -o ..\dist\cli
 ```
 
-Результат: `dist\cli\ocbridge-cli.exe`, single-file, ~74 МБ.
+Результат: `dist\cli\ocbridge-cli.exe`, single-file, ~74 МБ. В bundle он лежит в
+корне как `ocbridge-cli.exe`.
 
 ## 3. Electron-оболочка
 
@@ -43,70 +47,122 @@ npm install
 npm run pack                  # electron-builder --win --dir
 ```
 
-Результат: `desktop\release\win-unpacked\` (~357 МБ), внутри `OpenCode Bridge.exe`.
-Target только `dir` — отдельный portable-exe Electron не собирается.
+Результат: `desktop\release\win-unpacked\` (~357 МБ) с `OpenCode Bridge.exe`.
+Только target `dir` — отдельный portable Electron exe не собирается.
 
-## 4. Установщик
+## 4. Portable bundle
 
-```powershell
-winget install JRSoftware.InnoSetup
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\ocbridge.iss
+`scripts/build-release.ps1` готовит `dist\bundle\` и упаковывает:
+
+```
+ocbridge-bundle-0.6.0.zip
+  ocbridge.exe
+  ffmpeg.exe
+  ocbridge-cli.exe
+  desktop\            (весь win-unpacked)
+  version.json        version, builtAt, files[{path,size}]
+  CHANGELOG.md
+  README.md
 ```
 
-Выход: `dist\ocbridge-setup-<version>.exe`, сжатие lzma2, итог ~180 МБ.
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
+```
 
-Состав:
+Скрипт пишет `dist\ocbridge-bundle-<ver>.zip.sha256`. `version.json` также
+копируется в `dist\version.json` для полного установщика.
 
-| Что | Откуда | Размер |
-|---|---|---|
-| `ocbridge.exe` | `dist\` | ~115 МБ |
-| `ffmpeg.exe` | `dist\` | ~83 МБ |
-| `ocbridge-cli.exe` | `dist\cli\` (если есть) | ~74 МБ |
-| `desktop\*` | `desktop\release\win-unpacked\` | ~357 МБ |
-| `README.md`, `INSTALL.txt` | корень / `docs\` | мало |
+## 5. Установщики
 
-Установщик: простой режим пишет только `ui.lang` (существующий конфиг не трогает),
-расширенный — токен, режим, папку. Перед установкой процессы с путём
-`*OpenCodeTelegramBridge*` завершаются. Ярлыки: приложение, CLI, удаление,
-опционально рабочий стол. Автозапуск — задача установщика.
-При удалении `%APPDATA%\opencode-telegram-bridge\` сохраняется.
+Два скрипта Inno Setup используют общие `messages.iss` и `wizard.iss`:
 
-## 5. Версии: четыре места
+| Скрипт | Результат | Размер | Содержимое |
+|---|---|---|---|
+| `installer\ocbridge.iss` | `dist\ocbridge-setup-<ver>.exe` | ~180 МБ | полная офлайн-установка |
+| `installer\ocbridge-lite.iss` | `dist\ocbridge-setup-lite-<ver>.exe` | ~3–5 МБ | скачивает bundle |
+
+```powershell
+$iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+& $iscc "/DAppVersion=0.6.0" installer\ocbridge.iss
+$sha = (Get-FileHash dist\ocbridge-bundle-0.6.0.zip -Algorithm SHA256).Hash.ToLower()
+& $iscc "/DAppVersion=0.6.0" "/DBundleSha=$sha" installer\ocbridge-lite.iss
+```
+
+Lite-установщик показывает страницу загрузки с прогрессом, проверяет SHA256
+(`DownloadPage.Add(..., BundleSha)`), распаковывает zip в `{app}`, создаёт
+ярлыки/автозапуск и запускает приложение. При ошибке сети/404/хеша предлагает
+открыть страницу релиза ради полного установщика.
+
+Оба установщика:
+
+- не перезаписывают `config.json`; пишут `installer.json` с типом установки,
+  каталогом, флагом автозапуска и разовыми переопределениями конфига, которые
+  приложение применяет при следующем старте;
+- предзаполняют мастер из `%APPDATA%\opencode-telegram-bridge\config.json`
+  (режим, папка проектов, `topicsChatId`; токен замаскирован, пусто = оставить)
+  и из прошлого `installer.json`;
+- завершают процессы с `*OpenCodeTelegramBridge*` в пути перед установкой; при
+  удалении `%APPDATA%\opencode-telegram-bridge\` сохраняется.
+
+## 6. Контрольные суммы и артефакты
+
+```powershell
+Get-ChildItem dist\ocbridge-*0.6.0* | Select-Object Name,Length
+```
+
+В релиз загружаются три бинарника и три суммы:
+
+```
+ocbridge-setup-0.6.0.exe
+ocbridge-setup-0.6.0.exe.sha256
+ocbridge-setup-lite-0.6.0.exe
+ocbridge-setup-lite-0.6.0.exe.sha256
+ocbridge-bundle-0.6.0.zip
+ocbridge-bundle-0.6.0.zip.sha256
+```
+
+Формат `sha256sum`: hex в нижнем регистре, два пробела, имя файла.
+
+## 7. Версии: пять мест
 
 | Файл | Поле |
 |---|---|
 | `package.json` | `"version"` |
 | `desktop/package.json` | `"version"` |
-| `installer/ocbridge.iss` | `#define AppVersion "0.5.1"` |
+| `installer/ocbridge.iss` | `#define AppVersion "0.6.0"` |
+| `installer/ocbridge-lite.iss` | `#define AppVersion "0.6.0"` |
 | `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` |
 
 Дополнительно: `cli/Program.cs`, константа `Program.Version` — её печатает
 `ocbridge-cli version`; держите равной версии csproj. Версия API берётся из
 `package.json` автоматически.
 
-Имя установщика формируется из `AppVersion`: `ocbridge-setup-0.5.1.exe`.
-После смены версии пересоберите **все** артефакты — старый exe внутри нового
-установщика иначе покажет прежнюю версию.
+После смены версии пересоберите **все** артефакты — иначе старый exe внутри
+нового bundle/установщика всё ещё сообщает прошлую версию.
 
 ## Чек-лист релиза
 
-1. Поднять версию в четырёх местах (+ `Program.cs`).
-2. `bun run typecheck` и `bun run src/doctor.ts`.
-3. Пересобрать демон, CLI, оболочку, установщик.
-4. Запустить установщик на чистой машине: окно, трей, `/start`, тема, голос.
-5. Проверить, что в git нет `config.json`, `state.json`, `*.log`, `dist/`, `*.exe`.
-6. Тег `v0.5.1`, к релизу приложить `ocbridge-setup-0.5.1.exe` и исходники.
+1. Поднять версию в пяти местах (+ `Program.cs`).
+2. `bunx tsc --noEmit` и `bun run src/doctor.ts`.
+3. `powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1`.
+4. Проверить layout bundle (`version.json` со списком файлов,
+   `desktop\OpenCode Bridge.exe`).
+5. Установить полный и lite setup на чистой машине: окно, трей, `/start`, тема,
+   голос.
+6. Убедиться, что в git нет `config.json`, `state.json`, `installer.json`,
+   `*.log`, `dist/`, `*.exe`.
+7. Поставить тег `v0.6.0` и загрузить все шесть файлов.
+8. Удалить устаревшие релизы.
 
 ## Подпись кода
 
-Сейчас binaries не подписаны: SmartScreen покажет предупреждение «Неизвестный издатель».
-При наличии сертификата подпишите сначала `ocbridge.exe`, `ocbridge-cli.exe` и
-`OpenCode Bridge.exe`, затем сам установщик:
+Бинарники пока без подписи: SmartScreen показывает «Unknown publisher». С
+сертификатом подпишите `ocbridge.exe`, `ocbridge-cli.exe` и
+`OpenCode Bridge.exe`, затем установщики:
 
 ```powershell
-signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <файл>
+signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <file>
 ```
 
-Подпись установщика после сборки не меняет его содержимое, но меняет хеш —
-пересчитывайте контрольные суммы после подписи. CI и workflows в репозитории нет:
-сборка ручная, на Windows.
+Подпись установщика после сборки не меняет содержимое, но меняет хеш —
+пересчитайте контрольные суммы. CI нет: сборка ручная, на Windows.

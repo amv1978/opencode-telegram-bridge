@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import pkg from "../../package.json";
 import { App } from "../app.ts";
 import { log } from "../log.ts";
 import { PAGE } from "./ui.ts";
@@ -80,6 +81,22 @@ async function handle(app: App, request: Request): Promise<Response> {
 
     if (request.method === "POST" && url.pathname === "/api/update/install") {
       return json({ update: await app.installUpdate() });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/update/rollback") {
+      return json({ update: await app.rollbackUpdate() });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/changelog") {
+      const from = url.searchParams.get("from") ?? undefined;
+      const to = url.searchParams.get("to") ?? pkg.version;
+      return json({ sections: app.changelog(from, to) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/ui/seen-changelog") {
+      const body = (await request.json()) as { version?: string };
+      app.markChangelogSeen(String(body.version ?? ""));
+      return json({ ok: true });
     }
 
     if (request.method === "POST" && url.pathname === "/api/autostart") {

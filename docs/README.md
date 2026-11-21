@@ -25,7 +25,7 @@ Russian mirrors: [docs/ru/](ru/README.md).
 
 ## Quick links
 
-- Install: `dist\ocbridge-setup-0.5.1.exe` or build from source
+- Install: `dist\ocbridge-setup-0.6.0.exe` or build from source
   (see [build-and-release.md](build-and-release.md)).
 - Control panel: `http://127.0.0.1:7788` (localhost only).
 - Data: `%APPDATA%\opencode-telegram-bridge\` — `bridge.log` lives there too.

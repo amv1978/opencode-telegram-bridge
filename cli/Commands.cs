@@ -40,15 +40,34 @@ internal static class Commands
                 Console.Error.WriteLine("Ошибка: " + error);
                 return 1;
             }
-            Console.WriteLine("Установщик запускается, мост будет перезапущен.");
+            Console.WriteLine("Bundle скачивается и распаковывается, мост перезапустится автоматически.");
             return 0;
         }
+
+        if (mode == "--rollback")
+        {
+            var rollback = await api.PostAsync("/api/update/rollback");
+            var error = Text(rollback?["update"]?["error"]);
+            if (error.Length > 0)
+            {
+                Console.Error.WriteLine("Ошибка: " + error);
+                return 1;
+            }
+            Console.WriteLine("Откат запущен, мост перезапустится с предыдущей версией.");
+            return 0;
+        }
+
+        if (mode is not ("--check" or "check"))
+            throw new UsageException($"неизвестный параметр update: {args[0]} (ожидается --check, --install или --rollback)");
 
         var result = await api.PostAsync("/api/update/check");
         var update = result?["update"];
         WriteRow("Текущая", Text(update?["current"]));
         WriteRow("Последняя", Text(update?["latest"]));
         WriteRow("Доступна", update?["available"]?.GetValue<bool>() == true ? "да" : "нет");
+        var prev = Text(update?["prevVersion"]);
+        if (prev.Length > 0)
+            WriteRow("Откат на", prev);
         var notes = Text(update?["notes"]);
         if (notes.Length > 0)
             Console.WriteLine("Заметки:       " + notes.Split('\n')[0]);

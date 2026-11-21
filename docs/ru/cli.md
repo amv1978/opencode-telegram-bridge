@@ -134,8 +134,8 @@ both
 
 ```
 > ocbridge-cli version
-ocbridge-cli 0.5.1
-API: 0.5.1
+ocbridge-cli 0.6.0
+API: 0.6.0
 OpenCode: 2.3.2
 
 > ocbridge-cli help logs

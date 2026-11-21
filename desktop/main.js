@@ -12,6 +12,7 @@ let bridge = null;
 let spawnedByUs = false;
 let lastState = null;
 let quitting = false;
+const changelogShown = new Set();
 
 // ---------------------------------------------------------------- tray icons
 
@@ -179,6 +180,8 @@ const TEXTS = {
     reconnect: "Переподключить OpenCode",
     checkUpdate: "Проверить обновления",
     installUpdate: "Установить",
+    rollback: "Откатиться на",
+    whatsNew: "Что нового",
     settings: "Настройки",
     log: "Журнал",
     autostart: "Автозапуск",
@@ -199,6 +202,8 @@ const TEXTS = {
     reconnect: "Reconnect OpenCode",
     checkUpdate: "Check for updates",
     installUpdate: "Install",
+    rollback: "Roll back to",
+    whatsNew: "What's new",
     settings: "Settings",
     log: "Log",
     autostart: "Launch at login",
@@ -227,6 +232,137 @@ function statusOf(state) {
   if (state.state === "running") return { icon: ICONS.ok, text: `${t("running")} · @${state.username || "?"}` };
   if (state.state === "starting") return { icon: ICONS.warn, text: t("starting") };
   return { icon: ICONS.bad, text: state.state === "error" ? t("error") : t("stopped") };
+}
+
+// ---------------------------------------------------------------- changelog
+
+function compareVersions(left, right) {
+  const parse = (value) =>
+    String(value || "")
+      .replace(/^v/i, "")
+      .split(/[+-]/)[0]
+      .split(".")
+      .map((part) => parseInt(part, 10) || 0);
+  const a = parse(left);
+  const b = parse(right);
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const diff = (a[i] || 0) - (b[i] || 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function renderMarkdown(text) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  let html = "";
+  let inList = false;
+  const closeList = () => {
+    if (inList) html += "</ul>";
+    inList = false;
+  };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const inline = (value) =>
+      escapeHtml(value)
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/`([^`]+)`/g, "<code>$1</code>");
+    if (/^###\s+/.test(line)) {
+      closeList();
+      html += `<h3>${inline(line.replace(/^###\s+/, ""))}</h3>`;
+    } else if (/^##\s+/.test(line)) {
+      closeList();
+      html += `<h2>${inline(line.replace(/^##\s+/, ""))}</h2>`;
+    } else if (/^[-*]\s+/.test(line)) {
+      if (!inList) {
+        html += "<ul>";
+        inList = true;
+      }
+      html += `<li>${inline(line.replace(/^[-*]\s+/, ""))}</li>`;
+    } else if (line.trim() === "") {
+      closeList();
+    } else {
+      closeList();
+      html += `<p>${inline(line)}</p>`;
+    }
+  }
+  closeList();
+  return html;
+}
+
+async function markChangelogSeen(version) {
+  if (!version) return;
+  try {
+    await api("/api/ui/seen-changelog", { method: "POST", body: JSON.stringify({ version }) });
+  } catch {
+    /* non-critical */
+  }
+}
+
+async function openChangelog(from, to, markVersion) {
+  let sections = [];
+  try {
+    const query = `?to=${encodeURIComponent(to || app.getVersion())}${from ? `&from=${encodeURIComponent(from)}` : ""}`;
+    sections = (await api(`/api/changelog${query}`)).sections || [];
+  } catch (error) {
+    showError(error);
+    return;
+  }
+  if (!sections.length) {
+    dialog.showMessageBox({ type: "info", message: t("whatsNew"), detail: "Нет записей для этой версии." });
+    return;
+  }
+  const title = from ? `Что нового · ${from} → ${to}` : `Что нового · ${to}`;
+  const html = `<!doctype html><html lang="ru"><meta charset="utf-8"><title>${escapeHtml(title)}</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #161616; color: #e6e6e6; font: 14px/1.55 "Segoe UI", system-ui, sans-serif; }
+  header { position: sticky; top: 0; display: flex; gap: 12px; align-items: center; padding: 14px 20px; background: #1d1d1d; border-bottom: 1px solid #2c2c2c; }
+  header h1 { flex: 1; margin: 0; font-size: 16px; font-weight: 600; }
+  main { padding: 8px 20px 24px; }
+  section { border-bottom: 1px solid #262626; padding-bottom: 8px; margin-bottom: 12px; }
+  h2 { font-size: 15px; margin: 18px 0 8px; color: #7ee787; }
+  h3 { font-size: 13px; margin: 12px 0 6px; color: #9aa4b2; text-transform: uppercase; letter-spacing: .04em; }
+  p, li { margin: 4px 0; }
+  ul { padding-left: 20px; }
+  code { background: #262626; border-radius: 3px; padding: 1px 4px; font-family: Consolas, monospace; }
+  button { background: #238636; color: #fff; border: 0; border-radius: 6px; padding: 8px 18px; font-size: 14px; cursor: pointer; }
+  button:hover { background: #2ea043; }
+</style>
+<header><h1>${escapeHtml(title)}</h1><button onclick="window.close()">Понятно</button></header>
+<main>${sections.map((section) => `<section><h2>${escapeHtml(section.heading || section.version)}</h2>${renderMarkdown(section.body)}</section>`).join("")}</main>
+</html>`;
+  const modal = new BrowserWindow({
+    width: 760,
+    height: 680,
+    minWidth: 520,
+    minHeight: 420,
+    title,
+    backgroundColor: "#161616",
+    autoHideMenuBar: true,
+    parent: win && !win.isDestroyed() ? win : undefined,
+    modal: Boolean(win && !win.isDestroyed()),
+    webPreferences: { contextIsolation: true, nodeIntegration: false },
+  });
+  modal.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`).catch(() => undefined);
+  modal.on("closed", () => {
+    if (markVersion) void markChangelogSeen(markVersion);
+  });
+}
+
+function maybeShowChangelog(state) {
+  const from = state?.update?.prevVersion;
+  const current = state?.version;
+  if (!from || !current || compareVersions(from, current) >= 0) return;
+  const key = `${from}>${current}`;
+  if (changelogShown.has(key)) return;
+  const seen = Array.isArray(state?.config?.ui?.seenChangelog) ? state.config.ui.seenChangelog : [];
+  if (seen.includes(current)) return;
+  changelogShown.add(key);
+  void openChangelog(from, current, current);
 }
 
 function buildMenu(state) {
@@ -262,37 +398,23 @@ function buildMenu(state) {
       },
     },
     {
-      label: state?.update?.available ? `${t("installUpdate")} ${state.update.latest}` : t("checkUpdate"),
+      label: t("checkUpdate"),
       click: async () => {
         try {
-          if (state?.update?.available) {
-            const answer = await dialog.showMessageBox({
-              type: "question",
-              message: `Установить ${state.update.latest}?`,
-              buttons: [t("installUpdate"), "Отмена"],
-              defaultId: 0,
-              cancelId: 1,
-            });
-            if (answer.response === 0) {
-              await api("/api/update/install", { method: "POST" });
-              quit();
-            }
-            return;
-          }
           const result = await api("/api/update/check", { method: "POST" });
           await refresh();
           if (result.update?.available) {
             const answer = await dialog.showMessageBox({
               type: "question",
               message: `Доступна версия ${result.update.latest}`,
-              detail: "Установить сейчас?",
+              detail: "Скачать и установить сейчас? Настройки сохранятся.",
               buttons: [t("installUpdate"), "Позже"],
               defaultId: 0,
               cancelId: 1,
             });
             if (answer.response === 0) {
               await api("/api/update/install", { method: "POST" });
-              quit();
+              quitForUpdate();
             }
           } else {
             await dialog.showMessageBox({ type: "info", message: t("checkUpdate"), detail: "Установлена последняя версия." });
@@ -302,6 +424,56 @@ function buildMenu(state) {
         }
       },
     },
+    ...(state?.update?.available
+      ? [
+          {
+            label: `${t("installUpdate")} ${state.update.latest}`,
+            click: async () => {
+              try {
+                const answer = await dialog.showMessageBox({
+                  type: "question",
+                  message: `Установить ${state.update.latest}?`,
+                  buttons: [t("installUpdate"), "Отмена"],
+                  defaultId: 0,
+                  cancelId: 1,
+                });
+                if (answer.response === 0) {
+                  await api("/api/update/install", { method: "POST" });
+                  quitForUpdate();
+                }
+              } catch (error) {
+                showError(error);
+              }
+            },
+          },
+        ]
+      : []),
+    ...(state?.update?.prevVersion
+      ? [
+          {
+            label: `${t("rollback")} ${state.update.prevVersion}`,
+            click: async () => {
+              try {
+                const answer = await dialog.showMessageBox({
+                  type: "question",
+                  message: `${t("rollback")} ${state.update.prevVersion}?`,
+                  detail: "Текущая версия будет заменена предыдущей. Настройки не изменятся.",
+                  buttons: ["Откатиться", "Отмена"],
+                  defaultId: 1,
+                  cancelId: 1,
+                });
+                if (answer.response === 0) {
+                  await api("/api/update/rollback", { method: "POST" });
+                  quitForUpdate();
+                }
+              } catch (error) {
+                showError(error);
+              }
+            },
+          },
+        ]
+      : []),
+    { label: t("whatsNew"), click: () => void openChangelog(undefined, app.getVersion()) },
     { type: "separator" },
     { label: t("settings"), click: createWindow },
     {
@@ -345,6 +517,7 @@ async function refresh() {
   tray?.setToolTip(`OpenCode Bridge ${app.getVersion()} — ${status.text}`);
   if (state) tray?.setContextMenu(buildMenu(state));
   lastState = state;
+  if (state) maybeShowChangelog(state);
   return state;
 }
 
@@ -367,6 +540,12 @@ async function quit() {
     /* ignore */
   }
   bridge?.kill();
+  app.quit();
+}
+
+/** The updater helper owns the restart: do not shut the bridge down ourselves. */
+function quitForUpdate() {
+  quitting = true;
   app.quit();
 }
 

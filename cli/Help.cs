@@ -21,7 +21,7 @@ internal static class Help
         Console.WriteLine("  config set key=value      изменить параметр конфигурации");
         Console.WriteLine("  autostart on|off|status   автозапуск приложения");
         Console.WriteLine("  doctor                    диагностика API, демона, OpenCode, Telegram, конфига и автозапуска");
-        Console.WriteLine("  update [--check|--install] проверить обновление GitHub или запустить установщик");
+        Console.WriteLine("  update [--check|--install|--rollback] проверка, установка bundle или откат на предыдущую версию");
         Console.WriteLine("  version                   версия CLI и версия API");
         Console.WriteLine("  help [команда]            эта справка или справка по команде");
         Console.WriteLine();
@@ -76,9 +76,10 @@ internal static class Help
             "version" => new[] { "version — версия CLI и версия API из /api/state." },
             "update" => new[]
             {
-                "update [--check|--install] — проверка обновлений GitHub или запуск установщика.",
+                "update [--check|--install|--rollback] — обновление из GitHub Releases.",
                 "  --check (по умолчанию) — POST /api/update/check и вывод текущей/последней версии.",
-                "  --install — POST /api/update/install; установщик запустится, мост перезапустится.",
+                "  --install — POST /api/update/install: скачать bundle, проверить SHA256, распаковать и перезапуститься.",
+                "  --rollback — POST /api/update/rollback: вернуть версию из prev и перезапуститься.",
             },
             "help" => new[] { "help [команда] — общая справка или справка по команде." },
             _ => Array.Empty<string>(),

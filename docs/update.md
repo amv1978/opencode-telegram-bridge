@@ -2,25 +2,52 @@
 
 # Auto-update (Windows)
 
-The bridge checks GitHub Releases for a newer version and can download and install
-it without leaving the app.
+The bridge checks GitHub Releases and updates itself from the portable **bundle**
+without the installer wizard. User data in `%APPDATA%\opencode-telegram-bridge\`
+(`config.json`, `state.json`, bindings, tokens) is never touched.
 
 ## How it works
 
 1. `GET https://api.github.com/repos/amv1978/opencode-telegram-bridge/releases/latest`
    (public, no token).
-2. The latest `tag_name` is compared with `package.json` (`v` prefix and build
-   suffixes are ignored).
-3. The release asset `ocbridge-setup-*.exe` and, when present,
-   `ocbridge-setup-*.exe.sha256` are located.
+2. `tag_name` is compared with `package.json` (`v` prefixes and build suffixes are
+   ignored).
+3. The release assets `ocbridge-bundle-*.zip` and
+   `ocbridge-bundle-*.zip.sha256` are located.
 4. On start (and every 6 hours by default) the check runs in the background. The
    result is cached in `state.json` (`update` field), so the panel shows the last
-   known version immediately after a restart.
+   known version after a restart.
 
-Auto-update is **only for the packaged `ocbridge.exe`**. In a dev build
-(`bun run src/index.ts`) download/install returns
-“автообновление доступно только для собранной версии”. User data in
-`%APPDATA%\opencode-telegram-bridge\` is never touched.
+Auto-update is **only for the packaged `ocbridge.exe`**. A dev run
+(`bun run src/index.ts`) reports that updates are available only for compiled
+builds.
+
+## Download
+
+- Target: `%TEMP%\ocbridge-update\bundle.zip` (`.part` is kept between runs).
+- Progress 0–100 % is shown in `/api/state` and the panel.
+- Download order: **BITS** (`Start-BitsTransfer`) → **curl.exe** with `-C -`
+  resume → built-in `fetch` with a `Range` request. Any transport resumes a
+  `.part` file instead of downloading from zero.
+- The published `.sha256` is required; a missing or mismatching hash aborts the
+  update and keeps the current version.
+
+## Install and rollback
+
+1. The zip is unpacked to `{app}\new` (the directory that contains
+   `ocbridge.exe`, usually `%LOCALAPPDATA%\Programs\OpenCodeTelegramBridge`).
+2. `prevVersion` is written to `state.json` and the chat receives
+   `🔄 обновлено с X до Y — перезапускаюсь`.
+3. A detached PowerShell helper waits for the bridge to exit, moves the current
+   layout to `{app}\prev` (only one previous version), moves `new` into `{app}`
+   and starts the desktop shell (or `ocbridge.exe --no-browser`).
+4. Health check: `GET http://127.0.0.1:7788/api/state` every second for up to
+   60 seconds. On failure the helper stops the new build, restores `prev` and
+   starts it again. The broken layout is removed.
+5. A normal start notification is posted after a successful restart.
+
+`ocbridge-cli update --rollback` (or the tray item «Откатиться на X») swaps
+`{app}\prev` back immediately; settings stay untouched.
 
 ## Settings
 
@@ -30,79 +57,60 @@ Auto-update is **only for the packaged `ocbridge.exe`**. In a dev build
     "checkOnStart": true,
     "intervalHours": 6,
     "autoDownload": false
+  },
+  "notify": {
+    "enabled": true,
+    "targets": "admin"
   }
 }
 ```
 
 | Field | Meaning | Default |
 |---|---|---|
-| `checkOnStart` | check once when the bridge starts | `true` |
-| `intervalHours` | repeat check interval, 1–168 h | `6` |
-| `autoDownload` | download a found update automatically (never installs it) | `false` |
-
-The same fields are in the panel: **Settings → Проверять обновления / Интервал /
-Скачивать автоматически**, plus the **Проверить обновления** button.
-
-## Download and install
-
-- The installer is streamed to `%TEMP%\ocbridge-update\setup.exe` with progress
-  0–100 %, a 30-minute timeout and abort support.
-- If the release publishes `ocbridge-setup-X.exe.sha256`, the SHA256 is verified;
-  a mismatch deletes the file and reports an error.
-- Install spawns the setup with
-  `/VERYSILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /NORESTART=0`
-  and exits the bridge after 2 seconds. If the installer cannot close an elevated
-  instance, the panel/tray shows the error and the bridge keeps running.
-- A banner under the header appears when an update is available:
-  “Доступна версия X — Скачать / Установить”, with a progress bar while
-  downloading.
+| `update.checkOnStart` | check once when the bridge starts | `true` |
+| `update.intervalHours` | repeat interval, 1–168 h | `6` |
+| `update.autoDownload` | download a found bundle automatically (never installs it) | `false` |
+| `notify.enabled` | lifecycle messages in chat | `true` |
+| `notify.targets` | `"admin"` (first admin), `"all"` (every allowed user) or an array of chat ids | `"admin"` |
 
 ## API
 
 | Method | Path | Action |
 |---|---|---|
-| POST | `/api/update/check` | Check GitHub, update the cached snapshot |
-| POST | `/api/update/download` | Start/continue the download (progress in `/api/state`) |
-| POST | `/api/update/install` | Run the downloaded installer and exit |
+| POST | `/api/update/check` | Check GitHub and update the cached snapshot |
+| POST | `/api/update/download` | Start/continue the bundle download |
+| POST | `/api/update/install` | Unpack, swap and restart |
+| POST | `/api/update/rollback` | Restore `{app}\prev` and restart |
+| GET | `/api/changelog?from=X&to=Y` | CHANGELOG sections in `(X, Y]` |
 
-`/api/state` includes:
+`/api/state` includes `update.prevVersion` (the version in `{app}\prev`) and
+`update.bundled`.
 
-```json
-{
-  "update": {
-    "available": true,
-    "current": "0.5.1",
-    "latest": "0.5.1",
-    "notes": "…",
-    "progress": 0,
-    "error": "",
-    "downloading": false,
-    "installing": false
-  }
-}
-```
+## Changelog modal (Electron)
+
+After an update, when `prevVersion < current`, the shell opens a modal window with
+all CHANGELOG sections in `(prev, current]`, scrollable, with a «Понятно» button.
+It is shown once per version: the acknowledged version is stored in
+`ui.seenChangelog`. The tray item «Что нового» opens the current version manually.
 
 ## Tray and CLI
 
-- Tray menu: **Проверить обновления** (after a check the item becomes
-  **Установить X.Y.Z**). Installing from the tray quits the shell; the installer
-  restarts the app.
+- Tray: «Проверить обновления», «Установить X», «Откатиться на X», «Что нового».
 - CLI:
 
 ```
 ocbridge-cli update --check
 ocbridge-cli update --install
+ocbridge-cli update --rollback
 ```
 
 ## Release pipeline
 
-Every release must upload both files:
+Every release must upload:
 
-- `ocbridge-setup-<version>.exe`
-- `ocbridge-setup-<version>.exe.sha256` — hex SHA256 of the exe, one line,
-  `sha256sum` format.
+- `ocbridge-bundle-<version>.zip` + `.sha256`
+- `ocbridge-setup-<version>.exe` + `.sha256` (standalone, includes everything)
+- `ocbridge-setup-lite-<version>.exe` + `.sha256` (downloads the bundle)
 
-```powershell
-(Get-FileHash dist\ocbridge-setup-0.5.1.exe -Algorithm SHA256).Hash.ToLower() +
-  "  ocbridge-setup-0.5.1.exe" | Set-Content -Encoding ascii dist\ocbridge-setup-0.5.1.exe.sha256
-```
+`scripts/build-release.ps1` produces all of them; see
+[build-and-release.md](build-and-release.md).
