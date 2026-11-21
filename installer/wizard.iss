@@ -241,14 +241,14 @@ begin
       Json := Json + '    "telegramToken": "' + JsonEscape(Token) + '",' + #13#10;
     Json := Json +
       '    "mode": "' + Mode + '",' + #13#10 +
-      '    "defaultDirectory": "' + JsonEscape(Dir) + '",' + #13#10 +
-      '    "lang": "' + Lang + '"';
+      '    "defaultDirectory": "' + JsonEscape(Dir) + '"';
+    // Never override an existing interface language just because the installer
+    // ran in another language; only a brand-new config gets the chosen one.
+    if (SavedConfig = '') or (JsonStringValue(SavedConfig, 'lang') = '') then
+      Json := Json + ',' + #13#10 + '    "lang": "' + Lang + '"';
     if Topics <> 0 then
-      Json := Json + ',' + #13#10 +
-        '    "topicsChatId": ' + IntToStr(Topics) + #13#10
-    else
-      Json := Json + #13#10;
-    Json := Json + '  }' + #13#10 + '}' + #13#10;
+      Json := Json + ',' + #13#10 + '    "topicsChatId": ' + IntToStr(Topics);
+    Json := Json + #13#10 + '  }' + #13#10 + '}' + #13#10;
   end;
 
   ForceDirectories(ExpandConstant('{userappdata}\opencode-telegram-bridge'));
