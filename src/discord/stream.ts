@@ -1,5 +1,6 @@
 import type { Client, Message, MessageCreateOptions } from "discord.js";
 import { log } from "../log.ts";
+import { sanitizeModelName, UNKNOWN_MODEL } from "../model.ts";
 import { statusMarkdown, type StatusItem } from "../status.ts";
 import { chunkText, formatDuration, toDiscordMarkdown } from "./render.ts";
 
@@ -73,6 +74,8 @@ interface State {
   lastEditAt: number;
   lastTickLogAt?: number;
   flushing: boolean;
+  /** In-flight flush, so `end()` cannot be skipped by a slow edit. */
+  flushPromise?: Promise<void>;
   finished: boolean;
 }
 
@@ -102,7 +105,7 @@ export class DiscordStreamer {
 
   /** Model display name currently used by a session's live block. */
   modelOf(sessionID: string): string {
-    return this.models.get(sessionID) ?? "OpenCode";
+    return sanitizeModelName(this.models.get(sessionID) ?? UNKNOWN_MODEL);
   }
 
   async begin(sessionID: string, channelId: string, model?: string): Promise<void> {
@@ -122,7 +125,7 @@ export class DiscordStreamer {
       rendered: [],
       awaiting: false,
       frame: 0,
-      model: model || this.models.get(sessionID) || "OpenCode",
+      model: sanitizeModelName(model || this.models.get(sessionID) || UNKNOWN_MODEL),
       startedAt: Date.now(),
       lastEditAt: 0,
       flushing: false,
@@ -156,10 +159,11 @@ export class DiscordStreamer {
   }
 
   setModel(sessionID: string, model: string): void {
+    const label = sanitizeModelName(model);
     const state = this.states.get(sessionID);
-    if (!state || !model || state.model === model) return;
-    state.model = model;
-    this.models.set(sessionID, model);
+    this.models.set(sessionID, label);
+    if (!state || state.model === label) return;
+    state.model = label;
     this.schedule(state);
   }
 
@@ -395,7 +399,19 @@ export class DiscordStreamer {
   }
 
   private async flush(state: State, footer?: string): Promise<void> {
-    if (state.flushing) return;
+    // Serialize with any in-flight tick: a slow edit used to make `end()` a
+    // no-op, leaving the placeholder on screen with no final answer.
+    while (state.flushPromise) await state.flushPromise.catch(() => undefined);
+    const run = this.performFlush(state, footer);
+    state.flushPromise = run;
+    try {
+      await run;
+    } finally {
+      if (state.flushPromise === run) state.flushPromise = undefined;
+    }
+  }
+
+  private async performFlush(state: State, footer?: string): Promise<void> {
     state.flushing = true;
     try {
       if (!state.finished) state.frame = (state.frame + 1) % SPINNER.length;

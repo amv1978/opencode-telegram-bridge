@@ -22,6 +22,9 @@ start` or Desktop), so the bridge sees the same sessions as TUI and the desktop 
 | POST | `/api/session/{id}/model` | `{ model: { providerID, id, variant? } }` |
 | POST | `/api/session/{id}/agent` | `{ agent }` |
 | GET | `/api/agent` | Agent list |
+| GET | `/api/model` | Configured models: `providerID`, `id`, `modelID`, `name` |
+| GET | `/api/session/active` | Sessions currently executing |
+| GET | `/api/session/{id}/inbox` | Prompts accepted but not started |
 | GET | `/api/event?types=…` | SSE stream |
 
 Auth is Basic `opencode:<password>`; the password comes from `service.json`, the
@@ -43,14 +46,24 @@ The repeated `types` parameter is mandatory: OpenCode does not accept a comma li
 | `session.execution.started` | Starts the stream if it does not exist yet |
 | `session.text.started` / `delta` | Appends text to the message |
 | `session.text.ended` | Replaces text with the final version |
-| `session.tool.called` | Tool line (up to 6, `showTools` mode) |
+| `session.tool.called` | Tool line (last 2, `showTools` mode) |
 | `session.execution.succeeded/failed/interrupted` | Ends the turn, writes the footer |
 | `permission.asked` | Sends a message with buttons |
 | `session.renamed` | Renames the forum topic |
 | `session.created` | Caches `parentID`/`agent`/`title` of a new session |
+| `session.model.selected` | Refreshes the model label in a live block |
 | `session.synthetic` | Subagent report (`<subagent>`) into the parent chat |
 
 `session.idle` never arrives — the end of a turn is defined only by `session.execution.*`.
+
+**Model label.** `session.model` is mapped through `/api/model` (`providerID/id` →
+`name`, also `modelID`); without a name the label is `providerID/id`, without a model
+`unknown model`. The literal `OpenCode` is never rendered. The name is cached per
+session and dropped on `session.model.selected`.
+
+**Doctor.** A prompt accepted by `/prompt` is remembered; if no
+`session.execution.started` arrives within 30 s the bridge logs a warning, posts a
+`/stop` hint in the chat and shows it in the panel (`warnings` in `/api/state`).
 
 ## Specifics
 

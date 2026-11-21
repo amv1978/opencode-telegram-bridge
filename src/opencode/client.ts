@@ -143,6 +143,9 @@ export class OcClient {
       method,
       headers: this.headers(body === undefined ? {} : { "content-type": "application/json" }),
       body: body === undefined ? undefined : JSON.stringify(body),
+      // Chat commands must not hang forever on a half-open local socket; the
+      // same limit keeps `ensureStream` and the doctor responsive.
+      signal: AbortSignal.timeout(30_000),
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`${method} ${path} -> ${res.status} ${text.slice(0, 500)}`);
@@ -226,6 +229,16 @@ export class OcClient {
 
   async pendingPermissions(sessionID: string): Promise<Array<Record<string, any>>> {
     return (await this.call<{ data: Array<Record<string, any>> }>("GET", `/api/session/${sessionID}/permission`)).data;
+  }
+
+  /** Queued prompts that OpenCode has not started yet. */
+  async inbox(sessionID: string): Promise<Array<Record<string, any>>> {
+    return (await this.call<{ data: Array<Record<string, any>> }>("GET", `/api/session/${sessionID}/inbox`)).data;
+  }
+
+  /** Sessions currently executing (id → `{type: "running"}`). */
+  async activeSessions(): Promise<Record<string, { type?: string }>> {
+    return (await this.call<{ data: Record<string, { type?: string }> }>("GET", "/api/session/active")).data;
   }
 
   async setModel(sessionID: string, model: { providerID: string; id: string; variant?: string }): Promise<void> {

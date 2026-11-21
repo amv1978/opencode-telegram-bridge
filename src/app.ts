@@ -55,6 +55,8 @@ export interface Snapshot {
   autostartSupported: boolean;
   configPath: string;
   sessions: Array<{ id: string; title: string; directory?: string }>;
+  /** Doctor warnings (stalled prompts, etc.) shown in the panel. */
+  warnings: string[];
   update: ReturnType<Updater["snapshot"]>;
 }
 
@@ -143,6 +145,7 @@ export class App {
       autostartSupported: process.platform === "win32" && isCompiled(),
       configPath: this.paths.configFile,
       sessions: [],
+      warnings: this.bridge?.warnings() ?? [],
       update: this.updater.snapshot(),
     };
   }
@@ -189,7 +192,9 @@ export class App {
         });
         this.username = await this.bridge.start();
       }
-      await this.startDiscord();
+      // Discord may be slow or temporarily unreachable; Telegram must not wait
+      // for its login retries (up to ~7 min) before the panel says "running".
+      void this.startDiscord();
       this.state = "running";
       this.startedAt = Date.now();
       this.startUpdateLoop();

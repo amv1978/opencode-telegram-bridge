@@ -1,48 +1,13 @@
 import type { OcClient } from "../opencode/client.ts";
-
-interface ModelRef {
-  providerID?: string;
-  id?: string;
-}
-
-let namesCache: Map<string, string> | undefined;
-let namesAt = 0;
+import { resolveModelLabel, resolveModelName, type ModelRef } from "../model.ts";
 
 /**
- * Human model name from OpenCode `/api/model`; provider/id when unknown.
- * Same mapping as the Telegram adapter (`listModels` → `providerID/id`).
+ * Human model name from OpenCode `/api/model`; provider/id when unknown and
+ * "unknown model" when the session has no model yet. Shared with Telegram via
+ * `src/model.ts` so both transports always agree.
  */
 export async function modelLabel(oc: OcClient, sessionID: string): Promise<string> {
-  try {
-    const session = await oc.getSession(sessionID);
-    return await labelFor(oc, session.model);
-  } catch {
-    return "OpenCode";
-  }
-}
-
-async function labelFor(oc: OcClient, model: ModelRef | undefined): Promise<string> {
-  if (!model?.providerID || !model.id) return "OpenCode";
-  const names = await modelNames(oc);
-  return names.get(`${model.providerID}/${model.id}`) ?? `${model.providerID}/${model.id}`;
-}
-
-/** `/api/model` names, cached for five minutes. Copied from Telegram (no cross-import). */
-async function modelNames(oc: OcClient): Promise<Map<string, string>> {
-  if (namesCache && Date.now() - namesAt < 5 * 60 * 1000) return namesCache;
-  namesAt = Date.now();
-  const map = new Map<string, string>();
-  try {
-    for (const model of await oc.listModels()) {
-      if (!model.name) continue;
-      map.set(`${model.providerID}/${model.id}`, model.name);
-      if (model.modelID) map.set(`${model.providerID}/${model.modelID}`, model.name);
-    }
-  } catch {
-    /* names are cosmetic: fall back to provider/id */
-  }
-  namesCache = map;
-  return map;
+  return resolveModelLabel(oc, sessionID);
 }
 
 /**
@@ -75,7 +40,7 @@ export async function turnStats(
       | { output?: number; reasoning?: number; input?: number; cache?: { read?: number } }
       | undefined;
     // The model of the last assistant message is the one that actually answered.
-    const model = await labelFor(oc, (last as { model?: ModelRef }).model);
+    const model = await resolveModelName(oc, (last as { model?: ModelRef }).model);
 
     // Turn boundary: the prompt after the previous idle marker, or the nearest prompt in legacy sessions.
     const legacy = !messages.some((message) => message.type === "idle");

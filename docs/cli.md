@@ -136,8 +136,8 @@ If the daemon is not running, doctor exits immediately with code 3 and a hint.
 
 ```
 > ocbridge-cli version
-ocbridge-cli 0.4.1
-API: 0.4.1
+ocbridge-cli 0.5.1
+API: 0.5.1
 OpenCode: 2.3.2
 
 > ocbridge-cli help logs

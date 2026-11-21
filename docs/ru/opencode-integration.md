@@ -22,6 +22,9 @@
 | POST | `/api/session/{id}/model` | `{ model: { providerID, id, variant? } }` |
 | POST | `/api/session/{id}/agent` | `{ agent }` |
 | GET | `/api/agent` | Список агентов |
+| GET | `/api/model` | Настроенные модели: `providerID`, `id`, `modelID`, `name` |
+| GET | `/api/session/active` | Сессии, которые сейчас выполняются |
+| GET | `/api/session/{id}/inbox` | Принятые, но не начатые prompt'ы |
 | GET | `/api/event?types=…` | SSE-поток |
 
 Авторизация — Basic `opencode:<password>`; пароль из `service.json`, конфига или
@@ -43,14 +46,24 @@
 | `session.execution.started` | Начинает стрим, если его ещё нет |
 | `session.text.started` / `delta` | Добавляет текст к сообщению |
 | `session.text.ended` | Заменяет текст финальным |
-| `session.tool.called` | Строка инструментов (до 6, режим `showTools`) |
+| `session.tool.called` | Строка инструментов (последние 2, режим `showTools`) |
 | `session.execution.succeeded/failed/interrupted` | Завершает ход, пишет футер |
 | `permission.asked` | Отправляет сообщение с кнопками |
 | `session.renamed` | Переименовывает тему форума |
 | `session.created` | Кэширует `parentID`/`agent`/`title` новой сессии |
+| `session.model.selected` | Обновляет имя модели в живом блоке |
 | `session.synthetic` | Отчёт субагента (`<subagent>`) в чат родителя |
 
 `session.idle` не приходит вообще — конец хода определяется только `session.execution.*`.
+
+**Имя модели.** `session.model` сопоставляется с `/api/model` (`providerID/id` →
+`name`, а также `modelID`); без имени — `providerID/id`, без модели — `unknown model`.
+Литерал `OpenCode` не выводится никогда. Имя кэшируется на сессию и сбрасывается
+по `session.model.selected`.
+
+**Doctor.** Принятый `/prompt` запоминается; если за 30 с не пришёл
+`session.execution.started`, мост пишет предупреждение в журнал, подсказку `/stop`
+в чат и показывает её в панели (`warnings` в `/api/state`).
 
 ## Особенности
 

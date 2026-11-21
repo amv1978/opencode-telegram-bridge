@@ -2,6 +2,7 @@
 // Usage: bun run src/doctor.ts
 import { loadConfig, resolvePaths } from "./config.ts";
 import { discover, OcClient } from "./opencode/client.ts";
+import { resolveModelLabel } from "./model.ts";
 
 const ok = (label: string, value: string) => console.log(`  ✔ ${label}: ${value}`);
 const warn = (label: string, value: string) => console.log(`  ! ${label}: ${value}`);
@@ -37,8 +38,27 @@ async function main(): Promise<void> {
   if (session) {
     const messages = await client.messages(session.id);
     ok("history", `${messages.length} messages in ${session.id.slice(0, 16)}…`);
+    ok("model", await resolveModelLabel(client, session.id));
+    const active = await client.activeSessions();
+    ok("active sessions", Object.keys(active).length ? Object.keys(active).map((id) => id.slice(0, 16)).join(", ") : "none");
+    const queued = await client.inbox(session.id);
+    ok("inbox", String(queued.length));
     const pending = await client.pendingPermissions(session.id);
     ok("pending permissions", String(pending.length));
+    if (pending.length) warn("permission", "a request is waiting for a Telegram button");
+
+    // Doctor: a streamed assistant message with no `completed` after 30 s means
+    // the turn is stuck (usually a busy session or a lost SSE end event).
+    const last = messages[messages.length - 1];
+    const age = last?.time?.streamed ? Date.now() - last.time.streamed : 0;
+    if (last?.type === "assistant" && last.time?.streamed && !last.time.completed && age > 30_000) {
+      warn(
+        "stuck turn",
+        `${Math.round(age / 1000)}s without completion in ${session.id.slice(0, 16)}… — send /stop, then retry`,
+      );
+    } else {
+      ok("stuck turn", "no stalled assistant message");
+    }
   }
 
   let streamEvents = 0;

@@ -77,14 +77,14 @@ On uninstall `%APPDATA%\opencode-telegram-bridge\` is preserved.
 |---|---|
 | `package.json` | `"version"` |
 | `desktop/package.json` | `"version"` |
-| `installer/ocbridge.iss` | `#define AppVersion "0.4.1"` |
+| `installer/ocbridge.iss` | `#define AppVersion "0.5.1"` |
 | `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` |
 
 Additionally: `cli/Program.cs`, the `Program.Version` constant — it is printed by
 `ocbridge-cli version`; keep it equal to the csproj version. The API version is taken
 from `package.json` automatically.
 
-The installer name is derived from `AppVersion`: `ocbridge-setup-0.4.1.exe`.
+The installer name is derived from `AppVersion`: `ocbridge-setup-0.5.1.exe`.
 After a version change rebuild **all** artifacts — otherwise the old exe inside the
 new installer will still report the previous version.
 
@@ -95,7 +95,7 @@ new installer will still report the previous version.
 3. Rebuild daemon, CLI, shell, installer.
 4. Run the installer on a clean machine: window, tray, `/start`, theme, voice.
 5. Check that git has no `config.json`, `state.json`, `*.log`, `dist/`, `*.exe`.
-6. Tag `v0.4.1`, attach `ocbridge-setup-0.4.1.exe` and the sources to the release.
+6. Tag `v0.5.1`, attach `ocbridge-setup-0.5.1.exe` and the sources to the release.
 
 ## Code signing
 

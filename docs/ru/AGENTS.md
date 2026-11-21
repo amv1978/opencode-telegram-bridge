@@ -46,6 +46,10 @@ CLI: см. `docs/build-and-release.md`. Установщик: `ISCC installer\oc
 - Общий чат форума никогда не является адресом для ответов: сессии живут только в темах.
 - Футер статистики должен совпадать с OpenCode (`packages/util/src/session-turn.ts`):
   duration, tok/s, context = input + cache.read + output + reasoning.
+- Имя модели никогда не должно быть литералом `OpenCode`: `/api/model` (`name`) →
+  `providerID/id` → `unknown model`; кэш на сессию, сброс по `session.model.selected`.
+- Если prompt принят, а `session.execution.started` не пришёл за 30 с — это зависший
+  ход: журнал + предупреждение в панели + подсказка `/stop` (doctor).
 - Тестового набора нет. Проверка = `bun run typecheck`, `bun run src/doctor.ts`,
   затем ручной проход по Telegram (личный чат + тема + голос + кнопка разрешения).
 
@@ -53,4 +57,4 @@ CLI: см. `docs/build-and-release.md`. Установщик: `ISCC installer\oc
 
 Начните с `docs/ru/README.md`. Детали: `architecture.md`, `opencode-integration.md`,
 `telegram.md`, `discord.md`, `media.md`, `voice.md`, `ui.md`, `cli.md`,
-`build-and-release.md`, `troubleshooting.md`.
+`build-and-release.md`, `update.md`, `troubleshooting.md`.

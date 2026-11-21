@@ -69,16 +69,19 @@ While a turn runs, a live block is shown above the answer:
 <answer text…>
 ```
 
-- The model name comes from `session.model` and `/api/model` (`name`); if there is no
-  name — `providerID/id`, otherwise `OpenCode`.
+- The model name comes from `session.model` and `/api/model` (`name`); if the name is
+  missing — `providerID/id`; if the session has no model yet — `unknown model`. The
+  literal word `OpenCode` is never shown as a model.
 - Every status line is a separate physical line, nothing is glued; only the model
   name is bold, other labels are stripped of `*`/`_` and cut to 60 characters. The
   word `tool` is never printed — only the name and argument. Tools and subagents
   are list items (`- 🛠 …`, `- 🧩 …`): rich markdown collapses a lone `\n`, while a
   list item always starts a new line.
-- The status is refreshed by an independent 1.2 s ticker while any tool or subagent
-  is active; text deltas are not required. Every tick recomputes elapsed and forces
-  an edit (on 429 it waits for `retry_after`).
+- The status is refreshed by an independent 1.2 s ticker for as long as the block
+  lives (not only while a tool is active), so `thinking… 1s` turns into `… 12s`
+  even when Telegram deltas stop. Every tick recomputes elapsed and forces an edit
+  (on 429 it waits for `retry_after`). The model label refreshes on
+  `session.model.selected`.
 - Tools: `session.tool.called` → icon + name + short argument,
   `session.tool.success` → `✓`, `session.tool.failed` → `✗`. The last 2 lines are
   shown; finished ones disappear after ~10 s; repeats collapse (`edit bot.ts ×3`).

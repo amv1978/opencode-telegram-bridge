@@ -105,6 +105,7 @@ export const PAGE = /* html */ `<!doctype html>
         <input type="checkbox" id="autostart" style="width:16px;height:16px" /> <span data-i18n="status.autostart">автозапуск</span>
       </label>
     </div>
+    <div id="warn" class="hint" style="color:#d69e2e"></div>
     <div id="err" class="hint" style="color:var(--err)"></div>
   </section>
 
@@ -553,6 +554,7 @@ function fill(s) {
   $("net").textContent = s.telegramMode || "—";
   $("uptime").textContent = s.startedAt ? Math.round((Date.now() - s.startedAt) / 1000) + " " + t("status.seconds") : "—";
   $("err").textContent = s.error || "";
+  $("warn").textContent = (s.warnings || []).length ? "⚠️ " + s.warnings.join("\n⚠️ ") : "";
   $("cfgPath").textContent = s.configPath;
   $("btnStart").disabled = s.state === "running" || s.state === "starting";
   $("btnStop").disabled = s.state === "stopped";

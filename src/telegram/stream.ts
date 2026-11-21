@@ -1,5 +1,6 @@
 import { GrammyError, type Api } from "grammy";
 import { log } from "../log.ts";
+import { sanitizeModelName, UNKNOWN_MODEL } from "../model.ts";
 import { statusHtml, statusMarkdownList, type StatusItem } from "../status.ts";
 import { markdownToHtml, splitHtml, splitMarkdown, stripHtml } from "./render.ts";
 
@@ -56,6 +57,8 @@ interface State {
   startedAt: number;
   lastEditAt: number;
   flushing: boolean;
+  /** In-flight flush, so `end()` cannot be skipped by a slow edit. */
+  flushPromise?: Promise<void>;
   finished: boolean;
 }
 
@@ -87,7 +90,17 @@ export class Streamer {
   }
 
   modelOf(sessionID: string): string {
-    return this.models.get(sessionID) ?? "OpenCode";
+    return sanitizeModelName(this.models.get(sessionID) ?? UNKNOWN_MODEL);
+  }
+
+  /** `session.model.selected`: update the live block without restarting it. */
+  setModel(sessionID: string, model: string): void {
+    const label = sanitizeModelName(model);
+    this.models.set(sessionID, label);
+    const state = this.states.get(sessionID);
+    if (!state || state.model === label) return;
+    state.model = label;
+    this.schedule(state, STATUS_TICK_MS);
   }
 
   async begin(sessionID: string, target: Target, model?: string): Promise<void> {
@@ -100,7 +113,7 @@ export class Streamer {
       subagents: [],
       messageIds: [],
       awaiting: false,
-      model: model || this.models.get(sessionID) || "OpenCode",
+      model: sanitizeModelName(model || this.models.get(sessionID) || UNKNOWN_MODEL),
       startedAt: Date.now(),
       lastEditAt: 0,
       flushing: false,
@@ -366,7 +379,21 @@ export class Streamer {
   }
 
   private async flush(sessionID: string, state: State, footer?: string): Promise<void> {
-    if (state.flushing) return;
+    // A slow Telegram edit must not swallow the final message: wait for the
+    // in-flight flush, then run ours (the `end()` footer would otherwise be
+    // dropped while the placeholder stayed on screen forever).
+    while (state.flushPromise) await state.flushPromise.catch(() => undefined);
+    if (this.states.get(sessionID) !== state) return;
+    const run = this.performFlush(sessionID, state, footer);
+    state.flushPromise = run;
+    try {
+      await run;
+    } finally {
+      if (state.flushPromise === run) state.flushPromise = undefined;
+    }
+  }
+
+  private async performFlush(sessionID: string, state: State, footer?: string): Promise<void> {
     state.flushing = true;
     try {
       if (this.rich) {

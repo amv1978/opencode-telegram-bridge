@@ -41,7 +41,7 @@ sessions**; no OpenCode plugin is required.
 
 ### Installer (Windows 10/11)
 
-1. Run `ocbridge-setup-0.5.0.exe`.
+1. Run `ocbridge-setup-0.5.1.exe`.
 2. Paste the bot token from [@BotFather](https://t.me/BotFather) — you may skip this
    and set it later in the panel `http://127.0.0.1:7788`.
 3. Send `/start` to the bot — the first user becomes administrator.

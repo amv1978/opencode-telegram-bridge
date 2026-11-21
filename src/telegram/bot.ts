@@ -3,6 +3,7 @@ import type { BridgeConfig, UserConfig } from "../config.ts";
 import { findUser, isAdmin } from "../config.ts";
 import { log } from "../log.ts";
 import type { OcClient, OcEvent, OcSession } from "../opencode/client.ts";
+import { catalogFor, resolveModelLabel, sanitizeModelName, UNKNOWN_MODEL } from "../model.ts";
 import type { Store } from "../state/store.ts";
 import { entitiesToMarkdown } from "./entities.ts";
 import { Streamer, type Target } from "./stream.ts";
@@ -32,10 +33,13 @@ const EVENT_TYPES = [
   "permission.asked",
   "session.renamed",
   "session.created",
+  "session.model.selected",
   "session.synthetic",
 ];
 
 const PERMISSION_TTL_MS = 15 * 60 * 1000;
+/** A prompt with no `execution.started` for this long is reported by the doctor. */
+const ADMITTED_TIMEOUT_MS = 30_000;
 
 interface PendingPermission {
   sessionID: string;
@@ -50,8 +54,9 @@ export class Bridge {
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent binding, so `execution.*` updates the parent block. */
   private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
-  private modelNamesCache?: Map<string, string>;
-  private modelNamesAt = 0;
+  /** Prompts the API accepted but OpenCode has not started yet (doctor). */
+  private readonly admitted = new Map<string, { at: number; target?: Target; warned: boolean }>();
+  private doctorTimer?: ReturnType<typeof setInterval>;
   private readonly recentMirrors = new Map<string, { text: string; at: number }[]>();
   private readonly appliedTitles = new Map<string, string>();
   private readonly fetchImpl: typeof fetch;
@@ -117,13 +122,52 @@ export class Bridge {
         log.error("bot polling stopped:", message);
         this.options.onPollingError?.(message);
       });
+    // Doctor: a prompt admitted by OpenCode with no `execution.started` for 30 s
+    // usually means a stuck/busy session. Log it once and show a UI hint.
+    this.doctorTimer = setInterval(() => this.checkAdmitted(), 5_000);
+    this.doctorTimer.unref?.();
     return username;
   }
 
   async stop(): Promise<void> {
+    if (this.doctorTimer) clearInterval(this.doctorTimer);
+    this.doctorTimer = undefined;
     this.unsubscribe?.();
     await this.streamer.shutdown();
     await this.bot.stop();
+  }
+
+  /** Current doctor warnings for the web panel. */
+  warnings(): string[] {
+    const now = Date.now();
+    return [...this.admitted.entries()]
+      .filter(([, entry]) => now - entry.at >= ADMITTED_TIMEOUT_MS)
+      .map(([sessionID, entry]) => {
+        const seconds = Math.round((now - entry.at) / 1000);
+        return `${sessionID.slice(0, 16)}…: prompt accepted ${seconds}s ago, no execution.started — send /stop and retry`;
+      });
+  }
+
+  private checkAdmitted(): void {
+    const now = Date.now();
+    for (const [sessionID, entry] of this.admitted) {
+      if (now - entry.at < ADMITTED_TIMEOUT_MS || entry.warned) continue;
+      entry.warned = true;
+      const seconds = Math.round((now - entry.at) / 1000);
+      log.warn(
+        `doctor: prompt admitted ${seconds}s ago in ${sessionID.slice(0, 16)} but no session.execution.started — session is busy/stuck; /stop to interrupt`,
+      );
+      if (!entry.target) continue;
+      const options = entry.target.threadId ? { message_thread_id: entry.target.threadId } : {};
+      void this.bot.api
+        .sendMessage(
+          entry.target.chatId,
+          `⚠️ OpenCode принял задачу, но выполнение не началось ${seconds} с.\n` +
+            "Сессия, похоже, занята зависшей задачей. Отправьте /stop, чтобы прервать её, и повторите запрос.",
+          options,
+        )
+        .catch(() => undefined);
+    }
   }
 
   /** Media relay sender: uploads bytes to the bound Telegram chat/topic. */
@@ -378,6 +422,7 @@ export class Bridge {
       return;
     }
     const result = await this.oc.interrupt(sessionID);
+    this.admitted.delete(sessionID);
     await ctx.reply(result.interrupted ? "⏹ Остановлено." : "Нечего останавливать.");
   }
 
@@ -388,13 +433,13 @@ export class Bridge {
       return;
     }
     const session = await this.oc.getSession(sessionID);
-    const busy = session.time?.busy && !session.time?.idle ? "работает" : "свободна";
+    const busy = Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0) ? "работает" : "свободна";
     await ctx.reply(
       [
         `<b>${escape(session.title)}</b>`,
         `id: <code>${session.id}</code>`,
         `📁 <code>${escape(session.location?.directory ?? "?")}</code>`,
-        `🤖 ${escape(session.model?.providerID ?? "?")}/${escape(session.model?.id ?? "?")}`,
+        `🤖 ${escape(await this.modelLabel(sessionID))}`,
         `🧩 ${escape(session.agent ?? "?")}`,
         `⏱ ${busy}`,
         `💰 $${(session.cost ?? 0).toFixed(4)}`,
@@ -489,24 +534,38 @@ export class Bridge {
 
     // In the bound forum, a task in the general chat starts its own topic.
     if (chatId && chatId === this.cfg.topicsChatId && !threadId && this.cfg.autoTopics !== false) {
+      let topicID: number | undefined;
+      let sessionID: string | undefined;
       try {
         const title = text.replace(/\s+/g, " ").slice(0, 48) || "Изображение";
         const topic = await this.bot.api.createForumTopic(chatId, title);
+        topicID = topic.message_thread_id;
         const session = await this.oc.createSession({ title, directory: this.cfg.defaultDirectory });
-        this.store.bindThread(topic.message_thread_id, session.id);
-        this.store.upsert({ id: session.id, title: session.title, chatId, threadId: topic.message_thread_id });
-        const target = { chatId, threadId: topic.message_thread_id };
-        await this.options.relay?.relayBeforeTurn(session.id, media, "telegram", messageID, {
+        sessionID = session.id;
+        this.store.bindThread(topicID, session.id);
+        this.store.upsert({ id: session.id, title: session.title, chatId, threadId: topicID });
+      } catch (error) {
+        // Only topic/session creation may fall back to the chat session; a failed
+        // prompt inside an already-created topic must not create a duplicate.
+        log.warn("auto-topic failed, falling back to chat session:", (error as Error).message);
+      }
+      if (topicID && sessionID) {
+        const target = { chatId, threadId: topicID };
+        await this.options.relay?.relayBeforeTurn(sessionID, media, "telegram", messageID, {
           platform: "telegram",
           chatId,
-          threadId: topic.message_thread_id,
+          threadId: topicID,
         });
-        await this.streamer.begin(session.id, target, await this.modelLabel(session.id));
-        await this.oc.prompt(session.id, text, { source: "telegram" }, files);
-        log.info(`auto-topic ${topic.message_thread_id} → ${session.id.slice(0, 16)}`);
+        await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
+        log.info(`prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80).replace(/\s+/g, " ")}`);
+        try {
+          await this.oc.prompt(sessionID, text, { source: "telegram" }, files);
+          this.markAdmitted(sessionID, target);
+        } catch (error) {
+          await this.failPrompt(sessionID, target, error);
+        }
+        log.info(`auto-topic ${topicID} → ${sessionID.slice(0, 16)}`);
         return;
-      } catch (error) {
-        log.warn("auto-topic failed, falling back to chat session:", (error as Error).message);
       }
     }
 
@@ -533,9 +592,34 @@ export class Bridge {
     log.info(`prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
       await this.oc.prompt(sessionID, text, { source: "telegram" }, files);
+      this.markAdmitted(sessionID, target);
     } catch (error) {
-      await this.streamer.end(sessionID, `⚠️ ${(error as Error).message.slice(0, 200)}`);
+      await this.failPrompt(sessionID, target, error);
     }
+  }
+
+  /** Remembers an accepted prompt so the doctor can detect a stalled start. */
+  private markAdmitted(sessionID: string, target: Target): void {
+    this.admitted.set(sessionID, { at: Date.now(), target, warned: false });
+  }
+
+  /**
+   * A prompt the API refused (typically 409 busy / 400 bad request) used to
+   * leave the "thinking…" placeholder forever. Log it and turn the placeholder
+   * into an actionable error instead.
+   */
+  private async failPrompt(sessionID: string, target: Target, error: unknown): Promise<void> {
+    const message = (error as Error)?.message ?? String(error);
+    this.admitted.delete(sessionID);
+    const busy = /\b(409|busy|conflict)\b/i.test(message);
+    log.error(
+      `prompt failed ${sessionID.slice(0, 16)} target=${target.threadId ?? "dm"}: ` +
+        `${message.slice(0, 300)}${busy ? " (session busy — /stop interrupts it)" : ""}`,
+    );
+    const hint = busy
+      ? "Сессия занята другой задачей. Отправьте /stop, чтобы прервать её, и повторите запрос."
+      : "Сессия не приняла запрос. Проверьте /status и повторите; если не помогает — /stop.";
+    await this.streamer.end(sessionID, `⚠️ ${hint}\n\n\`${message.slice(0, 200)}\``);
   }
 
   private async onTopicCreated(ctx: Context): Promise<void> {
@@ -783,6 +867,7 @@ export class Bridge {
         break;
       case "session.execution.started":
       case "session.text.started":
+        this.admitted.delete(sessionID);
         if (event.type === "session.execution.started") {
           const meta = await this.sessionMeta(sessionID);
           if (meta.parentID) {
@@ -832,6 +917,7 @@ export class Bridge {
           break;
         }
         if (!this.streamer.has(sessionID)) break;
+        this.admitted.delete(sessionID);
         const elapsed = this.streamer.elapsedMs(sessionID);
         const status =
           event.type === "session.execution.interrupted"
@@ -840,8 +926,8 @@ export class Bridge {
               ? "⚠️ ошибка"
               : "";
         const stats = status ? { duration: elapsed, tps: undefined } : await this.turnStats(sessionID, elapsed);
-        const resolved = await this.modelLabel(sessionID);
-        const model = resolved === "OpenCode" ? this.streamer.modelOf(sessionID) : resolved;
+        const resolved = sanitizeModelName(await resolveModelLabel(this.oc, sessionID, true));
+        const model = resolved === UNKNOWN_MODEL ? this.streamer.modelOf(sessionID) : resolved;
         const parts: string[] = [model];
         if (status) parts.push(status);
         if (stats.duration) parts.push(`⏱ ${formatDuration(stats.duration)}`);
@@ -858,6 +944,15 @@ export class Bridge {
       case "session.synthetic":
         await this.subagentReport(sessionID, event.data);
         break;
+      case "session.model.selected": {
+        // The session switched models mid-flight: refresh the label everywhere.
+        catalogFor(this.oc).forget(sessionID);
+        this.sessionCache.delete(sessionID);
+        const label = sanitizeModelName(await resolveModelLabel(this.oc, sessionID, true));
+        this.streamer.setModel(sessionID, label);
+        log.info(`model selected ${sessionID.slice(0, 16)} → ${label}`);
+        break;
+      }
       case "session.renamed": {
         const title = String(event.data.title ?? "").trim();
         if (!title) break;
@@ -881,7 +976,13 @@ export class Bridge {
 
   private async ensureStream(sessionID: string): Promise<void> {
     if (this.streamer.has(sessionID)) return;
-    if (await this.isSubagent(sessionID)) return;
+    // One fetch covers both checks: child sessions never get a block, and a
+    // late event from a finished turn must not create an orphan placeholder
+    // that stays at "thinking… 1s" forever.
+    const session = await this.oc.getSession(sessionID).catch(() => undefined);
+    if (!session || session.parentID) return;
+    const busy = Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0);
+    if (!busy) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
     await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
@@ -937,34 +1038,11 @@ export class Bridge {
     return Boolean((await this.sessionMeta(sessionID)).parentID);
   }
 
-  /** Human model name from `/api/model`; provider/id when the name is unknown. */
+  /** Human model name shared with Discord; never the bare "OpenCode". */
   private async modelLabel(sessionID: string): Promise<string> {
-    try {
-      const session = await this.oc.getSession(sessionID);
-      const model = session.model;
-      if (!model?.providerID || !model?.id) return "OpenCode";
-      const names = await this.modelNames();
-      return names.get(`${model.providerID}/${model.id}`) ?? `${model.providerID}/${model.id}`;
-    } catch {
-      return "OpenCode";
-    }
-  }
-
-  private async modelNames(): Promise<Map<string, string>> {
-    if (this.modelNamesCache && Date.now() - this.modelNamesAt < 5 * 60 * 1000) return this.modelNamesCache;
-    this.modelNamesAt = Date.now();
-    const map = new Map<string, string>();
-    try {
-      for (const model of await this.oc.listModels()) {
-        if (!model.name) continue;
-        map.set(`${model.providerID}/${model.id}`, model.name);
-        if (model.modelID) map.set(`${model.providerID}/${model.modelID}`, model.name);
-      }
-    } catch (error) {
-      log.warn("model list unavailable:", (error as Error).message);
-    }
-    this.modelNamesCache = map;
-    return map;
+    const label = await resolveModelLabel(this.oc, sessionID);
+    catalogFor(this.oc).remember(sessionID, label);
+    return label;
   }
 
   /** Guards against feeding a message the bridge itself posted back into the model. */

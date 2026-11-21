@@ -71,7 +71,7 @@ The same fields are in the panel: **Settings → Проверять обновл
 {
   "update": {
     "available": true,
-    "current": "0.5.0",
+    "current": "0.5.1",
     "latest": "0.5.1",
     "notes": "…",
     "progress": 0,
@@ -103,6 +103,6 @@ Every release must upload both files:
   `sha256sum` format.
 
 ```powershell
-(Get-FileHash dist\ocbridge-setup-0.5.0.exe -Algorithm SHA256).Hash.ToLower() +
-  "  ocbridge-setup-0.5.0.exe" | Set-Content -Encoding ascii dist\ocbridge-setup-0.5.0.exe.sha256
+(Get-FileHash dist\ocbridge-setup-0.5.1.exe -Algorithm SHA256).Hash.ToLower() +
+  "  ocbridge-setup-0.5.1.exe" | Set-Content -Encoding ascii dist\ocbridge-setup-0.5.1.exe.sha256
 ```

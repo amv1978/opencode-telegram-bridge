@@ -1,5 +1,6 @@
 // Prints and verifies the composed live-status block. Run: bun run scripts/status-check.ts
 import { statusHtml, statusMarkdown, statusMarkdownList } from "../src/status.ts";
+import { modelKey, sanitizeModelName, UNKNOWN_MODEL } from "../src/model.ts";
 
 const snapshot = {
   model: "DeepSeek V4.1 Flash",
@@ -33,6 +34,21 @@ const longBlock = statusMarkdownList({
 const markdown = statusMarkdownList(snapshot);
 const plain = statusMarkdown(snapshot);
 const html = statusHtml(snapshot);
+
+const literal = statusMarkdown({
+  model: "OpenCode",
+  phase: "thinking…",
+  elapsed: "1s",
+  tools: [],
+  subagents: [],
+});
+const emptyModel = statusMarkdown({
+  model: "",
+  phase: "thinking…",
+  elapsed: "1s",
+  tools: [],
+  subagents: [],
+});
 console.log("--- telegram markdown ---");
 console.log(markdown);
 console.log("-------------------------");
@@ -64,6 +80,12 @@ const checks: Array<[string, boolean]> = [
   ["long label is truncated with …", longLine.includes("very…`") && longLine.includes("· 20s")],
   ["truncation never drops backslashes", longLine.includes("D:\\Home\\Mike") && !/\\…/.test(longLine)],
   ["no mangled path (backslashes removed)", !longLine.includes("HomeMikeWork")],
+  ["literal 'OpenCode' never rendered as a model", literal.startsWith("🟢 **unknown model**")],
+  ["empty model falls back to 'unknown model'", emptyModel.startsWith("🟢 **unknown model**")],
+  ["sanitize trims and rejects the product name", sanitizeModelName("  OpenCode Bridge ") === UNKNOWN_MODEL],
+  ["sanitize keeps a real name", sanitizeModelName("DeepSeek V4.1 Flash") === "DeepSeek V4.1 Flash"],
+  ["modelKey joins provider and id", modelKey({ providerID: "routerai", id: "deepseek/deepseek-v4.1-flash-1017" }) === "routerai/deepseek/deepseek-v4.1-flash-1017"],
+  ["modelKey rejects a partial model", modelKey({ providerID: "routerai" }) === undefined],
 ];
 
 let failed = 0;

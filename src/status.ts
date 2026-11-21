@@ -11,6 +11,8 @@
  * Windows paths keep their backslashes; plain labels escape Markdown specials.
  */
 
+import { sanitizeModelName } from "./model.ts";
+
 export interface StatusItem {
   icon: string;
   label: string;
@@ -90,7 +92,9 @@ function itemLine(item: StatusItem, render: (item: StatusItem) => string, bullet
  * lines (Discord).
  */
 export function statusMarkdown(snapshot: StatusSnapshot, bulletItems = false): string {
-  const lines = [`🟢 **${escapeMarkdown(statusLabel(snapshot.model))}** · ${snapshot.phase} ${snapshot.elapsed}`];
+  const lines = [
+    `🟢 **${escapeMarkdown(statusLabel(sanitizeModelName(snapshot.model)))}** · ${snapshot.phase} ${snapshot.elapsed}`,
+  ];
   for (const item of snapshot.tools) lines.push(itemLine(item, markdownLabel, bulletItems));
   for (const item of snapshot.subagents) lines.push(itemLine(item, markdownLabel, bulletItems));
   return lines.join("\n");
@@ -103,7 +107,9 @@ export function statusMarkdownList(snapshot: StatusSnapshot): string {
 
 /** Classic Telegram `parse_mode: "HTML"` variant of the same block. */
 export function statusHtml(snapshot: StatusSnapshot): string {
-  const lines = [`🟢 <b>${escapeHtml(statusLabel(snapshot.model))}</b> · ${escapeHtml(snapshot.phase)} ${snapshot.elapsed}`];
+  const lines = [
+    `🟢 <b>${escapeHtml(statusLabel(sanitizeModelName(snapshot.model)))}</b> · ${escapeHtml(snapshot.phase)} ${snapshot.elapsed}`,
+  ];
   for (const item of snapshot.tools) lines.push(itemLine(item, htmlLabel, true));
   for (const item of snapshot.subagents) lines.push(itemLine(item, htmlLabel, true));
   return lines.join("\n");

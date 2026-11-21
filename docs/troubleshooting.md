@@ -48,11 +48,30 @@ The bridge clears the `thread → session` binding, the final answer goes to the
 root, and the next message in a new topic creates a new session. The OpenCode session
 is still alive — bring it back with `/attach` or `/sessions`.
 
+## Stuck “thinking…” or no answer
+
+Symptom: the status line freezes at `thinking… 1s`, or the reply never arrives
+although the session finished in Desktop/TUI.
+
+1. Look at the panel **Log**. `doctor: prompt admitted 30s ago … no
+   session.execution.started` means OpenCode accepted the prompt but never started
+   it — usually the session is busy with a stuck turn. Send `/stop`, then repeat the
+   task. The same check is in `ocbridge-cli doctor` and `bun run src/doctor.ts`.
+2. `prompt failed … 409` means the session was busy when the prompt arrived. In
+   0.5.1+ the placeholder is replaced with this error instead of staying forever.
+3. If the log shows `status tick flush failed: … 502` / `Telegram 429` /
+   `telegram proxy connect failed`, Telegram itself is unreachable. Wait for the
+   proxy to recover or change **Network** settings; the final answer is retried and,
+   as a last resort, sent as a new message.
+4. `/status` shows `busy`/`idle` and the model. A pending permission request is a
+   message with buttons — press one; otherwise it cannot proceed.
+
 ## Timeouts
 
 | What | Limit |
 |---|---|
 | One SSE event handler | 20 s (a stuck one is skipped) |
+| Doctor: prompt → `execution.started` | 30 s (warning + panel hint) |
 | `/api/info` check during OpenCode discovery | 2.5 s per address |
 | Telegram file download | 60 s |
 | CLI request to the API | 10 s (connect 5 s) |

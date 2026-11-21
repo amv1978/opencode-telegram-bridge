@@ -48,7 +48,7 @@ export async function setupTelegramNetwork(
     });
   }
 
-  attempts.push(() => ({ mode: "direct", fetch: globalThis.fetch, stop: () => undefined }));
+  attempts.push(() => ({ mode: "direct", fetch: withFetchTimeout(globalThis.fetch), stop: () => undefined }));
 
   for (const attempt of attempts) {
     const net = attempt();
@@ -79,8 +79,21 @@ export async function setupTelegramNetwork(
 }
 
 function proxyFetch(proxyUrl: string): typeof globalThis.fetch {
-  return ((input: any, init: any = {}) =>
-    (globalThis.fetch as any)(input, { ...init, proxy: proxyUrl })) as typeof globalThis.fetch;
+  return withFetchTimeout((input: any, init: any = {}) =>
+    (globalThis.fetch as any)(input, { ...init, proxy: proxyUrl }),
+  ) as typeof globalThis.fetch;
+}
+
+/**
+ * A pinned-proxy connection can hang forever without ever answering; without a
+ * cap the status edit stays in flight and the final message is never sent.
+ * Uploads get a generous limit so a 20 MB document still fits.
+ */
+function withFetchTimeout(fetchImpl: (input: any, init?: any) => Promise<any>, ms = 45_000): typeof globalThis.fetch {
+  return ((input: any, init: any = {}) => {
+    if (init?.signal) return fetchImpl(input, init);
+    return fetchImpl(input, { ...init, signal: AbortSignal.timeout(ms) });
+  }) as unknown as typeof globalThis.fetch;
 }
 
 interface Conn {

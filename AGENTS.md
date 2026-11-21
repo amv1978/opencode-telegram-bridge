@@ -43,10 +43,15 @@ CLI: see `docs/build-and-release.md`. Installer: `ISCC installer\ocbridge.iss`.
 - The forum's General chat is never a reply target: sessions live in topics only.
 - Stats footer must match OpenCode (`packages/util/src/session-turn.ts`): duration, tok/s,
   context = input + cache.read + output + reasoning.
+- A model label is never the literal `OpenCode`: `/api/model` (`name`) →
+  `providerID/id` → `unknown model`; cache per session, drop on `session.model.selected`.
+- A prompt accepted without `session.execution.started` within 30 s is a stuck turn:
+  log + panel warning + `/stop` hint (doctor).
 - No test suite. Verification = `bun run typecheck`, `bun run src/doctor.ts`, then a manual
   Telegram pass (private chat + topic + voice + permission button).
 
 ## Docs
 
 Start at `docs/README.md`. Details: `architecture.md`, `opencode-integration.md`,
-`telegram.md`, `discord.md`, `voice.md`, `ui.md`, `cli.md`, `build-and-release.md`, `troubleshooting.md`.
+`telegram.md`, `discord.md`, `media.md`, `voice.md`, `ui.md`, `cli.md`,
+`build-and-release.md`, `update.md`, `troubleshooting.md`.

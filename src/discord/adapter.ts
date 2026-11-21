@@ -30,6 +30,7 @@ import {
 } from "../media/relay.ts";
 import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFromText, formatDuration, formatTokens, toDiscordMarkdown } from "./render.ts";
 import { modelLabel, turnStats } from "./stats.ts";
+import { catalogFor } from "../model.ts";
 import { DiscordStreamer, resolveSendable } from "./stream.ts";
 
 const EVENT_TYPES = [
@@ -47,6 +48,7 @@ const EVENT_TYPES = [
   "permission.asked",
   "session.renamed",
   "session.created",
+  "session.model.selected",
   "session.synthetic",
 ];
 
@@ -585,13 +587,13 @@ export class DiscordBridge {
       return;
     }
     const session = await this.oc.getSession(sessionID);
-    const busy = session.time?.busy && !session.time?.idle ? "работает" : "свободна";
+    const busy = Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0) ? "работает" : "свободна";
     await interaction.editReply({
       content: [
         `**${session.title}**`,
         `id: \`${session.id}\``,
         `📁 \`${session.location?.directory ?? "?"}\``,
-        `🤖 ${session.model?.providerID ?? "?"}/${session.model?.id ?? "?"}`,
+        `🤖 ${await modelLabel(this.oc, sessionID)}`,
         `🧩 ${session.agent ?? "?"}`,
         `⏱ ${busy}`,
         `💰 $${(session.cost ?? 0).toFixed(4)}`,
@@ -695,8 +697,7 @@ export class DiscordBridge {
         await this.ensureStream(sessionID);
         this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
         break;
-      }
-      case "session.text.started":
+      }      case "session.text.started":
         await this.ensureStream(sessionID);
         break;
       case "session.text.delta": {
@@ -761,6 +762,11 @@ export class DiscordBridge {
       case "session.synthetic":
         await this.subagentReport(sessionID, event.data);
         break;
+      case "session.model.selected": {
+        catalogFor(this.oc).forget(sessionID);
+        this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
+        break;
+      }
       case "session.renamed": {
         const title = String(event.data.title ?? "").trim();
         if (!title) break;
@@ -783,7 +789,12 @@ export class DiscordBridge {
 
   private async ensureStream(sessionID: string): Promise<void> {
     if (this.streamer?.has(sessionID)) return;
-    if (await this.isSubagent(sessionID)) return;
+    // Same guard as Telegram: late events from a finished turn must not create
+    // an orphan placeholder that never receives the final answer.
+    const session = await this.oc.getSession(sessionID).catch(() => undefined);
+    if (!session || session.parentID) return;
+    const busy = Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0);
+    if (!busy) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
     await this.streamer?.begin(sessionID, target, await modelLabel(this.oc, sessionID));
