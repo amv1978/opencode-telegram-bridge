@@ -3,6 +3,7 @@
 import { loadConfig, resolvePaths } from "./config.ts";
 import { discover, OcClient } from "./opencode/client.ts";
 import { resolveModelLabel } from "./model.ts";
+import { setupTelegramNetwork } from "./telegram/net.ts";
 
 const ok = (label: string, value: string) => console.log(`  ✔ ${label}: ${value}`);
 const warn = (label: string, value: string) => console.log(`  ! ${label}: ${value}`);
@@ -28,15 +29,28 @@ async function main(): Promise<void> {
   const info = await client.info();
   ok("version", info.version);
 
-  const sessions = await client.listSessions({ limit: 5 });
+  const sessions = await client.listSessions({ limit: 10 });
   ok("sessions", `${sessions.length} (latest: ${sessions[0]?.title?.slice(0, 40) ?? "—"})`);
 
   const agents = await client.listAgents();
   ok("agents", agents.map((a) => a.id).join(", "));
 
-  const session = sessions.find((s) => !s.parentID);
+  // Prefer the newest top-level session that actually has history; the absolute
+  // newest one is often a just-created or subagent session.
+  let session = sessions.find((s) => !s.parentID);
+  let messages = session ? await client.messages(session.id) : [];
+  if (!messages.length) {
+    for (const candidate of sessions) {
+      if (candidate.parentID) continue;
+      const history = await client.messages(candidate.id);
+      if (history.length) {
+        session = candidate;
+        messages = history;
+        break;
+      }
+    }
+  }
   if (session) {
-    const messages = await client.messages(session.id);
     ok("history", `${messages.length} messages in ${session.id.slice(0, 16)}…`);
     ok("model", await resolveModelLabel(client, session.id));
     const active = await client.activeSessions();
@@ -71,9 +85,25 @@ async function main(): Promise<void> {
 
   if (cfg) {
     const { Bot } = await import("grammy");
-    const bot = new Bot(cfg.telegram.token);
-    const me = await bot.api.getMe();
-    ok("telegram", `@${me.username}`);
+    // The doctor must use the same pinned IP/proxy as the daemon: direct access
+    // to api.telegram.org is blocked on some networks.
+    const net = await setupTelegramNetwork(cfg.telegram, async (fetchImpl) => {
+      try {
+        const response = await fetchImpl(`https://api.telegram.org/bot${cfg!.telegram.token}/getMe`, {
+          signal: AbortSignal.timeout(10_000),
+        });
+        return response.ok;
+      } catch {
+        return false;
+      }
+    });
+    try {
+      const bot = new Bot(cfg.telegram.token, { client: { fetch: net.fetch } });
+      const me = await bot.api.getMe();
+      ok("telegram", `@${me.username} (${net.mode})`);
+    } finally {
+      net.stop();
+    }
   }
 
   console.log("\nAll good. Start the bridge with: bun run src/index.ts");
