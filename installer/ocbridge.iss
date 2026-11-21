@@ -1,6 +1,6 @@
 ; Inno Setup script for OpenCode Telegram Bridge.
 ; Build: ISCC.exe installer\ocbridge.iss
-; Produces: dist\ocbridge-setup-<version>.exe
+; Produces: dist\ocbridge-setup-standalone-<version>.exe
 
 #define AppName "OpenCode Telegram Bridge"
 #ifndef AppVersion
@@ -22,7 +22,7 @@ DefaultDirName={autopf}\OpenCodeTelegramBridge
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
-OutputBaseFilename=ocbridge-setup-{#AppVersion}
+OutputBaseFilename=ocbridge-setup-standalone-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

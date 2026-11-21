@@ -109,7 +109,7 @@ Write-Host "-- setup-lite"
 if ($LASTEXITCODE -ne 0) { throw "lite installer failed" }
 
 # 6. Checksums ------------------------------------------------------------
-foreach ($name in @("ocbridge-setup-$Version.exe", "ocbridge-setup-lite-$Version.exe")) {
+foreach ($name in @("ocbridge-setup-standalone-$Version.exe", "ocbridge-setup-lite-$Version.exe")) {
   $path = Join-Path $dist $name
   if (-not (Test-Path $path)) { throw "missing artifact: $path" }
   $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
@@ -119,7 +119,7 @@ foreach ($name in @("ocbridge-setup-$Version.exe", "ocbridge-setup-lite-$Version
 Write-Host ""
 Write-Host "Artifacts:"
 Get-ChildItem $dist -File | Where-Object {
-  $_.Name -match "^ocbridge-(setup|setup-lite|bundle)-$([regex]::Escape($Version))"
+  $_.Name -match "^ocbridge-(setup-standalone|setup-lite|bundle)-$([regex]::Escape($Version))"
 } | Sort-Object Name | ForEach-Object {
   "{0,-38} {1,8:N1} MB" -f $_.Name, ($_.Length / 1MB)
 }

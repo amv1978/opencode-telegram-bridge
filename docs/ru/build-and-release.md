@@ -78,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 
 | Скрипт | Результат | Размер | Содержимое |
 |---|---|---|---|
-| `installer\ocbridge.iss` | `dist\ocbridge-setup-<ver>.exe` | ~180 МБ | полная офлайн-установка |
+| `installer\ocbridge.iss` | `dist\ocbridge-setup-standalone-<ver>.exe` | ~180 МБ | полная офлайн-установка |
 | `installer\ocbridge-lite.iss` | `dist\ocbridge-setup-lite-<ver>.exe` | ~3–5 МБ | скачивает bundle |
 
 ```powershell
@@ -113,8 +113,8 @@ Get-ChildItem dist\ocbridge-*0.6.0* | Select-Object Name,Length
 В релиз загружаются три бинарника и три суммы:
 
 ```
-ocbridge-setup-0.6.0.exe
-ocbridge-setup-0.6.0.exe.sha256
+ocbridge-setup-standalone-0.6.0.exe
+ocbridge-setup-standalone-0.6.0.exe.sha256
 ocbridge-setup-lite-0.6.0.exe
 ocbridge-setup-lite-0.6.0.exe.sha256
 ocbridge-bundle-0.6.0.zip

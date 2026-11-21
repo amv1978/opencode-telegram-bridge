@@ -109,7 +109,7 @@ ocbridge-cli update --rollback
 Каждый релиз должен содержать:
 
 - `ocbridge-bundle-<version>.zip` + `.sha256`
-- `ocbridge-setup-<version>.exe` + `.sha256` (полный, всё внутри)
+- `ocbridge-setup-standalone-<version>.exe` + `.sha256` (полный, всё внутри)
 - `ocbridge-setup-lite-<version>.exe` + `.sha256` (скачивает bundle)
 
 `scripts/build-release.ps1` собирает всё; см.

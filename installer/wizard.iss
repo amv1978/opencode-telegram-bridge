@@ -37,16 +37,32 @@ begin
   StringChangeEx(Result, '\t', ' ', True);
 end;
 
-function JsonStringValue(const Json, Key: String): String;
+function LastPos(const Needle, Haystack: String): Integer;
+var
+  P, Q: Integer;
+begin
+  Result := 0;
+  P := Pos(Needle, Haystack);
+  while P > 0 do
+  begin
+    Result := P;
+    Q := Pos(Needle, Copy(Haystack, P + 1, Length(Haystack)));
+    if Q = 0 then break;
+    P := P + Q;
+  end;
+end;
+
+function JsonStringValueFrom(const Json, Key: String; StartAt: Integer): String;
 var
   Tag, Rest: String;
   P, Q: Integer;
 begin
   Result := '';
+  if StartAt < 1 then StartAt := 1;
   Tag := '"' + Key + '"';
-  P := Pos(Tag, Json);
+  P := Pos(Tag, Copy(Json, StartAt, Length(Json)));
   if P = 0 then exit;
-  Rest := Copy(Json, P + Length(Tag), Length(Json));
+  Rest := Copy(Json, StartAt + P + Length(Tag) - 1, Length(Json));
   P := Pos(':', Rest);
   if P = 0 then exit;
   Rest := TrimLeft(Copy(Rest, P + 1, Length(Rest)));
@@ -55,6 +71,16 @@ begin
   Q := Pos('"', Rest);
   if Q = 0 then exit;
   Result := JsonUnescape(Copy(Rest, 1, Q - 1));
+end;
+
+function JsonStringValue(const Json, Key: String): String;
+begin
+  Result := JsonStringValueFrom(Json, Key, 1);
+end;
+
+function JsonStringValueLast(const Json, Key: String): String;
+begin
+  Result := JsonStringValueFrom(Json, Key, LastPos('"' + Key + '"', Json));
 end;
 
 function JsonNumberValue(const Json, Key: String): Int64;
@@ -87,7 +113,9 @@ begin
   SavedConfig := LoadTextFile(ConfigPath);
   Previous := LoadTextFile(InstallerPath);
 
-  SavedToken := JsonStringValue(SavedConfig, 'token');
+  // `discord` also has token/mode: read the Telegram token after "telegram" and
+  // take the last root-level "mode", never the Discord thread mode.
+  SavedToken := JsonStringValueFrom(SavedConfig, 'token', Pos('"telegram"', SavedConfig));
   SavedTokenMask := '';
   if Length(SavedToken) > 4 then
     SavedTokenMask := '****' + Copy(SavedToken, Length(SavedToken) - 3, 4);
@@ -132,15 +160,16 @@ begin
   ModePage.Add(CustomMessage('ModePrivate'));
   ModePage.Add(CustomMessage('ModeTopics'));
   ModePage.Values[0] := True;
-  Mode := JsonStringValue(SavedConfig, 'mode');
+  Mode := JsonStringValueLast(SavedConfig, 'mode');
   if Mode = 'private' then
     ModePage.Values[1] := True
   else if Mode = 'topics' then
     ModePage.Values[2] := True;
 
-  // Remember the previous install directory and task selection.
+  // Remember the previous install directory, but never override an explicit /DIR.
   Dir := JsonStringValue(Previous, 'directory');
-  if Dir <> '' then
+  if (Dir <> '') and
+     (CompareText(WizardForm.DirEdit.Text, ExpandConstant('{autopf}\OpenCodeTelegramBridge')) = 0) then
     WizardForm.DirEdit.Text := Dir;
   if Pos('"autostart": true', Previous) > 0 then
     WizardSelectTasks('autostart');

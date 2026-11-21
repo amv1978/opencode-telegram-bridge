@@ -28,7 +28,7 @@
 
 ### Установщик (Windows 10/11)
 
-1. Запустите `ocbridge-setup-0.6.0.exe` (офлайн) или
+1. Запустите `ocbridge-setup-standalone-0.6.0.exe` (офлайн) или
    `ocbridge-setup-lite-0.6.0.exe` (скачивает portable-bundle, ~2 МБ). Готовый
    layout также лежит в `ocbridge-bundle-0.6.0.zip`.
 2. Вставьте токен бота от [@BotFather](https://t.me/BotFather) — можно пропустить

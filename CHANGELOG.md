@@ -10,7 +10,7 @@
 - **Portable bundle** `ocbridge-bundle-0.6.0.zip`: установочный layout
   (`ocbridge.exe`, `ffmpeg.exe`, `ocbridge-cli.exe`, `desktop\`), `version.json`
   (версия, время сборки, список файлов) и `CHANGELOG.md`. Публикуется вместе с
-  `ocbridge-setup-0.6.0.exe`, `ocbridge-setup-lite-0.6.0.exe` и `.sha256`.
+  `ocbridge-setup-standalone-0.6.0.exe`, `ocbridge-setup-lite-0.6.0.exe` и `.sha256`.
 - **Автообновление bundle.** Скачивание zip + `.sha256` с прогрессом, BITS →
   curl → встроенный fetch, докачка `.part`, проверка SHA256, распаковка в
   `{app}\new`, обмен с `{app}`, предыдущая версия — в `{app}\prev` (одна),

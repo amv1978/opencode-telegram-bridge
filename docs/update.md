@@ -109,7 +109,7 @@ ocbridge-cli update --rollback
 Every release must upload:
 
 - `ocbridge-bundle-<version>.zip` + `.sha256`
-- `ocbridge-setup-<version>.exe` + `.sha256` (standalone, includes everything)
+- `ocbridge-setup-standalone-<version>.exe` + `.sha256` (standalone, includes everything)
 - `ocbridge-setup-lite-<version>.exe` + `.sha256` (downloads the bundle)
 
 `scripts/build-release.ps1` produces all of them; see

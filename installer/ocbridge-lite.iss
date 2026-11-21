@@ -9,6 +9,7 @@
   #define AppVersion "0.6.0"
 #endif
 #define AppExe "ocbridge.exe"
+#define LITE
 
 [Setup]
 AppId={{7C4E2B0F-6C1E-4C63-9C2A-91C1D8B7A001}
