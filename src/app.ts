@@ -76,6 +76,7 @@ export class App {
   private username = "";
   private startedAt = 0;
   private retryTimer?: ReturnType<typeof setTimeout>;
+  private discordRetryTimer?: ReturnType<typeof setTimeout>;
   private ocVersion = "";
   private ocUrl = "";
 
@@ -216,7 +217,7 @@ export class App {
 
   /** Discord is optional: any failure is logged and Telegram keeps running. */
   private async startDiscord(): Promise<void> {
-    if (!this.client || !isDiscordConfigured(this.cfg)) return;
+    if (!this.client || !isDiscordConfigured(this.cfg) || this.discord) return;
     this.discord = new DiscordBridge(this.cfg, this.client, this.store, {
       relay: this.relay,
       onStateChange: (state, error) => {
@@ -229,7 +230,21 @@ export class App {
       log.error("discord start failed (Telegram keeps running):", (error as Error).message);
       await this.discord.stop().catch(() => undefined);
       this.discord = undefined;
+      // The gateway may be temporarily unreachable: retry in the background
+      // instead of leaving Discord dead until a manual restart.
+      this.scheduleDiscordRetry();
     }
+  }
+
+  private scheduleDiscordRetry(): void {
+    if (this.discordRetryTimer || this.state !== "running" || !isDiscordConfigured(this.cfg)) return;
+    this.discordRetryTimer = setTimeout(() => {
+      this.discordRetryTimer = undefined;
+      if (this.state !== "running" || !isDiscordConfigured(this.cfg)) return;
+      log.info("retrying discord connection…");
+      void this.startDiscord();
+    }, 5 * 60_000);
+    this.discordRetryTimer.unref?.();
   }
 
   private scheduleRetry(): void {
@@ -273,6 +288,10 @@ export class App {
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = undefined;
+    }
+    if (this.discordRetryTimer) {
+      clearTimeout(this.discordRetryTimer);
+      this.discordRetryTimer = undefined;
     }
     await this.bridge?.stop().catch((error) => log.warn("stop:", (error as Error).message));
     await this.discord?.stop().catch((error) => log.warn("discord stop:", (error as Error).message));
