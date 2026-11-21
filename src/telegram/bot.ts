@@ -879,6 +879,11 @@ export class Bridge {
             }
             break;
           }
+          // A session created without a model gets one assigned by OpenCode by
+          // the time execution starts; refresh the label before/when the block
+          // appears so it never keeps "unknown model" or a stale /model value.
+          catalogFor(this.oc).forget(sessionID);
+          this.streamer.setModel(sessionID, await this.modelLabel(sessionID, true));
         }
         await this.ensureStream(sessionID);
         break;
@@ -1039,8 +1044,8 @@ export class Bridge {
   }
 
   /** Human model name shared with Discord; never the bare "OpenCode". */
-  private async modelLabel(sessionID: string): Promise<string> {
-    const label = await resolveModelLabel(this.oc, sessionID);
+  private async modelLabel(sessionID: string, refresh = false): Promise<string> {
+    const label = await resolveModelLabel(this.oc, sessionID, refresh);
     catalogFor(this.oc).remember(sessionID, label);
     return label;
   }

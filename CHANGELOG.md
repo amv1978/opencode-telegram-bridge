@@ -18,7 +18,7 @@
   В авто-теме ошибка prompt больше не приводит к дублю задачи в чате.
 - **Имя модели.** Литерал `OpenCode` больше никогда не показывается: имя берётся
   из `/api/model` (`providerID/id`), при отсутствии — `unknown model`. Кэш на
-  сессию, обновление по `session.model.selected` (Telegram и Discord).
+  сессию, обновление по `session.model.selected` и в начале хода (Telegram и Discord).
 - **Doctor.** Если prompt принят, но `session.execution.started` не пришёл за 30 с,
   в журнал и панель выводится предупреждение с советом `/stop`; то же проверяет
   `ocbridge-cli doctor` / `bun run src/doctor.ts`.
