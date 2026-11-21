@@ -76,10 +76,13 @@ configurable). If a newer version exists, a banner appears in the panel with
 ```
 ocbridge-cli update --check
 ocbridge-cli update --install
+ocbridge-cli update --rollback
 ```
 
-The installer is downloaded to `%TEMP%\ocbridge-update\setup.exe`, verified against
-the release's `.sha256` asset, then run silently. User data in
+The portable bundle is downloaded to `%TEMP%\ocbridge-update\bundle.zip`
+(resumable, progress, SHA256 verified), unpacked into `{app}\new` and swapped
+into `{app}`; the previous version stays in `{app}\prev` for automatic rollback
+after a failed 60-second `GET /api/state` health check. User data in
 `%APPDATA%\opencode-telegram-bridge\` is never touched. Auto-update works only for
 the packaged Windows build, not for `bun` dev runs. See [docs/update.md](docs/update.md).
 
