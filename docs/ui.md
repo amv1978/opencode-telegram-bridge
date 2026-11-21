@@ -11,6 +11,10 @@ Sections: bot and OpenCode status, token, mode, forum group ID, default folder,
 throttling, tools, media relay, network (proxy/IP), users, recent sessions, log,
 “Start / Stop / Restart” buttons, autostart.
 
+If `/api/state` fails (daemon restarting, port busy) the page keeps the last data
+and shows a red banner with the failure reason instead of empty dashes. Discord
+shows `connected`, `retrying N · in Xs · error`, or the error text.
+
 ## Themes
 
 Two themes × three schemes:

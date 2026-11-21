@@ -1,6 +1,6 @@
 param(
-  [string]$Version = "0.6.0",
-  [string]$Title = "First public release 0.6.0",
+  [string]$Version = "",
+  [string]$Title = "",
   [switch]$SkipDeleteOld
 )
 
@@ -8,6 +8,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $root "dist"
 $repo = "amv1978/opencode-telegram-bridge"
+
+if (-not $Version) {
+  $Version = (Get-Content (Join-Path $root "package.json") -Raw | ConvertFrom-Json).version
+}
+if (-not $Title) { $Title = "OpenCode Bridge $Version" }
 
 $token = $env:GH_TOKEN
 if (-not $token) {
@@ -22,7 +27,7 @@ $headers = @{
 }
 
 $body = @"
-First public release. Portable bundle, wizard-free updates with rollback, chat lifecycle notifications, Electron changelog modal and a lightweight installer.
+OpenCode Bridge $Version.
 
 Assets:
 - ocbridge-setup-standalone-$Version.exe - full offline installer

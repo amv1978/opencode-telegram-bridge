@@ -55,7 +55,7 @@ Target `dir` only — no separate portable Electron exe is built.
 `scripts/build-release.ps1` stages `dist\bundle\` and zips it:
 
 ```
-ocbridge-bundle-0.6.0.zip
+ocbridge-bundle-0.6.1.zip
   ocbridge.exe
   ffmpeg.exe
   ocbridge-cli.exe
@@ -83,9 +83,9 @@ Two Inno Setup scripts share `messages.iss` and `wizard.iss`:
 
 ```powershell
 $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-& $iscc "/DAppVersion=0.6.0" installer\ocbridge.iss
-$sha = (Get-FileHash dist\ocbridge-bundle-0.6.0.zip -Algorithm SHA256).Hash.ToLower()
-& $iscc "/DAppVersion=0.6.0" "/DBundleSha=$sha" installer\ocbridge-lite.iss
+& $iscc "/DAppVersion=0.6.1" installer\ocbridge.iss
+$sha = (Get-FileHash dist\ocbridge-bundle-0.6.1.zip -Algorithm SHA256).Hash.ToLower()
+& $iscc "/DAppVersion=0.6.1" "/DBundleSha=$sha" installer\ocbridge-lite.iss
 ```
 
 The lite installer shows a download page with % progress, verifies SHA256
@@ -107,18 +107,18 @@ Both installers:
 ## 6. Checksums and artifacts
 
 ```powershell
-Get-ChildItem dist\ocbridge-*0.6.0* | Select-Object Name,Length
+Get-ChildItem dist\ocbridge-*0.6.1* | Select-Object Name,Length
 ```
 
 The release uploads three binaries and three sums:
 
 ```
-ocbridge-setup-standalone-0.6.0.exe
-ocbridge-setup-standalone-0.6.0.exe.sha256
-ocbridge-setup-lite-0.6.0.exe
-ocbridge-setup-lite-0.6.0.exe.sha256
-ocbridge-bundle-0.6.0.zip
-ocbridge-bundle-0.6.0.zip.sha256
+ocbridge-setup-standalone-0.6.1.exe
+ocbridge-setup-standalone-0.6.1.exe.sha256
+ocbridge-setup-lite-0.6.1.exe
+ocbridge-setup-lite-0.6.1.exe.sha256
+ocbridge-bundle-0.6.1.zip
+ocbridge-bundle-0.6.1.zip.sha256
 ```
 
 `sha256sum` format: lowercase hex, two spaces, file name.
@@ -129,8 +129,8 @@ ocbridge-bundle-0.6.0.zip.sha256
 |---|---|
 | `package.json` | `"version"` |
 | `desktop/package.json` | `"version"` |
-| `installer/ocbridge.iss` | `#define AppVersion "0.6.0"` |
-| `installer/ocbridge-lite.iss` | `#define AppVersion "0.6.0"` |
+| `installer/ocbridge.iss` | `#define AppVersion "0.6.1"` |
+| `installer/ocbridge-lite.iss` | `#define AppVersion "0.6.1"` |
 | `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` |
 
 Additionally: `cli/Program.cs`, the `Program.Version` constant — it is printed by
@@ -150,7 +150,7 @@ the new bundle/installer still reports the previous version.
    `/start`, theme, voice.
 6. Check that git has no `config.json`, `state.json`, `installer.json`, `*.log`,
    `dist/`, `*.exe`.
-7. Tag `v0.6.0` and upload all six assets.
+7. Tag `v0.6.1` and upload all six assets.
 8. Delete older releases if they are superseded.
 
 ## Code signing

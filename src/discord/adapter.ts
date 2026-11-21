@@ -69,7 +69,7 @@ interface ThreadParent {
   };
 }
 
-export type DiscordState = "stopped" | "starting" | "running" | "error";
+export type DiscordState = "stopped" | "starting" | "running" | "retrying" | "error";
 
 export interface DiscordOptions {
   onStateChange?: (state: DiscordState, error: string) => void;
@@ -96,6 +96,8 @@ export class DiscordBridge {
   private state: DiscordState = "stopped";
   private error = "";
   private username = "";
+  private retryAt = 0;
+  private attempt = 0;
 
   constructor(
     private readonly cfg: BridgeConfig,
@@ -104,14 +106,16 @@ export class DiscordBridge {
     private readonly options: DiscordOptions = {},
   ) {}
 
-  get status(): { state: DiscordState; error: string; username: string } {
-    return { state: this.state, error: this.error, username: this.username };
+  get status(): { state: DiscordState; error: string; username: string; retryAt: number; attempt: number } {
+    return { state: this.state, error: this.error, username: this.username, retryAt: this.retryAt, attempt: this.attempt };
   }
 
   async start(): Promise<string> {
     const token = this.cfg.discord?.token?.trim();
     if (!token) throw new Error("Не указан токен Discord");
     this.setState("starting", "");
+    this.attempt = 0;
+    this.retryAt = 0;
 
     const client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -147,10 +151,16 @@ export class DiscordBridge {
         const wait = delays[attempt] ?? 300000;
         log.warn(`discord login attempt ${attempt + 1}/${delays.length} failed: ${lastError.message}; retry in ${Math.round(wait / 1000)}s`);
         await client.destroy().catch(() => undefined);
-        if (attempt < delays.length - 1) await new Promise((resolve) => setTimeout(resolve, wait));
+        if (attempt < delays.length - 1) {
+          this.attempt = attempt + 1;
+          this.retryAt = Date.now() + wait;
+          this.setState("retrying", `${lastError.message}; retry in ${Math.round(wait / 1000)}s`);
+          await new Promise((resolve) => setTimeout(resolve, wait));
+        }
       }
     }
     if (lastError) {
+      this.retryAt = 0;
       this.setState("error", lastError.message);
       await client.destroy().catch(() => undefined);
       this.client = undefined;
@@ -158,6 +168,8 @@ export class DiscordBridge {
     }
 
     this.username = client.user?.username ?? "";
+    this.attempt = 0;
+    this.retryAt = 0;
     const guilds = this.cfg.discord?.allowedGuilds ?? [];
     if (guilds.length === 0) log.warn("discord: allowedGuilds is empty — all events will be ignored");
     if ((this.cfg.discord?.allowedUsers ?? []).length === 0) log.warn("discord: allowedUsers is empty — nobody can drive the bot");
@@ -240,18 +252,21 @@ export class DiscordBridge {
     client.on(Events.Warn, (message) => log.warn("discord warning:", message));
     client.on(Events.ShardDisconnect, (event, id) => {
       log.warn(`discord shard ${id} disconnected (${event.code}); scheduling reconnect`);
-      this.scheduleReconnect();
+      this.scheduleReconnect(`gateway disconnected (code ${event.code})`);
     });
     client.on(Events.ShardReconnecting, (id) => log.info(`discord shard ${id} reconnecting…`));
     client.on(Events.ShardResume, (id, replayed) => log.info(`discord shard ${id} resumed (${replayed} replayed)`));
   }
 
   /** Exponential backoff (5 s → 5 min) without restarting the whole bridge. */
-  private scheduleReconnect(): void {
+  private scheduleReconnect(reason = "gateway disconnected"): void {
     const token = this.cfg.discord?.token?.trim();
     if (!token || !this.client || this.reconnectTimer || this.client.isReady()) return;
     const delay = Math.min(300000, 5000 * 2 ** this.reconnectAttempt);
     this.reconnectAttempt += 1;
+    this.attempt = this.reconnectAttempt;
+    this.retryAt = Date.now() + delay;
+    this.setState("retrying", `${reason}; reconnect in ${Math.round(delay / 1000)}s`);
     log.warn(`discord gateway down; reconnect attempt ${this.reconnectAttempt} in ${Math.round(delay / 1000)}s`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
@@ -270,6 +285,9 @@ export class DiscordBridge {
     try {
       await client.login(token);
       this.reconnectAttempt = 0;
+      this.attempt = 0;
+      this.retryAt = 0;
+      this.setState("running", "");
       log.info("discord reconnected");
     } catch (error) {
       log.warn(`discord reconnect failed: ${(error as Error).message}`);

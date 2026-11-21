@@ -55,7 +55,7 @@ npm run pack                  # electron-builder --win --dir
 `scripts/build-release.ps1` готовит `dist\bundle\` и упаковывает:
 
 ```
-ocbridge-bundle-0.6.0.zip
+ocbridge-bundle-0.6.1.zip
   ocbridge.exe
   ffmpeg.exe
   ocbridge-cli.exe
@@ -83,9 +83,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 
 ```powershell
 $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-& $iscc "/DAppVersion=0.6.0" installer\ocbridge.iss
-$sha = (Get-FileHash dist\ocbridge-bundle-0.6.0.zip -Algorithm SHA256).Hash.ToLower()
-& $iscc "/DAppVersion=0.6.0" "/DBundleSha=$sha" installer\ocbridge-lite.iss
+& $iscc "/DAppVersion=0.6.1" installer\ocbridge.iss
+$sha = (Get-FileHash dist\ocbridge-bundle-0.6.1.zip -Algorithm SHA256).Hash.ToLower()
+& $iscc "/DAppVersion=0.6.1" "/DBundleSha=$sha" installer\ocbridge-lite.iss
 ```
 
 Lite-установщик показывает страницу загрузки с прогрессом, проверяет SHA256
@@ -107,18 +107,18 @@ Lite-установщик показывает страницу загрузки
 ## 6. Контрольные суммы и артефакты
 
 ```powershell
-Get-ChildItem dist\ocbridge-*0.6.0* | Select-Object Name,Length
+Get-ChildItem dist\ocbridge-*0.6.1* | Select-Object Name,Length
 ```
 
 В релиз загружаются три бинарника и три суммы:
 
 ```
-ocbridge-setup-standalone-0.6.0.exe
-ocbridge-setup-standalone-0.6.0.exe.sha256
-ocbridge-setup-lite-0.6.0.exe
-ocbridge-setup-lite-0.6.0.exe.sha256
-ocbridge-bundle-0.6.0.zip
-ocbridge-bundle-0.6.0.zip.sha256
+ocbridge-setup-standalone-0.6.1.exe
+ocbridge-setup-standalone-0.6.1.exe.sha256
+ocbridge-setup-lite-0.6.1.exe
+ocbridge-setup-lite-0.6.1.exe.sha256
+ocbridge-bundle-0.6.1.zip
+ocbridge-bundle-0.6.1.zip.sha256
 ```
 
 Формат `sha256sum`: hex в нижнем регистре, два пробела, имя файла.
@@ -129,8 +129,8 @@ ocbridge-bundle-0.6.0.zip.sha256
 |---|---|
 | `package.json` | `"version"` |
 | `desktop/package.json` | `"version"` |
-| `installer/ocbridge.iss` | `#define AppVersion "0.6.0"` |
-| `installer/ocbridge-lite.iss` | `#define AppVersion "0.6.0"` |
+| `installer/ocbridge.iss` | `#define AppVersion "0.6.1"` |
+| `installer/ocbridge-lite.iss` | `#define AppVersion "0.6.1"` |
 | `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` |
 
 Дополнительно: `cli/Program.cs`, константа `Program.Version` — её печатает
@@ -151,7 +151,7 @@ ocbridge-bundle-0.6.0.zip.sha256
    голос.
 6. Убедиться, что в git нет `config.json`, `state.json`, `installer.json`,
    `*.log`, `dist/`, `*.exe`.
-7. Поставить тег `v0.6.0` и загрузить все шесть файлов.
+7. Поставить тег `v0.6.1` и загрузить все шесть файлов.
 8. Удалить устаревшие релизы.
 
 ## Подпись кода

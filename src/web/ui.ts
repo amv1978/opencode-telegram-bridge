@@ -60,6 +60,10 @@ export const PAGE = /* html */ `<!doctype html>
   <span id="who" class="pill"></span>
   <span id="ver" class="pill version" hidden></span>
 </header>
+<div id="apiError" class="card" hidden style="max-width:900px;margin:18px auto 0;border-color:var(--err)">
+  <b data-i18n="err.apiTitle">Нет связи с приложением</b>
+  <div id="apiErrorText" class="hint" style="color:var(--err)"></div>
+</div>
 <div id="updateBanner" class="card" hidden>
   <div class="row">
     <span id="updateText" style="flex:1"></span>
@@ -369,7 +373,11 @@ const I18N = {
     "toast.on": "Готово",
     "toast.token": "Вставьте токен",
     "toast.done": "Готово — напишите боту /start",
-    "err.offline": "нет связи с приложением"
+    "err.offline": "нет связи с приложением",
+    "err.apiTitle": "Панель не может получить состояние",
+    "status.connected": "подключён",
+    "status.retrying": "переподключение",
+    "status.retryIn": "через"
   },
   en: {
     "title": "OpenCode · Telegram Bridge",
@@ -448,7 +456,11 @@ const I18N = {
     "toast.on": "Done",
     "toast.token": "Paste a token",
     "toast.done": "Done — send /start to the bot",
-    "err.offline": "no connection to the app"
+    "err.offline": "no connection to the app",
+    "err.apiTitle": "Panel cannot read the bridge state",
+    "status.connected": "connected",
+    "status.retrying": "retrying",
+    "status.retryIn": "in"
   }
 };
 
@@ -537,6 +549,26 @@ async function api(path, options) {
   return json;
 }
 
+function discordLine(dc) {
+  if (!dc.enabled) return t("status.off");
+  const tail = dc.tokenTail ? " · " + dc.tokenTail : "";
+  if (dc.state === "running") return t("status.connected") + (dc.username ? " · @" + dc.username : "") + tail;
+  if (dc.state === "retrying") {
+    const sec = dc.retryAt ? Math.max(0, Math.ceil((dc.retryAt - Date.now()) / 1000)) : 0;
+    const when = sec ? " · " + t("status.retryIn") + " " + sec + " " + t("status.seconds") : "";
+    return t("status.retrying") + (dc.attempt ? " " + dc.attempt : "") + when + (dc.error ? " · " + dc.error : "") + tail;
+  }
+  if (dc.state === "error") return t("state.error") + (dc.error ? " · " + dc.error : "") + tail;
+  return (dc.state || t("status.off")) + tail;
+}
+
+function setApiError(message) {
+  const box = $("apiError");
+  if (!box) return;
+  box.hidden = !message;
+  if (message) $("apiErrorText").textContent = message;
+}
+
 function fill(s) {
   lastState = s;
   $("state").textContent = t("state." + s.state, s.state);
@@ -548,13 +580,11 @@ function fill(s) {
   $("tg").textContent = s.configured ? t("status.token") + " " + s.config.tokenTail : t("status.notConfigured");
   $("oc").textContent = s.ocVersion ? "v" + s.ocVersion + " · " + s.ocUrl : "—";
   const dc = s.discord || {};
-  $("dc").textContent = dc.enabled
-    ? (dc.state || "off") + (dc.username ? " · @" + dc.username : "") + (dc.tokenTail ? " · " + dc.tokenTail : "")
-    : t("status.off");
+  $("dc").textContent = discordLine(dc);
   $("net").textContent = s.telegramMode || "—";
   $("uptime").textContent = s.startedAt ? Math.round((Date.now() - s.startedAt) / 1000) + " " + t("status.seconds") : "—";
   $("err").textContent = s.error || "";
-  $("warn").textContent = (s.warnings || []).length ? "⚠️ " + s.warnings.join("\n⚠️ ") : "";
+  $("warn").textContent = (s.warnings || []).length ? "⚠️ " + s.warnings.join("\\n⚠️ ") : "";
   $("cfgPath").textContent = s.configPath;
   $("btnStart").disabled = s.state === "running" || s.state === "starting";
   $("btnStop").disabled = s.state === "stopped";
@@ -598,7 +628,7 @@ function fill(s) {
   const banner = $("updateBanner");
   banner.hidden = !u.available && !u.downloading;
   if (!banner.hidden) {
-    $("updateText").textContent = t("update.available") + " " + (u.latest || "") + (u.notes ? " — " + String(u.notes).split("\n")[0].slice(0, 120) : "");
+    $("updateText").textContent = t("update.available") + " " + (u.latest || "") + (u.notes ? " — " + String(u.notes).split("\\n")[0].slice(0, 120) : "");
     $("updateDownload").disabled = Boolean(u.downloading);
     $("updateInstall").disabled = !(u.progress >= 100);
     $("updateProgress").hidden = !u.downloading;
@@ -623,6 +653,7 @@ async function refresh() {
     const s = await api("/api/state");
     if (!s.sessions || !s.sessions.length) s.sessions = [];
     fill(s);
+    setApiError("");
     if (!s.sessions.length) {
       const extra = await api("/api/sessions").catch(() => ({ sessions: [] }));
       s.sessions = extra.sessions;
@@ -631,6 +662,7 @@ async function refresh() {
   } catch (e) {
     $("state").textContent = t("err.offline");
     $("state").className = "pill error";
+    setApiError((e && e.message ? e.message : String(e)) || t("err.offline"));
   }
 }
 

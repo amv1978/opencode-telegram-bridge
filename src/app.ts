@@ -61,8 +61,11 @@ export interface Snapshot {
     enabled: boolean;
     configured: boolean;
     state: string;
+    error: string;
     username: string;
     tokenTail: string;
+    retryAt: number;
+    attempt: number;
     allowedGuilds: string[];
     allowedUsers: string[];
   };
@@ -93,6 +96,10 @@ export class App {
   private startedAt = 0;
   private retryTimer?: ReturnType<typeof setTimeout>;
   private discordRetryTimer?: ReturnType<typeof setTimeout>;
+  private discordState = "off";
+  private discordError = "";
+  private discordRetryAt = 0;
+  private discordRetryAttempt = 0;
   private ocVersion = "";
   private ocUrl = "";
   private lastStartNotice = 0;
@@ -117,6 +124,8 @@ export class App {
   }
 
   snapshot(): Snapshot {
+    const ds = this.discord?.status;
+    const discordOn = Boolean(this.cfg.discord?.enabled) && isDiscordConfigured(this.cfg);
     return {
       version: pkg.version,
       configured: Boolean(this.cfg.telegram.token),
@@ -164,9 +173,12 @@ export class App {
       discord: {
         enabled: Boolean(this.cfg.discord?.enabled),
         configured: isDiscordConfigured(this.cfg),
-        state: this.discord?.status.state ?? (isDiscordConfigured(this.cfg) ? "stopped" : "off"),
-        username: this.discord?.status.username ?? "",
+        state: discordOn ? (ds?.state ?? this.discordState) : "off",
+        error: discordOn ? (ds?.error || this.discordError) : "",
+        username: ds?.username ?? "",
         tokenTail: this.cfg.discord?.token ? `…${this.cfg.discord.token.slice(-4)}` : "",
+        retryAt: discordOn ? (ds ? (ds.state === "retrying" ? ds.retryAt : 0) : this.discordRetryAt) : 0,
+        attempt: ds?.attempt ?? this.discordRetryAttempt,
         allowedGuilds: this.cfg.discord?.allowedGuilds ?? [],
         allowedUsers: this.cfg.discord?.allowedUsers ?? [],
       },
@@ -255,29 +267,44 @@ export class App {
     this.discord = new DiscordBridge(this.cfg, this.client, this.store, {
       relay: this.relay,
       onStateChange: (state, error) => {
+        this.discordState = state;
+        this.discordError = error;
+        if (state === "running") {
+          this.discordRetryAt = 0;
+          this.discordRetryAttempt = 0;
+        }
         if (state === "error") log.error(`discord: ${error}`);
       },
     });
     try {
       await this.discord.start();
     } catch (error) {
-      log.error("discord start failed (Telegram keeps running):", (error as Error).message);
+      const message = (error as Error).message;
+      log.error("discord start failed (Telegram keeps running):", message);
       await this.discord.stop().catch(() => undefined);
       this.discord = undefined;
       // The gateway may be temporarily unreachable: retry in the background
       // instead of leaving Discord dead until a manual restart.
+      this.discordState = "retrying";
+      this.discordError = message;
       this.scheduleDiscordRetry();
     }
   }
 
   private scheduleDiscordRetry(): void {
     if (this.discordRetryTimer || this.state !== "running" || !isDiscordConfigured(this.cfg)) return;
+    const delay = Math.min(300_000, 60_000 * 2 ** Math.min(this.discordRetryAttempt, 3));
+    this.discordRetryAttempt += 1;
+    this.discordRetryAt = Date.now() + delay;
+    this.discordState = "retrying";
+    log.warn(`discord retry ${this.discordRetryAttempt} in ${Math.round(delay / 1000)}s`);
     this.discordRetryTimer = setTimeout(() => {
       this.discordRetryTimer = undefined;
       if (this.state !== "running" || !isDiscordConfigured(this.cfg)) return;
+      this.discordRetryAt = 0;
       log.info("retrying discord connection…");
       void this.startDiscord();
-    }, 5 * 60_000);
+    }, delay);
     this.discordRetryTimer.unref?.();
   }
 
@@ -337,6 +364,10 @@ export class App {
     this.net?.stop();
     this.bridge = undefined;
     this.discord = undefined;
+    this.discordState = isDiscordConfigured(this.cfg) ? "stopped" : "off";
+    this.discordError = "";
+    this.discordRetryAt = 0;
+    this.discordRetryAttempt = 0;
     this.net = undefined;
     this.state = "stopped";
     this.startedAt = 0;
