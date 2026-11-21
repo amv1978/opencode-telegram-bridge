@@ -14,6 +14,7 @@ internal static class Commands
     {
         var state = await api.GetAsync("/api/state");
         WriteRow("Состояние", Text(state?["state"]));
+        WriteRow("Версия", Text(state?["version"]));
         WriteRow("Пользователь", User(state));
         WriteRow("OpenCode", VersionUrl(state));
         WriteRow("Telegram", OrDash(Text(state?["telegramMode"])));

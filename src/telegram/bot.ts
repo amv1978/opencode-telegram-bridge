@@ -17,6 +17,7 @@ import {
   type MediaSendLimits,
   type TelegramMediaTarget,
 } from "../media/relay.ts";
+import pkg from "../../package.json";
 
 const EVENT_TYPES = [
   "session.text.started",
@@ -443,6 +444,7 @@ export class Bridge {
         `🧩 ${escape(session.agent ?? "?")}`,
         `⏱ ${busy}`,
         `💰 $${(session.cost ?? 0).toFixed(4)}`,
+        `🏷 ${escape(pkg.version)}`,
       ].join("\n"),
       { parse_mode: "HTML" },
     );

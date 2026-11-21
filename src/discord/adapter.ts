@@ -32,6 +32,7 @@ import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFrom
 import { modelLabel, turnStats } from "./stats.ts";
 import { catalogFor } from "../model.ts";
 import { DiscordStreamer, resolveSendable } from "./stream.ts";
+import pkg from "../../package.json";
 
 const EVENT_TYPES = [
   "session.text.started",
@@ -615,6 +616,7 @@ export class DiscordBridge {
         `🧩 ${session.agent ?? "?"}`,
         `⏱ ${busy}`,
         `💰 $${(session.cost ?? 0).toFixed(4)}`,
+        `🏷 ${pkg.version}`,
       ].join("\n"),
       allowedMentions: { parse: [] },
     });

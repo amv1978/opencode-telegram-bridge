@@ -69,7 +69,7 @@ Commands are registered per allowed server on connect.
 | `/attach <sessionID\|prefix>` | attach an existing session to the current thread |
 | `/detach` | detach the thread/channel (the OpenCode session remains) |
 | `/stop` | interrupt the turn |
-| `/status` | model, agent, directory, cost |
+| `/status` | model, agent, directory, cost, bridge version |
 | `/model [provider/id]` | show/change the model |
 | `/agent [id]` | list/change the agent |
 | `/fmt` | formatting check |

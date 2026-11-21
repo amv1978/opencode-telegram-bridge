@@ -51,7 +51,7 @@ deleted, the binding is cleared and the final answer goes to the chat root.
 | `/topic <name>` | Create a forum topic and a session |
 | `/detach` | Detach the chat or topic from the session |
 | `/chatid` | Chat ID, type, forum flag; an admin saves the group |
-| `/status` | Title, id, folder, model, agent, busy state, cost |
+| `/status` | Title, id, folder, model, agent, busy state, cost, bridge version |
 | `/model [provider/id]` | Show or change the model |
 | `/agent [id]` | List agents or change the agent |
 | `/stop` | Interrupt the current turn |
