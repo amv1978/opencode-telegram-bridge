@@ -74,6 +74,8 @@ Commands are registered per allowed server on connect.
 | `/agent [id]` | list/change the agent |
 | `/mode [ask\|auto\|plan]` | show/change the session permission mode |
 | `/recent` | recent sessions with a `🔔` unread marker; a button creates a thread |
+| `/observe [action]` | mirror Desktop/TUI runs into this channel/thread (`on`, `off`, `status`; no action = toggle) |
+| `/budget` | cost caps and today's spend |
 | `/fmt` | formatting check |
 
 Permission modes (`ask` / `auto` / `plan`) work exactly as in Telegram: the preset
@@ -132,13 +134,23 @@ current one through `PATCH /api/session/{id}` (auto allows everything, plan deni
   is untouched. Text is cut into 1900-character chunks, extra chunks go as new
   messages; a code block is never split — at the boundary it is closed and
   reopened with the same language.
-- **Final**: one italic line
-  `_<Model> · ⏱ <duration> · ⚡ <tok/s> · 🧠 <context>_`. The model comes from the
+- **Final**: the stats line uses
+  `<Model> · ⏱ <duration> · ⚡ <tok/s> · 🧠 <context>`. The model comes from the
   last assistant message, the name from `/api/model` (same map as Telegram). The
-  duration/tok/s/context formula matches Telegram (`turnStats`). For
-  `interrupted`/`failed`: `_<Model> · ⏹ interrupted · ⏱ …_` / `⚠️ error` (no tok/s).
-  If the line contains `_`, `*` or `` ` ``, italics are disabled — the text goes
-  without asterisks so the markup does not break.
+  duration/tok/s/context formula matches Telegram (`turnStats`).
+  An abnormal end puts the reason on a line above the stats, so the stats line
+  stays last: `⚠️ остановлено: /stop`, `⛔ бюджет: $X из $Y`,
+  `⚠️ лимит шагов`, `⚠️ ошибка: <short reason>`; blocked tool calls are counted
+  (`· 2 инструмента заблокировано`). The same reason is logged.
+- **`/observe`**: mirrors runs started in Desktop/TUI into the current thread or
+  channel. A live card (`👀 title · model`, `⏱ … · 🛠 N`) is edited every 2.5 s;
+  the final card adds `✅`/`⚠️`, duration, tok/s, context and the run cost.
+  Sessions already bound to a thread/channel or having an active stream are
+  skipped. The flag and observed sessions are persisted in `state.json`
+  (`observe`); `/observe off` clears, `/observe status` lists.
+- **Agent artifacts**: file parts (`type:"file"`, `tool.state.content`) are posted
+  as Discord attachments up to 10 MB, with the file name; larger files become a
+  link. The relay hash cache deduplicates across transports.
 - **Permissions**: `permission.asked` → a message with “Allow / Always / Deny”
   buttons, TTL 15 minutes.
 - **Forms**: `form.created` (`question`, `mcp-elicitation`, `websearch.provider`)

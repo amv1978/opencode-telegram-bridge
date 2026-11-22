@@ -38,6 +38,15 @@ import {
   type MediaSendLimits,
   type TelegramMediaTarget,
 } from "../media/relay.ts";
+import {
+  ObservationCards,
+  parseObserveKey,
+  pickObserveTarget,
+  telegramObserveKey,
+  type ObserveBinding,
+} from "../observe.ts";
+import type { StopRegistry } from "../stops.ts";
+import { composeTurnFooter, isBlockedToolFailure, turnReason } from "../turn.ts";
 import pkg from "../../package.json";
 
 const EVENT_TYPES = [
@@ -118,6 +127,10 @@ export class Bridge {
   private readonly fetchImpl: typeof fetch;
   /** Last agent-files scan per session, so tool.success + turn end don't double-fetch. */
   private readonly agentFilesAt = new Map<string, number>();
+  /** `/observe` cards for foreign (Desktop/TUI) sessions. */
+  private readonly observer: ObservationCards;
+  /** Cumulative session cost at observation start, for the final card. */
+  private readonly observeCost = new Map<string, number>();
   private eventChain: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void) | undefined;
 
@@ -131,10 +144,26 @@ export class Bridge {
       onConfigChange?: () => void;
       onPollingError?: (message: string) => void;
       budget?: () => BudgetSnapshot | undefined;
+      stops?: StopRegistry;
     } = {},
   ) {
     this.bot = new Bot(cfg.telegram.token, options.fetch ? { client: { fetch: options.fetch } } : {});
     this.fetchImpl = options.fetch ?? globalThis.fetch;
+    this.observer = new ObservationCards({
+      intervalMs: 1200,
+      log: (message) => log.warn(message),
+      transport: {
+        send: async (target, text) => {
+          if (!target.chatId) return undefined;
+          const message = await this.bot.api.sendMessage(target.chatId, text, target.threadId ? { message_thread_id: target.threadId } : {});
+          return String(message.message_id);
+        },
+        edit: async (target, messageId, text) => {
+          if (!target.chatId) return;
+          await this.bot.api.editMessageText(target.chatId, Number(messageId), text);
+        },
+      },
+    });
     this.streamer = new Streamer(this.bot.api, {
       editIntervalMs: cfg.stream.editIntervalMs,
       showTools: cfg.stream.showTools,
@@ -201,6 +230,7 @@ export class Bridge {
     for (const state of this.titles.values()) if (state.timer) clearTimeout(state.timer);
     this.titles.clear();
     this.unsubscribe?.();
+    await this.observer.shutdown();
     await this.streamer.shutdown();
     await this.bot.stop();
   }
@@ -241,7 +271,10 @@ export class Bridge {
   /** Media relay sender: uploads bytes to the bound Telegram chat/topic. */
   async sendMedia(target: TelegramMediaTarget, item: MediaItem, limits: MediaSendLimits): Promise<void> {
     if (!item.buffer?.length) return;
-    const options = target.threadId ? { message_thread_id: target.threadId } : {};
+    const options = {
+      ...(target.threadId ? { message_thread_id: target.threadId } : {}),
+      caption: item.name.slice(0, 1000),
+    };
     const photo =
       Boolean(item.mime?.startsWith("image/")) &&
       !/gif/i.test(item.mime ?? "") &&
@@ -332,6 +365,7 @@ export class Bridge {
     this.bot.command("mode", (ctx) => this.cmdMode(ctx));
     this.bot.command("recent", (ctx) => this.cmdRecent(ctx));
     this.bot.command("budget", (ctx) => this.cmdBudget(ctx));
+    this.bot.command("observe", (ctx) => this.cmdObserve(ctx));
     this.bot.command("chatid", (ctx) => this.cmdChatId(ctx));
     this.bot.command("fmt", (ctx) => this.cmdFmt(ctx));
     this.bot.command("detach", (ctx) => this.cmdDetach(ctx));
@@ -369,7 +403,9 @@ export class Bridge {
         "/model [provider/id] — модель",
         "/agent [id] — агент",
         "/mode [ask|auto|plan] — режим разрешений",
+        "/budget — лимиты стоимости и расход за день",
         "/recent — недавние сессии (🔔 = не прочитано)",
+        "/observe [on|off|status] — зеркало внешних запусков",
         "",
         `Ваша роль: <b>${user?.role ?? "user"}</b>`,
       ].join("\n"),
@@ -459,6 +495,126 @@ export class Bridge {
     if (!limits.length) lines.push("", "Настройка: <code>ocbridge-cli budget set per-turn=1 daily=5</code>.");
     else if (snapshot.perTurnUsd) lines.push("", `<i>80% — предупреждение, 100% — ${snapshot.action === "stop" ? "прерывание" : "ещё одно предупреждение"}.</i>`);
     await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  }
+
+  private async cmdObserve(ctx: Context): Promise<void> {
+    const binding = this.observeBinding(ctx);
+    if (!binding) {
+      await ctx.reply("Не понимаю, какой чат наблюдать.");
+      return;
+    }
+    const arg = argText(ctx).toLowerCase();
+    const enabled = this.store.observeEnabled(binding.key);
+    if (arg === "on" || (!arg && !enabled)) {
+      this.store.observeEnable(binding.key);
+      await ctx.reply(
+        "👀 <b>Наблюдение включено</b>\n" +
+          "Запуски сессий из Desktop/TUI появятся здесь компактной карточкой. " +
+          "Сессии, привязанные к теме/чату, не дублируются.\n" +
+          "Выключить: <code>/observe off</code> · статус: <code>/observe status</code>",
+        { parse_mode: "HTML" },
+      );
+      log.info(`observe enabled for ${binding.key}`);
+      return;
+    }
+    if (arg === "off" || (!arg && enabled)) {
+      await this.store.observeClear(binding.key);
+      await this.observer.cancelKey(binding.key);
+      await ctx.reply("⏹ Наблюдение выключено.");
+      log.info(`observe disabled for ${binding.key}`);
+      return;
+    }
+    if (arg && arg !== "status") {
+      await ctx.reply("Формат: <code>/observe [on|off|status]</code>", { parse_mode: "HTML" });
+      return;
+    }
+    if (!enabled) {
+      await ctx.reply("👀 Наблюдение выключено. <code>/observe</code> — включить.", { parse_mode: "HTML" });
+      return;
+    }
+    const sessions = this.store.observeFor(binding.key);
+    const live = new Map(this.observer.entries(binding.key).map((entry) => [entry.sessionID, entry]));
+    const lines = ["👀 <b>Наблюдение включено</b>"];
+    if (!sessions.length) {
+      lines.push("", "Активных внешних запусков нет — жду следующего.");
+    } else {
+      lines.push("");
+      for (const sessionID of sessions) {
+        const title = live.get(sessionID)?.title || this.store.session[sessionID]?.title || sessionID.slice(0, 12);
+        lines.push(`· ${escape(title)} · <code>${escape(sessionID.slice(0, 16))}</code>`);
+      }
+    }
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  }
+
+  private observeBinding(ctx: Context): ObserveBinding | undefined {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return undefined;
+    const threadId = (ctx.message as { message_thread_id?: number } | undefined)?.message_thread_id;
+    return {
+      key: telegramObserveKey(chatId, threadId),
+      platform: "telegram",
+      chatId,
+      ...(threadId ? { threadId } : {}),
+    };
+  }
+
+  /** Every Telegram chat/topic that opted into `/observe`. */
+  private observeTargets(): ObserveBinding[] {
+    return this.store
+      .observeKeys()
+      .map((key) => parseObserveKey(key))
+      .filter((binding): binding is ObserveBinding => binding?.platform === "telegram");
+  }
+
+  /**
+   * Starts an observation card for a run that has no topic/thread binding.
+   * Bound sessions are never duplicated; the first observing target wins.
+   */
+  private async maybeObserve(sessionID: string): Promise<boolean> {
+    if (this.observer.has(sessionID)) return true;
+    if (this.streamer.has(sessionID)) return false;
+    const targets = this.observeTargets();
+    if (!targets.length) return false;
+    const session = await this.oc.getSession(sessionID).catch(() => undefined);
+    if (!session) return false;
+    const telegram = this.store.locate(sessionID);
+    const discord = this.store.locateDiscord(sessionID);
+    const bound = Boolean(telegram.chatId || telegram.threadId || discord.chatId || discord.threadId);
+    const target = pickObserveTarget({ bound, parent: Boolean(session.parentID), hasStream: false }, targets);
+    if (!target) return false;
+    const model = await this.modelLabel(sessionID);
+    if (!(await this.observer.begin(sessionID, target, model, session.title))) return false;
+    this.observeCost.set(sessionID, Number(session.cost ?? 0));
+    this.store.observeAdd(target.key, sessionID);
+    log.info(`observing ${sessionID.slice(0, 16)} → ${target.key}`);
+    return true;
+  }
+
+  /** Final observation card: duration/tok/s/context from the same stats as a normal turn. */
+  private async finishObservation(
+    sessionID: string,
+    event: OcEvent,
+  ): Promise<boolean> {
+    if (!this.observer.has(sessionID)) return false;
+    const elapsed = this.observer.elapsedMs(sessionID);
+    const stats = await this.turnStats(sessionID, elapsed);
+    const total = Number((await this.oc.getSession(sessionID).catch(() => undefined))?.cost ?? 0);
+    const base = this.observeCost.get(sessionID) ?? total;
+    this.observeCost.delete(sessionID);
+    await this.observer.end(sessionID, {
+      ok: event.type === "session.execution.succeeded",
+      durationMs: stats.duration,
+      tps: stats.tps,
+      contextTokens: stats.contextTokens,
+      costUsd: Math.max(0, total - base),
+    });
+    this.store.observeRemove(sessionID);
+    log.info(
+      `observe ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)} ` +
+        `(${Math.round((stats.duration ?? elapsed ?? 0) / 1000)}s)`,
+    );
+    return true;
   }
 
   private async cmdSessions(ctx: Context): Promise<void> {
@@ -573,7 +729,9 @@ export class Bridge {
       await ctx.reply("Нет активной сессии.");
       return;
     }
+    this.options.stops?.markUser(sessionID);
     const result = await this.oc.interrupt(sessionID);
+    if (!result.interrupted) this.options.stops?.clear(sessionID);
     this.admitted.delete(sessionID);
     await ctx.reply(result.interrupted ? "⏹ Остановлено." : "Нечего останавливать.");
   }
@@ -1010,6 +1168,7 @@ export class Bridge {
         return;
       }
       await this.oc.replyPermission(pending.sessionID, pending.requestID, decision as "once" | "always" | "reject");
+      if (decision === "reject") this.streamer.blockedTool(pending.sessionID);
       this.pending.delete(key!);
       const label = decision === "reject" ? "⛔️ Отклонено" : decision === "always" ? "♾ Разрешено всегда" : "✅ Разрешено";
       await ctx.editMessageText(label).catch(() => undefined);
@@ -1044,6 +1203,7 @@ export class Bridge {
       case "session.text.started":
         this.admitted.delete(sessionID);
         if (event.type === "session.execution.started") {
+          this.options.stops?.clear(sessionID);
           const meta = await this.sessionMeta(sessionID);
           if (meta.parentID) {
             const agent = meta.agent || "subagent";
@@ -1061,10 +1221,10 @@ export class Bridge {
           this.streamer.setModel(sessionID, await this.modelLabel(sessionID, true));
           await this.markTitle(sessionID, "start");
         }
-        await this.ensureStream(sessionID);
+        if (!(await this.maybeObserve(sessionID))) await this.ensureStream(sessionID);
         break;
       case "session.text.delta": {
-        if (!this.streamer.has(sessionID)) await this.ensureStream(sessionID);
+        if (!this.streamer.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID);
         this.streamer.append(sessionID, String(event.data.delta ?? ""));
         break;
       }
@@ -1075,6 +1235,7 @@ export class Bridge {
       }
       case "session.tool.called": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
+        this.observer.toolCalled(sessionID);
         this.streamer.toolCalled(sessionID, callID, String(event.data.name ?? "tool"), event.data.input);
         break;
       }
@@ -1082,6 +1243,9 @@ export class Bridge {
       case "session.tool.failed": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
         this.streamer.toolFinished(sessionID, callID, event.type === "session.tool.success");
+        if (event.type === "session.tool.failed" && isBlockedToolFailure(event.data.error ?? event.data)) {
+          this.streamer.blockedTool(sessionID);
+        }
         if (event.type === "session.tool.success") void this.relayAgentFiles(sessionID);
         break;
       }
@@ -1097,27 +1261,32 @@ export class Bridge {
           log.info(`subagent ${child.agent} finished ${sessionID.slice(0, 16)}`);
           break;
         }
-        if (!this.streamer.has(sessionID)) break;
         this.admitted.delete(sessionID);
+        if (await this.finishObservation(sessionID, event)) break;
+        if (!this.streamer.has(sessionID)) break;
         const elapsed = this.streamer.elapsedMs(sessionID);
-        const status =
-          event.type === "session.execution.interrupted"
-            ? "⏹ остановлено"
-            : event.type === "session.execution.failed"
-              ? "⚠️ ошибка"
-              : "";
-        const stats = status ? { duration: elapsed, tps: undefined } : await this.turnStats(sessionID, elapsed);
+        const type = event.type.replace("session.execution.", "");
+        const reason = turnReason({
+          type,
+          data: event.data,
+          stop: this.options.stops?.get(sessionID),
+        });
+        const stats = await this.turnStats(sessionID, elapsed);
         const resolved = sanitizeModelName(await resolveModelLabel(this.oc, sessionID, true));
         const model = resolved === UNKNOWN_MODEL ? this.streamer.modelOf(sessionID) : resolved;
-        const parts: string[] = [model];
-        if (status) parts.push(status);
-        if (stats.duration) parts.push(`⏱ ${formatDuration(stats.duration)}`);
-        if (stats.tps) parts.push(`⚡ ${stats.tps.toFixed(1)} tok/s`);
-        if (stats.contextTokens) parts.push(`🧠 ${formatTokens(stats.contextTokens)}`);
-        await this.streamer.end(sessionID, parts.join(" · "));
+        const blocked = this.streamer.blockedOf(sessionID);
+        const footer = composeTurnFooter({
+          reason,
+          blockedTools: blocked,
+          model,
+          durationMs: stats.duration ?? elapsed,
+          tps: stats.tps,
+          contextTokens: stats.contextTokens,
+        });
+        await this.streamer.end(sessionID, footer);
         await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
-        log.info(`turn ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)}`);
+        log.info(`turn ${type} ${sessionID.slice(0, 16)}: ${reason ?? "ok"}${blocked ? ` · blocked=${blocked}` : ""}`);
         break;
       }
       case "permission.asked":
@@ -1138,6 +1307,7 @@ export class Bridge {
         this.sessionCache.delete(sessionID);
         const label = sanitizeModelName(await resolveModelLabel(this.oc, sessionID, true));
         this.streamer.setModel(sessionID, label);
+        this.observer.setModel(sessionID, label);
         log.info(`model selected ${sessionID.slice(0, 16)} → ${label}`);
         break;
       }
@@ -1168,7 +1338,7 @@ export class Bridge {
   }
 
   private async ensureStream(sessionID: string): Promise<void> {
-    if (this.streamer.has(sessionID)) return;
+    if (this.streamer.has(sessionID) || this.observer.has(sessionID)) return;
     // One fetch covers both checks: child sessions never get a block, and a
     // late event from a finished turn must not create an orphan placeholder
     // that stays at "thinking… 1s" forever.
@@ -1929,20 +2099,6 @@ export function telegramMediaItems(
   const mime = message.document?.mime_type ?? "image/jpeg";
   const name = message.document?.file_name ?? `photo-${Date.now()}.jpg`;
   return [{ buffer, mime, name }];
-}
-
-function formatTokens(count: number): string {
-  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
-  if (count >= 1_000) return `${Math.round(count / 1_000)}k`;
-  return String(count);
-}
-
-function formatDuration(ms: number): string {
-  const total = Math.max(1, Math.round(ms / 1000));
-  if (total < 60) return `${total}s`;
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
 function argText(ctx: Context): string {  return typeof ctx.match === "string" ? ctx.match.trim() : "";

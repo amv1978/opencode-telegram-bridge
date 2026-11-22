@@ -35,6 +35,19 @@ export const COMMANDS = [
     ),
   new SlashCommandBuilder().setName("recent").setDescription("Недавние сессии, 🔔 = не прочитано"),
   new SlashCommandBuilder().setName("budget").setDescription("Лимиты стоимости и расход за день"),
+  new SlashCommandBuilder()
+    .setName("observe")
+    .setDescription("Зеркало запусков из Desktop/TUI в этот канал")
+    .addStringOption((option) =>
+      option
+        .setName("action")
+        .setDescription("Без аргумента — переключить")
+        .addChoices(
+          { name: "on", value: "on" },
+          { name: "off", value: "off" },
+          { name: "status", value: "status" },
+        ),
+    ),
   new SlashCommandBuilder().setName("fmt").setDescription("Проверка форматирования Discord"),
 ].map((command) => command.toJSON());
 

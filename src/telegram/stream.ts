@@ -57,6 +57,8 @@ interface State {
   startedAt: number;
   lastEditAt: number;
   flushing: boolean;
+  /** Tool calls refused by a permission rule during this turn. */
+  blocked: number;
   /** In-flight flush, so `end()` cannot be skipped by a slow edit. */
   flushPromise?: Promise<void>;
   finished: boolean;
@@ -117,6 +119,7 @@ export class Streamer {
       startedAt: Date.now(),
       lastEditAt: 0,
       flushing: false,
+      blocked: 0,
       finished: false,
     };
     this.models.set(sessionID, state.model);
@@ -154,6 +157,17 @@ export class Streamer {
     if (!state || !text) return;
     state.text = text;
     this.schedule(state);
+  }
+
+  /** `session.tool.failed` for a permission/policy refusal. */
+  blockedTool(sessionID: string): void {
+    const state = this.states.get(sessionID);
+    if (!state) return;
+    state.blocked += 1;
+  }
+
+  blockedOf(sessionID: string): number {
+    return this.states.get(sessionID)?.blocked ?? 0;
   }
 
   /** `session.tool.called`: remember the tool for the live status block. */
@@ -326,7 +340,7 @@ export class Streamer {
   private composeParts(state: State, footer?: string, html = false): { body: string; tail: string } {
     const status = state.finished && !state.awaiting ? "" : this.statusBlock(state, html);
     const line = footer ?? state.footer;
-    const stats = line ? (html ? `<i>${line}</i>` : `_${line}_`) : "";
+    const stats = line ? (html ? footerHtml(line) : footerMarkdown(line)) : "";
     return {
       body: html ? (state.text.trim() ? markdownToHtml(state.text.trim()) : "") : state.text.trim(),
       tail: [status, stats].filter(Boolean).join("\n\n"),
@@ -561,9 +575,27 @@ export class Streamer {
   }
 }
 
+/** Footer lines are italic one by one: a two-line footer stays valid markdown. */
+function footerMarkdown(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => (/[*_~`\\]/.test(line) ? line : `_${line}_`))
+    .join("\n");
+}
+
+function footerHtml(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => `<i>${line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</i>`)
+    .join("\n");
+}
+
 /** `42s`, `1m 23s` — same shape as the stats footer. */
-export function formatElapsed(ms: number): string {
-  const total = Math.max(1, Math.round(ms / 1000));
+export function formatElapsed(ms: number): string {  const total = Math.max(1, Math.round(ms / 1000));
   if (total < 60) return `${total}s`;
   const minutes = Math.floor(total / 60);
   const seconds = total % 60;

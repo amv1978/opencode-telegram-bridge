@@ -31,9 +31,23 @@ export interface State {
   prevVersion?: string;
   /** Cost spent today (UTC) for the budget tracker, survives restarts. */
   budget?: { day: string; spentUsd: number };
+  /**
+   * `/observe`: target key (`tg:<chatId>:<threadId|0>` / `dc:<channelId>`) →
+   * sessions mirrored into that chat. An empty array means "enabled, nothing
+   * running yet".
+   */
+  observe?: Record<string, string[]>;
 }
 
-const emptyState = (): State => ({ topics: {}, chats: {}, sessions: {}, discordThreads: {}, discordChannels: {}, discordSessions: {} });
+const emptyState = (): State => ({
+  topics: {},
+  chats: {},
+  sessions: {},
+  discordThreads: {},
+  discordChannels: {},
+  discordSessions: {},
+  observe: {},
+});
 
 export class Store {
   private data: State;
@@ -51,6 +65,7 @@ export class Store {
       discordThreads: parsed.discordThreads ?? {},
       discordChannels: parsed.discordChannels ?? {},
       discordSessions: parsed.discordSessions ?? {},
+      observe: normalizeObserve(parsed.observe),
     };
   }
 
@@ -229,6 +244,57 @@ export class Store {
     this.save();
   }
 
+  // --------------------------------------------------------------- observe
+
+  /** Every enabled target, including ones with no active session yet. */
+  observeKeys(): string[] {
+    return Object.keys(this.data.observe ?? {});
+  }
+
+  observeEnabled(key: string): boolean {
+    return Object.prototype.hasOwnProperty.call(this.data.observe ?? {}, key);
+  }
+
+  observeFor(key: string): string[] {
+    return [...(this.data.observe?.[key] ?? [])];
+  }
+
+  observeEnable(key: string): void {
+    this.data.observe ??= {};
+    this.data.observe[key] ??= [];
+    this.save();
+  }
+
+  observeAdd(key: string, sessionID: string): void {
+    this.data.observe ??= {};
+    const current = this.data.observe[key] ?? [];
+    if (!current.includes(sessionID)) current.push(sessionID);
+    this.data.observe[key] = current;
+    this.save();
+  }
+
+  /** Removes the session from every target; enabled flags stay in place. */
+  observeRemove(sessionID: string): void {
+    const observe = this.data.observe;
+    if (!observe) return;
+    let changed = false;
+    for (const [key, sessions] of Object.entries(observe)) {
+      const next = sessions.filter((id) => id !== sessionID);
+      if (next.length !== sessions.length) {
+        observe[key] = next;
+        changed = true;
+      }
+    }
+    if (changed) this.save();
+  }
+
+  observeClear(key: string): void {
+    if (this.data.observe && key in this.data.observe) {
+      delete this.data.observe[key];
+      this.save();
+    }
+  }
+
   /** Flush immediately: the process is about to be replaced by the updater. */
   saveNow(): void {
     if (this.timer) clearTimeout(this.timer);
@@ -263,4 +329,19 @@ export class Store {
     }, 150);
     this.timer.unref?.();
   }
+}
+
+/** Tolerates old/hand-edited state: strings, arrays, junk entries. */
+function normalizeObserve(value: unknown): Record<string, string[]> {
+  if (!value || typeof value !== "object") return {};
+  const result: Record<string, string[]> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry === "string" && entry.trim()) {
+      result[key] = [entry.trim()];
+      continue;
+    }
+    if (!Array.isArray(entry)) continue;
+    result[key] = [...new Set(entry.map((item) => String(item).trim()).filter(Boolean))];
+  }
+  return result;
 }

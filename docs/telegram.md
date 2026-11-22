@@ -57,6 +57,7 @@ deleted, the binding is cleared and the final answer goes to the chat root.
 | `/mode [ask\|auto\|plan]` | Show or change the session permission mode |
 | `/recent` | Recent sessions with a `🔔` unread marker; a button reattaches |
 | `/budget` | Cost caps, today's spend and a hint how to change them |
+| `/observe [on\|off\|status]` | Mirror runs started in Desktop/TUI into this chat/topic |
 | `/stop` | Interrupt the current turn |
 | `/fmt` | Rich-markup check |
 
@@ -133,16 +134,50 @@ While a turn runs, a live block is shown above the answer:
   with the block. A `session.synthetic` child report is posted to the chat as a
   quote `> 🧩 <agent>: …` (first ~300 characters). Disabled by
   `showSubagents: false`.
-- When the turn ends the block disappears and a single italic line remains under the
-  answer after a blank line:
+- When the turn ends the block disappears and one or two lines remain under the
+  answer after a blank line. A successful turn keeps only the stats line:
 
 ```
-_DeepSeek V4.1 Flash · ⏱ 1m 23s · ⚡ 197.8 tok/s · 🧠 531k_
+DeepSeek V4.1 Flash · ⏱ 1m 23s · ⚡ 197.8 tok/s · 🧠 531k
 ```
 
-For `interrupted`/`failed`: `_… · ⏹ interrupted · ⏱ 42s_` /
-`_… · ⚠️ error · ⏱ 42s_`. Numbers use the same OpenCode formula (duration, tok/s,
-context) and do not change.
+### Honest stop footer
+
+An abnormal end never looks like success: the reason is its own line, the stats
+line stays last. Blocked tool calls are counted when present.
+
+| End | Line |
+|---|---|
+| `/stop` | `⚠️ остановлено: /stop` |
+| budget stop (`action: "stop"`) | `⛔ бюджет: $0.4210 из $1.00` |
+| step/turn cap | `⚠️ лимит шагов` |
+| `execution.failed` | `⚠️ ошибка: <short reason>` |
+
+```
+⚠️ остановлено: /stop · 2 инструмента заблокировано
+DeepSeek V4.1 Flash · ⏱ 42s · 🧠 531k
+```
+
+The same reason string is written to `bridge.log`. Telegram and Discord render
+identical text; blocked calls come from declined permissions and policy denials,
+not from ordinary tool errors.
+
+### `/observe` — foreign runs
+
+`/observe` in a chat or topic turns on observation of sessions started outside the
+bridge (Desktop/TUI). A run without a topic/chat binding is mirrored as one compact
+card edited in place:
+
+```
+👀 Fix login · DeepSeek V4.1 Flash
+⏱ 12s · 🛠 3
+```
+
+When it ends the card becomes the final one with `✅`/`⚠️`, duration, tok/s, context
+and the cost of the run. Sessions already bound to a topic/thread are never
+duplicated; a session with an active stream is skipped. The opt-in flag and the
+observed session ids live in `state.json` (`observe`). `/observe status` lists them,
+`/observe off` stops and clears; without an argument the command toggles.
 
 ### Title status
 
@@ -202,6 +237,11 @@ To keep that message from going back into the model, the text is remembered for
 
 - Photos and documents up to **20 MB** (Bot API download limit) go into the session
   as a data URI; the caption becomes the task text.
+- Files produced by the agent (`message` parts `type:"file"` and `tool.state.content`
+  file parts) are delivered as native media: images ≤ `maxPhotoMb` (10 MB) as
+  `sendPhoto`, everything else up to 50 MB as `sendDocument`; the caption is the
+  file name. Larger files become a link/path. Delivery is thread-aware and reuses
+  the relay hash cache, so both transports never send the same file twice.
 - Voice and audio (OGG/Opus, MPEG, WAV, MP4, WebM) are recognised locally, see
   [voice.md](voice.md). The transcript arrives as a rich message styled like
   mirrored messages: quote `> 💠 **Transcript · voice**`, text line by line and the

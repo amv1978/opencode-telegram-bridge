@@ -65,6 +65,8 @@ export interface BudgetTrackerOptions {
   /** Cumulative session cost in USD. */
   costOf: (sessionID: string) => Promise<number | undefined>;
   interrupt: (sessionID: string) => Promise<void>;
+  /** Budget stopped a turn: the footer says `⛔ бюджет: $X из $Y`. */
+  onStop?: (sessionID: string, detail: { spentUsd: number; limitUsd: number }) => void;
   /** Sends a budget notice to the chat bound to the session. */
   notify: (sessionID: string, text: string) => Promise<void>;
   load?: () => { day?: string; spentUsd?: number } | undefined;
@@ -151,6 +153,8 @@ export class BudgetTracker {
     const spent = Math.max(0, turn.lastUsd - turn.baseUsd);
     const notices: string[] = [];
     let stop = false;
+    let stopSpent = 0;
+    let stopLimit = 0;
 
     const turnLevel = budgetLevel(spent, cfg.perTurnUsd);
     if (turnLevel !== "ok" && (final || !turn.stopped)) {
@@ -163,6 +167,8 @@ export class BudgetTracker {
       if (turnLevel === "over") {
         if (action === "stop") {
           stop = true;
+          stopSpent = spent;
+          stopLimit = cfg.perTurnUsd ?? 0;
           turn.stopped = true;
           notices.push(`⛔️ Бюджет хода превышен: ${formatUsd(spent)} из ${formatUsd(cfg.perTurnUsd ?? 0)}. Ход остановлен.`);
         } else if (!turn.stopped) {
@@ -180,6 +186,10 @@ export class BudgetTracker {
     if (dayLevel === "over") {
       if (action === "stop") {
         stop = true;
+        if (!stopLimit) {
+          stopSpent = this.spentUsd;
+          stopLimit = cfg.dailyUsd ?? 0;
+        }
         notices.push(`⛔️ Дневной бюджет исчерпан: ${formatUsd(this.spentUsd)} из ${formatUsd(cfg.dailyUsd ?? 0)}. Ход остановлен.`);
       } else if (!this.dailyWarned) {
         this.dailyWarned = true;
@@ -190,7 +200,10 @@ export class BudgetTracker {
     for (const text of new Set(notices)) {
       await this.options.notify(sessionID, text).catch(() => undefined);
     }
-    if (stop) await this.options.interrupt(sessionID).catch(() => undefined);
+    if (stop) {
+      this.options.onStop?.(sessionID, { spentUsd: stopSpent, limitUsd: stopLimit });
+      await this.options.interrupt(sessionID).catch(() => undefined);
+    }
   }
 
   private rollDay(): void {

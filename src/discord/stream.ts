@@ -74,6 +74,8 @@ interface State {
   lastEditAt: number;
   lastTickLogAt?: number;
   flushing: boolean;
+  /** Tool calls refused by a permission rule during this turn. */
+  blocked: number;
   /** In-flight flush, so `end()` cannot be skipped by a slow edit. */
   flushPromise?: Promise<void>;
   finished: boolean;
@@ -129,6 +131,7 @@ export class DiscordStreamer {
       startedAt: Date.now(),
       lastEditAt: 0,
       flushing: false,
+      blocked: 0,
       finished: false,
     };
     this.models.set(sessionID, state.model);
@@ -179,6 +182,17 @@ export class DiscordStreamer {
     if (!state || !text) return;
     state.text = text;
     this.schedule(state);
+  }
+
+  /** `session.tool.failed` for a permission/policy refusal. */
+  blockedTool(sessionID: string): void {
+    const state = this.states.get(sessionID);
+    if (!state) return;
+    state.blocked += 1;
+  }
+
+  blockedOf(sessionID: string): number {
+    return this.states.get(sessionID)?.blocked ?? 0;
   }
 
   /** `session.tool.called`: remember the tool for the live status block. */

@@ -16,7 +16,7 @@ sessions**; no OpenCode plugin is required.
 - **Discord adapter**: public threads (**thread = session**), the same sessions,
   both transports can run at once.
 - **Slash commands** on both transports: `/help`, `/new`, `/sessions`, `/attach`,
-  `/detach`, `/stop`, `/status`, `/model`, `/agent`, `/fmt`.
+  `/detach`, `/stop`, `/status`, `/model`, `/agent`, `/observe`, `/fmt`.
 - **Permission buttons**: Allow / Always / Deny (Telegram and Discord).
 - **Forms and choices**: OpenCode questions (`form.created`) arrive as option
   buttons, multi-select toggles and select menus/modals; answers are posted back to
@@ -32,6 +32,15 @@ sessions**; no OpenCode plugin is required.
 - **Title status**: the topic/thread is marked `⏳` while a turn runs, `✅` when it
   finishes and restored afterwards (rate-limit aware); the live block has a tool
   spinner and animated `thinking.` dots.
+- **Honest end of turn**: an abnormal finish says why (`⚠️ остановлено: /stop`,
+  `⛔ бюджет: $X из $Y`, `⚠️ лимит шагов`, `⚠️ ошибка: …`) and counts blocked tool
+  calls; the stats line stays last. Same text in Telegram and Discord.
+- **`/observe`**: mirror runs started in Desktop/TUI into a chat/topic as a compact
+  live card, then a final `✅`/`⚠️` card with duration, tok/s, context and cost;
+  bound sessions are never duplicated.
+- **Agent artifacts**: files produced by the agent arrive as native media (Telegram
+  photo/document with the file name, Discord attachment) and are deduplicated by
+  the relay hash cache.
 - **Voice input**: OGG/Opus → ffmpeg → HEX, fully local, no cloud.
 - **Media relay** between all bound chats (Telegram topic/chat ↔ Discord
   thread/channel), including files produced by the agent; over platform limits the
@@ -55,9 +64,9 @@ sessions**; no OpenCode plugin is required.
 
 ### Installer (Windows 10/11)
 
-1. Run `ocbridge-setup-standalone-0.7.1.exe` (offline) or `ocbridge-setup-lite-0.7.1.exe`
+1. Run `ocbridge-setup-standalone-0.7.2.exe` (offline) or `ocbridge-setup-lite-0.7.2.exe`
    (downloads the portable bundle, ~2 MB). The portable layout is also available
-   as `ocbridge-bundle-0.7.1.zip`.
+   as `ocbridge-bundle-0.7.2.zip`.
 2. Paste the bot token from [@BotFather](https://t.me/BotFather) - you may skip this
    and set it later in the panel `http://127.0.0.1:7788`.
 3. Send `/start` to the bot — the first user becomes administrator.

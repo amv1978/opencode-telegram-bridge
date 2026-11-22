@@ -35,8 +35,17 @@ import {
   type MediaRelay,
   type MediaSendLimits,
 } from "../media/relay.ts";
-import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFromText, formatDuration, formatTokens, toDiscordMarkdown } from "./render.ts";
+import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFromText, toDiscordMarkdown } from "./render.ts";
 import { modelLabel, turnStats } from "./stats.ts";
+import {
+  ObservationCards,
+  discordObserveKey,
+  parseObserveKey,
+  pickObserveTarget,
+  type ObserveBinding,
+} from "../observe.ts";
+import type { StopRegistry } from "../stops.ts";
+import { composeTurnFooter, isBlockedToolFailure, turnReason } from "../turn.ts";
 import { catalogFor } from "../model.ts";
 import { DiscordStreamer, resolveSendable } from "./stream.ts";
 import { isPermissionMode, MODE_SUMMARY, modeOf, rulesForMode } from "../permissions.ts";
@@ -131,6 +140,7 @@ export interface DiscordOptions {
   onStateChange?: (state: DiscordState, error: string) => void;
   relay?: MediaRelay;
   budget?: () => BudgetSnapshot | undefined;
+  stops?: StopRegistry;
 }
 
 /**
@@ -152,6 +162,10 @@ export class DiscordBridge {
   private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
   /** Last agent-files scan per session, so tool.success + turn end don't double-fetch. */
   private readonly agentFilesAt = new Map<string, number>();
+  /** `/observe` cards for foreign (Desktop/TUI) sessions. */
+  private readonly observer: ObservationCards;
+  /** Cumulative session cost at observation start, for the final card. */
+  private readonly observeCost = new Map<string, number>();
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempt = 0;
   private eventChain: Promise<void> = Promise.resolve();
@@ -167,7 +181,28 @@ export class DiscordBridge {
     private readonly oc: OcClient,
     private readonly store: Store,
     private readonly options: DiscordOptions = {},
-  ) {}
+  ) {
+    this.observer = new ObservationCards({
+      intervalMs: 2500,
+      log: (message) => log.warn(message),
+      transport: {
+        send: async (target, text) => {
+          const channelId = target.channelId;
+          const channel = channelId && this.client ? await resolveSendable(this.client, channelId) : undefined;
+          if (!channel) return undefined;
+          const message = await channel.send({ content: text, allowedMentions: { parse: [] } });
+          return message.id;
+        },
+        edit: async (target, messageId, text) => {
+          const channelId = target.channelId;
+          const channel = channelId && this.client ? await resolveSendable(this.client, channelId) : undefined;
+          if (!channel) return;
+          const message = await channel.messages.fetch(messageId);
+          await message.edit({ content: text, allowedMentions: { parse: [] } });
+        },
+      },
+    });
+  }
 
   get status(): { state: DiscordState; error: string; username: string; retryAt: number; attempt: number } {
     return { state: this.state, error: this.error, username: this.username, retryAt: this.retryAt, attempt: this.attempt };
@@ -277,6 +312,7 @@ export class DiscordBridge {
     this.titles.clear();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    await this.observer.shutdown();
     await this.streamer?.shutdown().catch(() => undefined);
     this.streamer = undefined;
     await this.client?.destroy().catch((error) => log.warn("discord stop:", (error as Error).message));
@@ -556,6 +592,8 @@ export class DiscordBridge {
         return this.cmdRecent(interaction);
       case "budget":
         return this.cmdBudget(interaction);
+      case "observe":
+        return this.cmdObserve(interaction);
       case "fmt":
         return this.cmdFmt(interaction);
       default:
@@ -582,6 +620,7 @@ export class DiscordBridge {
         "`/mode [ask|auto|plan]` — режим разрешений",
         "`/recent` — недавние сессии (🔔 = не прочитано)",
         "`/budget` — лимиты стоимости и расход за день",
+        "`/observe [on|off|status]` — зеркало внешних запусков",
         "`/fmt` — проверка форматирования",
         "",
         "🎤 Голосовые распознаются локально через HEX.",
@@ -683,7 +722,9 @@ export class DiscordBridge {
       await interaction.editReply({ content: "Нет активной сессии." });
       return;
     }
+    this.options.stops?.markUser(sessionID);
     const result = await this.oc.interrupt(sessionID);
+    if (!result.interrupted) this.options.stops?.clear(sessionID);
     await interaction.editReply({ content: result.interrupted ? "⏹ Остановлено." : "Нечего останавливать." });
   }
 
@@ -811,6 +852,112 @@ export class DiscordBridge {
     await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
   }
 
+  private async cmdObserve(interaction: ChatInputCommandInteraction): Promise<void> {
+    const binding = this.observeBinding(interaction);
+    if (!binding) {
+      await interaction.editReply({ content: "Не понимаю, какой канал наблюдать." });
+      return;
+    }
+    const arg = (interaction.options.getString("action") ?? "").trim().toLowerCase();
+    const enabled = this.store.observeEnabled(binding.key);
+    if (arg === "on" || (!arg && !enabled)) {
+      this.store.observeEnable(binding.key);
+      await interaction.editReply({
+        content:
+          "👀 **Наблюдение включено**\n" +
+          "Запуски сессий из Desktop/TUI появятся здесь компактной карточкой. " +
+          "Сессии, привязанные к треду/каналу, не дублируются.\n" +
+          "Выключить: `/observe action:off` · статус: `/observe action:status`",
+        allowedMentions: { parse: [] },
+      });
+      log.info(`discord observe enabled for ${binding.key}`);
+      return;
+    }
+    if (arg === "off" || (!arg && enabled)) {
+      this.store.observeClear(binding.key);
+      await this.observer.cancelKey(binding.key);
+      await interaction.editReply({ content: "⏹ Наблюдение выключено." });
+      log.info(`discord observe disabled for ${binding.key}`);
+      return;
+    }
+    if (arg && arg !== "status") {
+      await interaction.editReply({ content: "Формат: `/observe action:on|off|status`" });
+      return;
+    }
+    if (!enabled) {
+      await interaction.editReply({ content: "👀 Наблюдение выключено. `/observe` — включить." });
+      return;
+    }
+    const sessions = this.store.observeFor(binding.key);
+    const live = new Map(this.observer.entries(binding.key).map((entry) => [entry.sessionID, entry]));
+    const lines = ["👀 **Наблюдение включено**"];
+    if (!sessions.length) lines.push("", "Активных внешних запусков нет — жду следующего.");
+    else {
+      lines.push("");
+      for (const sessionID of sessions) {
+        const title = live.get(sessionID)?.title || this.store.session[sessionID]?.title || sessionID.slice(0, 12);
+        lines.push(`· ${title} · \`${sessionID.slice(0, 16)}\``);
+      }
+    }
+    await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
+  }
+
+  private observeBinding(interaction: ChatInputCommandInteraction): ObserveBinding | undefined {
+    const channelId = interaction.channelId;
+    if (!channelId) return undefined;
+    return { key: discordObserveKey(channelId), platform: "discord", channelId };
+  }
+
+  private observeTargets(): ObserveBinding[] {
+    return this.store
+      .observeKeys()
+      .map((key) => parseObserveKey(key))
+      .filter((binding): binding is ObserveBinding => binding?.platform === "discord");
+  }
+
+  /** Starts a card for a run without a thread/channel binding; never duplicates one. */
+  private async maybeObserve(sessionID: string): Promise<boolean> {
+    if (this.observer.has(sessionID)) return true;
+    if (this.streamer?.has(sessionID)) return false;
+    const targets = this.observeTargets();
+    if (!targets.length) return false;
+    const session = await this.oc.getSession(sessionID).catch(() => undefined);
+    if (!session) return false;
+    const telegram = this.store.locate(sessionID);
+    const discord = this.store.locateDiscord(sessionID);
+    const bound = Boolean(telegram.chatId || telegram.threadId || discord.chatId || discord.threadId);
+    const target = pickObserveTarget({ bound, parent: Boolean(session.parentID), hasStream: false }, targets);
+    if (!target) return false;
+    const model = await modelLabel(this.oc, sessionID);
+    if (!(await this.observer.begin(sessionID, target, model, session.title))) return false;
+    this.observeCost.set(sessionID, Number(session.cost ?? 0));
+    this.store.observeAdd(target.key, sessionID);
+    log.info(`discord observing ${sessionID.slice(0, 16)} → ${target.key}`);
+    return true;
+  }
+
+  private async finishObservation(sessionID: string, event: OcEvent): Promise<boolean> {
+    if (!this.observer.has(sessionID)) return false;
+    const elapsed = this.observer.elapsedMs(sessionID);
+    const stats = await turnStats(this.oc, sessionID, elapsed);
+    const total = Number((await this.oc.getSession(sessionID).catch(() => undefined))?.cost ?? 0);
+    const base = this.observeCost.get(sessionID) ?? total;
+    this.observeCost.delete(sessionID);
+    await this.observer.end(sessionID, {
+      ok: event.type === "session.execution.succeeded",
+      durationMs: stats.duration,
+      tps: stats.tps,
+      contextTokens: stats.contextTokens,
+      costUsd: Math.max(0, total - base),
+    });
+    this.store.observeRemove(sessionID);
+    log.info(
+      `discord observe ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)} ` +
+        `(${Math.round((stats.duration ?? elapsed ?? 0) / 1000)}s)`,
+    );
+    return true;
+  }
+
   private async cmdFmt(interaction: ChatInputCommandInteraction): Promise<void> {    await interaction.editReply({
       content: [
         "# Проверка разметки",
@@ -858,6 +1005,7 @@ export class DiscordBridge {
         await this.mirrorUserMessage(sessionID, event.data.item);
         break;
       case "session.execution.started": {
+        this.options.stops?.clear(sessionID);
         const meta = await this.sessionMeta(sessionID);
         if (meta.parentID) {
           const agent = meta.agent || "subagent";
@@ -868,15 +1016,17 @@ export class DiscordBridge {
           }
           break;
         }
-        await this.ensureStream(sessionID);
-        this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
-        await this.markTitle(sessionID, "start");
+        if (!(await this.maybeObserve(sessionID))) {
+          await this.ensureStream(sessionID);
+          this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
+          await this.markTitle(sessionID, "start");
+        }
         break;
       }      case "session.text.started":
         await this.ensureStream(sessionID);
         break;
       case "session.text.delta": {
-        if (!this.streamer?.has(sessionID)) await this.ensureStream(sessionID);
+        if (!this.streamer?.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID);
         this.streamer?.append(sessionID, String(event.data.delta ?? ""));
         break;
       }
@@ -887,6 +1037,7 @@ export class DiscordBridge {
       }
       case "session.tool.called": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
+        this.observer.toolCalled(sessionID);
         this.streamer?.toolCalled(sessionID, callID, String(event.data.name ?? "tool"), event.data.input);
         break;
       }
@@ -894,6 +1045,9 @@ export class DiscordBridge {
       case "session.tool.failed": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
         this.streamer?.toolFinished(sessionID, callID, event.type === "session.tool.success");
+        if (event.type === "session.tool.failed" && isBlockedToolFailure(event.data.error ?? event.data)) {
+          this.streamer?.blockedTool(sessionID);
+        }
         if (event.type === "session.tool.success") void this.relayAgentFiles(sessionID);
         break;
       }
@@ -909,27 +1063,33 @@ export class DiscordBridge {
           log.info(`discord subagent ${child.agent} finished ${sessionID.slice(0, 16)}`);
           break;
         }
+        if (await this.finishObservation(sessionID, event)) break;
         if (!this.streamer?.has(sessionID)) break;
         const elapsed = this.streamer.elapsedMs(sessionID);
-        const status =
-          event.type === "session.execution.interrupted"
-            ? "⏹ остановлено"
-            : event.type === "session.execution.failed"
-              ? "⚠️ ошибка"
-              : "";
-        const stats = status
-          ? { duration: elapsed, tps: undefined, contextTokens: undefined, model: await modelLabel(this.oc, sessionID) }
-          : await turnStats(this.oc, sessionID, elapsed);
-        // One italic line: model · duration · tok/s · context.
-        const parts: string[] = [stats.model || this.streamer.modelOf(sessionID)];
-        if (status) parts.push(status);
-        if (stats.duration) parts.push(`⏱ ${formatDuration(stats.duration)}`);
-        if (stats.tps) parts.push(`⚡ ${stats.tps.toFixed(1)} tok/s`);
-        if (stats.contextTokens) parts.push(`🧠 ${formatTokens(stats.contextTokens)}`);
-        await this.streamer.end(sessionID, italicLine(parts.join(" · ")) || undefined);
+        const type = event.type.replace("session.execution.", "");
+        const reason = turnReason({
+          type,
+          data: event.data,
+          stop: this.options.stops?.get(sessionID),
+        });
+        const stats = await turnStats(this.oc, sessionID, elapsed);
+        const model = stats.model || this.streamer.modelOf(sessionID);
+        const blocked = this.streamer.blockedOf(sessionID);
+        const footer = composeTurnFooter({
+          reason,
+          blockedTools: blocked,
+          model,
+          durationMs: stats.duration ?? elapsed,
+          tps: stats.tps,
+          contextTokens: stats.contextTokens,
+        });
+        const [reasonLine, statsLine] = footer.split("\n");
+        const formatted =
+          reasonLine && statsLine ? `${reasonLine}\n${italicLine(statsLine)}` : italicLine(footer) || footer;
+        await this.streamer.end(sessionID, formatted || undefined);
         await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
-        log.info(`discord turn ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)}`);
+        log.info(`discord turn ${type} ${sessionID.slice(0, 16)}: ${reason ?? "ok"}${blocked ? ` · blocked=${blocked}` : ""}`);
         break;
       }
       case "permission.asked":
@@ -946,7 +1106,9 @@ export class DiscordBridge {
         break;
       case "session.model.selected": {
         catalogFor(this.oc).forget(sessionID);
-        this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
+        const label = await modelLabel(this.oc, sessionID);
+        this.streamer?.setModel(sessionID, label);
+        this.observer.setModel(sessionID, label);
         break;
       }
       case "session.renamed": {
@@ -973,7 +1135,7 @@ export class DiscordBridge {
   }
 
   private async ensureStream(sessionID: string): Promise<void> {
-    if (this.streamer?.has(sessionID)) return;
+    if (this.streamer?.has(sessionID) || this.observer.has(sessionID)) return;
     // Same guard as Telegram: late events from a finished turn must not create
     // an orphan placeholder that never receives the final answer.
     const session = await this.oc.getSession(sessionID).catch(() => undefined);
@@ -1057,6 +1219,7 @@ export class DiscordBridge {
 
     try {
       await this.oc.replyPermission(pending.sessionID, pending.requestID, decision as "once" | "always" | "reject");
+      if (decision === "reject") this.streamer?.blockedTool(pending.sessionID);
       this.pending.delete(key!);
       const label = decision === "reject" ? "⛔️ Отклонено" : decision === "always" ? "♾ Разрешено всегда" : "✅ Разрешено";
       await interaction.update({ content: label, components: [] });

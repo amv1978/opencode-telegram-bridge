@@ -383,7 +383,14 @@ export async function collectAgentFiles(oc: OcClient, sessionID: string): Promis
     log.warn("agent files: history unavailable:", (error as Error).message);
     return [];
   }
+  return agentFilesFromMessages(messages);
+}
 
+/**
+ * Pure extractor for tests and adapters: every `type: "file"` part and every
+ * `tool.state.content[]` file entry, newest messages first, deduplicated by URI.
+ */
+export function agentFilesFromMessages(messages: Array<{ type?: string; content?: unknown }>): MediaItem[] {
   const items: MediaItem[] = [];
   const seen = new Set<string>();
   const add = (part: Record<string, unknown>) => {
@@ -398,8 +405,8 @@ export async function collectAgentFiles(oc: OcClient, sessionID: string): Promis
 
   for (const message of messages) {
     if (message.type !== "assistant") continue;
-    for (const part of message.content ?? []) {
-      const value = part as unknown as Record<string, unknown>;
+    for (const part of (message.content ?? []) as unknown[]) {
+      const value = part as Record<string, unknown>;
       if (value.type === "file") add(value);
       if (value.type === "tool") {
         const state = value.state as { content?: unknown } | undefined;

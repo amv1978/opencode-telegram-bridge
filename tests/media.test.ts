@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listTargets, mediaFromPayload, MediaRelay, promptFilesFromMedia } from "../src/media/relay.ts";
+import { listTargets, mediaFromPayload, MediaRelay, promptFilesFromMedia, agentFilesFromMessages } from "../src/media/relay.ts";
 import { Store } from "../src/state/store.ts";
 
 const store = () => new Store(join(mkdtempSync(join(tmpdir(), "ocbridge-media-")), "state.json"));
@@ -61,6 +61,26 @@ describe("listTargets", () => {
     s.bindThread(7, "ses_b");
     const targets = listTargets(s, "ses_b", -555);
     expect(targets).toEqual([{ platform: "telegram", chatId: -555, threadId: 7 }]);
+  });
+});
+
+describe("agent files", () => {
+  test("collects message file parts and tool state content, deduped", () => {
+    const items = agentFilesFromMessages([
+      {
+        type: "assistant",
+        content: [
+          { type: "file", uri: "data:image/png;base64,AAA", name: "chart.png" },
+          { type: "tool", state: { content: [{ type: "file", uri: "https://example.com/report.pdf" }] } },
+        ],
+      },
+      {
+        type: "assistant",
+        content: [{ type: "file", uri: "data:image/png;base64,AAA", name: "chart-copy.png" }],
+      },
+      { type: "user", content: [{ type: "file", uri: "https://example.com/ignored.png" }] },
+    ]);
+    expect(items.map((item) => item.name)).toEqual(["chart.png", "report.pdf"]);
   });
 });
 

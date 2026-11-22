@@ -22,6 +22,7 @@ import { Updater, type UpdateCache } from "./updater.ts";
 import { changelogBetween } from "./changelog.ts";
 import { BudgetTracker, type BudgetSnapshot } from "./budget.ts";
 import { isPermissionMode } from "./permissions.ts";
+import { StopRegistry } from "./stops.ts";
 
 export type BotState = "stopped" | "starting" | "running" | "error";
 
@@ -105,6 +106,7 @@ export class App {
   private ocVersion = "";
   private ocUrl = "";
   private budget?: BudgetTracker;
+  private readonly stops = new StopRegistry();
   private budgetUnsub?: () => void;
   private budgetTimer?: ReturnType<typeof setInterval>;
   private budgetChain: Promise<void> = Promise.resolve();
@@ -232,6 +234,7 @@ export class App {
           fetch: this.net.fetch,
           relay: this.relay,
           budget: () => this.budgetSnapshot(),
+          stops: this.stops,
           onConfigChange: () => saveConfig(this.paths, this.cfg),
           onPollingError: (message) => {
             if (/409/.test(message)) {
@@ -281,6 +284,7 @@ export class App {
         await client.interrupt(sessionID);
         log.warn(`budget: interrupted ${sessionID.slice(0, 16)}`);
       },
+      onStop: (sessionID, detail) => this.stops.markBudget(sessionID, detail.spentUsd, detail.limitUsd),
       notify: (sessionID, text) => this.notifySession(sessionID, text),
       load: () => this.store.budgetState(),
       save: (state) => this.store.setBudgetState(state),
@@ -344,6 +348,7 @@ export class App {
     this.discord = new DiscordBridge(this.cfg, this.client, this.store, {
       relay: this.relay,
       budget: () => this.budgetSnapshot(),
+      stops: this.stops,
       onStateChange: (state, error) => {
         this.discordState = state;
         this.discordError = error;

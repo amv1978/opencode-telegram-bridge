@@ -37,6 +37,11 @@ are visible in the `/api/state` snapshot (`config.media`).
 | Discord | — | 10 MB |
 
 - An image within `maxPhotoMb` goes as a photo, larger — as a document.
+- Telegram captions are the file name; photo/document messages are posted into the
+  bound topic (`message_thread_id`). Discord attachments keep the file name.
+- Agent files (`message` parts `type:"file"`, `tool.state.content[]` file entries)
+  go to every bound chat as native media. A file already relayed from another
+  transport is skipped by the content-hash cache, so it is never uploaded twice.
 - If a file exceeds the platform limit (Telegram 50 MB, Discord 10 MB), a text link
   is sent instead: for `https://…` — the URL as is, for a local file — the absolute
   path.
