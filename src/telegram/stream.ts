@@ -319,24 +319,41 @@ export class Streamer {
     state.timer.unref?.();
   }
 
-  private composeMarkdown(state: State, footer?: string): string {
-    const parts: string[] = [];
-    const status = state.finished && !state.awaiting ? "" : this.statusBlock(state);
-    if (status) parts.push(status);
-    if (state.text.trim()) parts.push(state.text.trim());
+  /**
+   * Body + tail (`status` block, then the italic stats line). The status block
+   * lives *below* the answer; when the turn ends only the stats line remains.
+   */
+  private composeParts(state: State, footer?: string, html = false): { body: string; tail: string } {
+    const status = state.finished && !state.awaiting ? "" : this.statusBlock(state, html);
     const line = footer ?? state.footer;
-    if (line) parts.push(`_${line}_`);
-    return parts.join("\n\n") || PLACEHOLDER;
+    const stats = line ? (html ? `<i>${line}</i>` : `_${line}_`) : "";
+    return {
+      body: html ? (state.text.trim() ? markdownToHtml(state.text.trim()) : "") : state.text.trim(),
+      tail: [status, stats].filter(Boolean).join("\n\n"),
+    };
   }
 
-  private composeHtml(state: State, footer?: string): string {
-    const parts: string[] = [];
-    const status = state.finished && !state.awaiting ? "" : this.statusBlock(state, true);
-    if (status) parts.push(status);
-    if (state.text.trim()) parts.push(markdownToHtml(state.text));
-    const line = footer ?? state.footer;
-    if (line) parts.push(`<i>${line}</i>`);
-    return parts.join("\n\n") || PLACEHOLDER;
+  /** Full text for a single message (last-resort fallback). */
+  private composeMarkdown(state: State, footer?: string): string {
+    const { body, tail } = this.composeParts(state, footer);
+    return [body, tail].filter(Boolean).join("\n\n") || PLACEHOLDER;
+  }
+
+  /**
+   * Chunks of the answer with the status block + stats appended to the LAST
+   * chunk, so split answers never carry the live block in an earlier message.
+   */
+  private composeChunks(state: State, footer: string | undefined, html = false): string[] {
+    const { body, tail } = this.composeParts(state, footer, html);
+    if (!body) return tail ? [tail] : [PLACEHOLDER];
+    const limit = html ? 3800 : 30_000;
+    const reserve = tail ? tail.length + 2 : 0;
+    const chunks = html
+      ? splitHtml(body, Math.max(500, limit - reserve))
+      : splitMarkdown(body, Math.max(1000, limit - reserve));
+    if (!chunks.length) return [PLACEHOLDER];
+    if (tail) chunks[chunks.length - 1] = `${chunks[chunks.length - 1]}\n\n${tail}`;
+    return chunks;
   }
 
   /** Three physical lines: model, tools, subagents. Bold only the model. */
@@ -416,7 +433,7 @@ export class Streamer {
   }
 
   private async flushRich(state: State, footer?: string): Promise<void> {
-    const chunks = splitMarkdown(this.composeMarkdown(state, footer));
+    const chunks = this.composeChunks(state, footer);
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index] ?? "";
       const messageId = state.messageIds[index];
@@ -430,7 +447,7 @@ export class Streamer {
   }
 
   private async flushHtml(state: State, footer?: string): Promise<void> {
-    const chunks = splitHtml(this.composeHtml(state, footer));
+    const chunks = this.composeChunks(state, footer, true);
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index] ?? "";
       const messageId = state.messageIds[index];

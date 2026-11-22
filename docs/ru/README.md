@@ -28,9 +28,9 @@
 
 ### Установщик (Windows 10/11)
 
-1. Запустите `ocbridge-setup-standalone-0.6.1.exe` (офлайн) или
-   `ocbridge-setup-lite-0.6.1.exe` (скачивает portable-bundle, ~2 МБ). Готовый
-   layout также лежит в `ocbridge-bundle-0.6.1.zip`.
+1. Запустите `ocbridge-setup-standalone-0.6.2.exe` (офлайн) или
+   `ocbridge-setup-lite-0.6.2.exe` (скачивает portable-bundle, ~2 МБ). Готовый
+   layout также лежит в `ocbridge-bundle-0.6.2.zip`.
 2. Вставьте токен бота от [@BotFather](https://t.me/BotFather) — можно пропустить
    и указать позже в панели `http://127.0.0.1:7788`.
 3. Напишите боту `/start` — первый пользователь становится администратором.

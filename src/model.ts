@@ -11,13 +11,22 @@ export const UNKNOWN_MODEL = "unknown model";
 export interface ModelRef {
   providerID?: string;
   id?: string;
+  /** OpenCode 2.x may report `modelID` instead of `id` (assistant messages). */
+  modelID?: string;
   variant?: string;
 }
 
-/** `providerID/id` key used by `/api/model` and session.model. */
+/**
+ * `providerID/id` key used by `/api/model` and session.model. A model is only
+ * "unknown" when both fields are absent: a lone provider or id still labels the
+ * turn instead of collapsing to `unknown model`.
+ */
 export function modelKey(model?: ModelRef | null): string | undefined {
-  if (!model?.providerID || !model?.id) return undefined;
-  return `${model.providerID}/${model.id}`;
+  const provider = String(model?.providerID ?? "").trim();
+  const id = String(model?.id ?? model?.modelID ?? "").trim();
+  if (!provider && !id) return undefined;
+  if (provider && id) return `${provider}/${id}`;
+  return provider || id;
 }
 
 /** Drops the bare "OpenCode"/"OpenCode Bridge" label and empty values. */
@@ -37,6 +46,8 @@ export class ModelCatalog {
   private namesAt = 0;
   private namesInflight?: Promise<Map<string, string>>;
   private readonly sessions = new Map<string, { label: string; at: number }>();
+  /** Last `providerID/id` seen per session: the fallback when `/api/model` is down. */
+  private readonly keys = new Map<string, string>();
 
   constructor(private readonly oc: OcClient) {}
 
@@ -68,6 +79,11 @@ export class ModelCatalog {
   async labelFor(model?: ModelRef | null): Promise<string> {
     const key = modelKey(model);
     if (!key) return UNKNOWN_MODEL;
+    return this.labelForKey(key);
+  }
+
+  /** Display name for `providerID/id`; the raw key when `/api/model` has no entry. */
+  private async labelForKey(key: string): Promise<string> {
     const names = await this.modelNames();
     return sanitizeModelName(names.get(key) ?? key);
   }
@@ -77,11 +93,20 @@ export class ModelCatalog {
     if (!refresh && cached && Date.now() - cached.at < SESSION_TTL_MS) return cached.label;
     try {
       const session = await this.oc.getSession(sessionID);
-      const label = await this.labelFor(session.model);
-      this.sessions.set(sessionID, { label, at: Date.now() });
-      return label;
+      const key = modelKey(session.model) ?? this.keys.get(sessionID);
+      if (key) {
+        this.keys.set(sessionID, key);
+        const label = await this.labelForKey(key);
+        this.sessions.set(sessionID, { label, at: Date.now() });
+        return label;
+      }
+      return cached?.label ?? UNKNOWN_MODEL;
     } catch (error) {
       log.warn(`model label for ${sessionID.slice(0, 16)}: ${(error as Error).message}`);
+      // A failed session fetch must not erase a known model: fall back to
+      // `providerID/id`, then to the last display name.
+      const key = this.keys.get(sessionID);
+      if (key) return sanitizeModelName(cached?.label && cached.label !== UNKNOWN_MODEL ? cached.label : key);
       return cached?.label ?? UNKNOWN_MODEL;
     }
   }
@@ -93,6 +118,7 @@ export class ModelCatalog {
   /** `session.model.selected`: the next label must be fetched again. */
   forget(sessionID: string): void {
     this.sessions.delete(sessionID);
+    this.keys.delete(sessionID);
   }
 }
 

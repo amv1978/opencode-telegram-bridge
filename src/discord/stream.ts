@@ -2,7 +2,7 @@ import type { Client, Message, MessageCreateOptions } from "discord.js";
 import { log } from "../log.ts";
 import { sanitizeModelName, UNKNOWN_MODEL } from "../model.ts";
 import { statusMarkdown, type StatusItem } from "../status.ts";
-import { chunkText, formatDuration, toDiscordMarkdown } from "./render.ts";
+import { DISCORD_CHUNK, chunkText, formatDuration, toDiscordMarkdown } from "./render.ts";
 
 const PLACEHOLDER = "⏳ Думаю…";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -350,15 +350,33 @@ export class DiscordStreamer {
     state.timer.unref?.();
   }
 
-  private compose(state: State, footer?: string): string {
-    const parts: string[] = [];
+  /**
+   * Body + tail (`status` block, then the stats line). The live status block
+   * lives *below* the answer; when the turn ends only the stats line remains.
+   */
+  private composeParts(state: State, footer?: string): { body: string; tail: string } {
     const status = state.finished && !state.awaiting ? "" : this.statusBlock(state);
-    if (status) parts.push(status);
-    const body = state.text.trim();
-    if (body) parts.push(toDiscordMarkdown(body));
     const line = footer ?? state.footer;
-    if (line) parts.push(line);
-    return parts.join("\n\n") || PLACEHOLDER;
+    return {
+      body: state.text.trim() ? toDiscordMarkdown(state.text.trim()) : "",
+      tail: [status, line].filter(Boolean).join("\n\n"),
+    };
+  }
+
+  private compose(state: State, footer?: string): string {
+    const { body, tail } = this.composeParts(state, footer);
+    return [body, tail].filter(Boolean).join("\n\n") || PLACEHOLDER;
+  }
+
+  /** Chunks with the live block appended to the LAST chunk only. */
+  private composeChunks(state: State, footer?: string): string[] {
+    const { body, tail } = this.composeParts(state, footer);
+    if (!body) return tail ? [tail] : [PLACEHOLDER];
+    const reserve = tail ? tail.length + 2 : 0;
+    const chunks = chunkText(body, Math.max(400, DISCORD_CHUNK - reserve));
+    if (!chunks.length) return [PLACEHOLDER];
+    if (tail) chunks[chunks.length - 1] = `${chunks[chunks.length - 1]}\n\n${tail}`;
+    return chunks;
   }
 
   /** Three physical lines: model, tools, subagents. Bold only the model. */
@@ -420,7 +438,7 @@ export class DiscordStreamer {
         this.options.onGone?.(state.sessionID);
         return;
       }
-      const chunks = chunkText(this.compose(state, footer));
+      const chunks = this.composeChunks(state, footer);
       for (let index = 0; index < chunks.length; index += 1) {
         const chunk = chunks[index] ?? "";
         if (!chunk) continue;

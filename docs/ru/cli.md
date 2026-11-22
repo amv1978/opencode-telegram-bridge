@@ -16,7 +16,7 @@ HTTP-таймаут — 10 с.
 ```
 > ocbridge-cli status
 Состояние     running
-Версия        0.6.1
+Версия        0.6.2
 Пользователь  @my_bot
 OpenCode      2.3.2 (http://127.0.0.1:28894)
 Telegram      pinned 149.154.167.220
@@ -135,8 +135,8 @@ both
 
 ```
 > ocbridge-cli version
-ocbridge-cli 0.6.1
-API: 0.6.1
+ocbridge-cli 0.6.2
+API: 0.6.2
 OpenCode: 2.3.2
 
 > ocbridge-cli help logs
