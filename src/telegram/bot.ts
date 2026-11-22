@@ -27,6 +27,7 @@ import {
 import { isPermissionMode, MODE_SUMMARY, modeOf, rulesForMode } from "../permissions.ts";
 import { recentEntries, recentLine } from "../recent.ts";
 import { formatUsd, type BudgetSnapshot } from "../budget.ts";
+import { canRename, renameWait, titleWithMarker } from "../titles.ts";
 import { enableHexFileTranscription, transcribeAudio } from "../audio/transcribe.ts";
 import {
   collectAgentFiles,
@@ -1148,9 +1149,10 @@ export class Bridge {
         if (!target?.threadId) break;
         const state = this.titles.get(sessionID);
         if (state) state.base = title;
-        const prefix = state?.phase === "start" ? "⏳ " : state?.phase === "done" ? "✅ " : "";
         try {
-          await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: `${prefix}${title}`.slice(0, 128) });
+          await this.bot.api.editForumTopic(target.chatId, target.threadId, {
+            name: titleWithMarker(title, state?.phase ?? "idle"),
+          });
           if (state) state.lastRename = Date.now();
           this.appliedTitles.set(sessionID, title);
           this.store.setTitle(sessionID, title);
@@ -1453,15 +1455,15 @@ export class Bridge {
       state.version += 1;
       if (state.timer) clearTimeout(state.timer);
       state.timer = undefined;
-      if (Date.now() - state.lastRename < 60_000) return;
-      if (await this.setTopicTitle(sessionID, `⏳ ${state.base}`)) state.lastRename = Date.now();
+      if (!canRename(state.lastRename)) return;
+      if (await this.setTopicTitle(sessionID, titleWithMarker(state.base, "start"))) state.lastRename = Date.now();
       return;
     }
     if (state.phase !== "start") return;
     state.phase = "done";
     const version = state.version;
-    if (Date.now() - state.lastRename >= 60_000) {
-      if (await this.setTopicTitle(sessionID, `✅ ${state.base}`)) state.lastRename = Date.now();
+    if (canRename(state.lastRename)) {
+      if (await this.setTopicTitle(sessionID, titleWithMarker(state.base, "done"))) state.lastRename = Date.now();
     }
     if (state.timer) clearTimeout(state.timer);
     state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), 10_000);
@@ -1472,21 +1474,21 @@ export class Bridge {
     const state = this.titles.get(sessionID);
     if (!state || state.version !== version || state.phase !== "done") return;
     state.timer = undefined;
-    const wait = 60_000 - (Date.now() - state.lastRename);
+    const wait = renameWait(state.lastRename);
     if (wait > 0) {
       state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), wait + 500);
       state.timer.unref?.();
       return;
     }
     state.phase = "idle";
-    if (await this.setTopicTitle(sessionID, state.base)) state.lastRename = Date.now();
+    if (await this.setTopicTitle(sessionID, titleWithMarker(state.base, "idle"))) state.lastRename = Date.now();
   }
 
   private async setTopicTitle(sessionID: string, name: string): Promise<boolean> {
     const target = this.targetFor(sessionID);
     if (!target?.threadId) return false;
     try {
-      await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: name.slice(0, 128) });
+      await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: titleWithMarker(name, "idle") });
       return true;
     } catch (error) {
       log.debug("topic title:", (error as Error).message);

@@ -100,8 +100,8 @@ it to a private chat.
 While a turn runs, a live block is shown above the answer:
 
 ```
-🟢 **DeepSeek V4.1 Flash** · thinking… 42s
-- 🛠 edit bot.ts · 3s ✓
+🟢 **DeepSeek V4.1 Flash** · thinking. 42s
+- ⠋ 🛠 edit bot.ts · 3s
 - 🔍 grep "permission" · 1s ✓
 
 <answer text…>
@@ -116,9 +116,11 @@ While a turn runs, a live block is shown above the answer:
   are list items (`- 🛠 …`, `- 🧩 …`): rich markdown collapses a lone `\n`, while a
   list item always starts a new line.
 - The status is refreshed by an independent 1.2 s ticker for as long as the block
-  lives (not only while a tool is active), so `thinking… 1s` turns into `… 12s`
+  lives (not only while a tool is active), so `thinking. 1s` turns into `thinking.. 12s`
   even when Telegram deltas stop. Every tick recomputes elapsed and forces an edit
-  (on 429 it waits for `retry_after`). The model label refreshes on
+  (on 429 it waits for `retry_after`). The same tick advances the spinner before a
+  running tool (`⠋ 🛠 …`) and the `thinking.` dots; line order is stable and the
+  message is edited in place, never re-sent. The model label refreshes on
   `session.model.selected`.
 - Tools: `session.tool.called` → icon + name + short argument,
   `session.tool.success` → `✓`, `session.tool.failed` → `✗`. The last 2 lines are
@@ -141,6 +143,16 @@ _DeepSeek V4.1 Flash · ⏱ 1m 23s · ⚡ 197.8 tok/s · 🧠 531k_
 For `interrupted`/`failed`: `_… · ⏹ interrupted · ⏱ 42s_` /
 `_… · ⚠️ error · ⏱ 42s_`. Numbers use the same OpenCode formula (duration, tok/s,
 context) and do not change.
+
+### Title status
+
+While a turn runs the bound forum topic is renamed once to `⏳ <original title>`
+(`session.execution.started`). On the end of the turn it becomes
+`✅ <original title>` and after ~10 s the original title is restored. Renames are
+throttled to one per 60 s, so a very short turn may only show `⏳` and then the
+original; the General chat is never renamed. A session rename during a turn keeps
+the marker and becomes the new original title. Chat title changes are cosmetic:
+the OpenCode session title is not modified.
 
 ## Permissions
 

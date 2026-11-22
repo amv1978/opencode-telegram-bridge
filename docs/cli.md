@@ -16,7 +16,7 @@ HTTP timeout — 10 s.
 ```
 > ocbridge-cli status
 State         running
-Version       0.7.0
+Version       0.7.1
 User          @my_bot
 OpenCode      2.3.2 (http://127.0.0.1:28894)
 Telegram      pinned 149.154.167.220
@@ -160,8 +160,8 @@ If the daemon is not running, doctor exits immediately with code 3 and a hint.
 
 ```
 > ocbridge-cli version
-ocbridge-cli 0.7.0
-API: 0.7.0
+ocbridge-cli 0.7.1
+API: 0.7.1
 OpenCode: 2.3.2
 
 > ocbridge-cli help logs

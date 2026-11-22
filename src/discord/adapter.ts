@@ -42,6 +42,7 @@ import { DiscordStreamer, resolveSendable } from "./stream.ts";
 import { isPermissionMode, MODE_SUMMARY, modeOf, rulesForMode } from "../permissions.ts";
 import { recentEntries, recentLine } from "../recent.ts";
 import { budgetReport, type BudgetSnapshot } from "../budget.ts";
+import { canRename, renameWait, titleWithMarker } from "../titles.ts";
 import {
   activeFields,
   buildAnswer,
@@ -955,10 +956,9 @@ export class DiscordBridge {
         if (!threadId || !this.client) break;
         const state = this.titles.get(sessionID);
         if (state) state.base = title;
-        const prefix = state?.phase === "start" ? "⏳ " : state?.phase === "done" ? "✅ " : "";
         try {
           const channel = await this.client.channels.fetch(threadId);
-          if (channel?.isThread()) await channel.setName(threadName(`${prefix}${title}`));
+          if (channel?.isThread()) await channel.setName(titleWithMarker(title, state?.phase ?? "idle", 100));
           if (state) state.lastRename = Date.now();
           this.store.setDiscordTitle(sessionID, title);
           log.info(`discord session renamed → thread: ${title}`);
@@ -1088,15 +1088,15 @@ export class DiscordBridge {
       state.version += 1;
       if (state.timer) clearTimeout(state.timer);
       state.timer = undefined;
-      if (Date.now() - state.lastRename < TITLE_MIN_MS) return;
-      if (await this.setThreadTitle(sessionID, `⏳ ${state.base}`)) state.lastRename = Date.now();
+      if (!canRename(state.lastRename, Date.now(), TITLE_MIN_MS)) return;
+      if (await this.setThreadTitle(sessionID, titleWithMarker(state.base, "start", 100))) state.lastRename = Date.now();
       return;
     }
     if (state.phase !== "start") return;
     state.phase = "done";
     const version = state.version;
-    if (Date.now() - state.lastRename >= TITLE_MIN_MS) {
-      if (await this.setThreadTitle(sessionID, `✅ ${state.base}`)) state.lastRename = Date.now();
+    if (canRename(state.lastRename, Date.now(), TITLE_MIN_MS)) {
+      if (await this.setThreadTitle(sessionID, titleWithMarker(state.base, "done", 100))) state.lastRename = Date.now();
     }
     if (state.timer) clearTimeout(state.timer);
     state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), TITLE_RESTORE_MS);
@@ -1107,14 +1107,14 @@ export class DiscordBridge {
     const state = this.titles.get(sessionID);
     if (!state || state.version !== version || state.phase !== "done") return;
     state.timer = undefined;
-    const wait = TITLE_MIN_MS - (Date.now() - state.lastRename);
+    const wait = renameWait(state.lastRename, Date.now(), TITLE_MIN_MS);
     if (wait > 0) {
       state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), wait + 500);
       state.timer.unref?.();
       return;
     }
     state.phase = "idle";
-    if (await this.setThreadTitle(sessionID, state.base)) state.lastRename = Date.now();
+    if (await this.setThreadTitle(sessionID, titleWithMarker(state.base, "idle", 100))) state.lastRename = Date.now();
   }
 
   private async setThreadTitle(sessionID: string, name: string): Promise<boolean> {
@@ -1123,7 +1123,7 @@ export class DiscordBridge {
     try {
       const channel = await this.client.channels.fetch(threadId);
       if (!channel?.isThread()) return false;
-      await channel.setName(threadName(name));
+      await channel.setName(titleWithMarker(name, "idle", 100));
       return true;
     } catch (error) {
       log.debug("discord thread title:", (error as Error).message);

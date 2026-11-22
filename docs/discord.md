@@ -105,11 +105,19 @@ current one through `PATCH /api/session/{id}` (auto allows everything, plan deni
   throwing. On a gateway disconnect login/reconnect retries with 5 s → 5 min
   backoff; the bridge does not need a restart.
 - **Live status**: in the same message above the answer — physical lines
-  `🟢 **<Model>** · thinking… 42s`, then up to two recent tools like
-  `🛠 edit bot.ts · 3s ✓`. Only the model is bold; labels have no `*`/`_` and are at
-  most 60 characters, the word `tool` is never printed. The status is refreshed by
-  an independent 2.5 s ticker (without text deltas). Repeats collapse (`×3`),
-  finished lines hide after ~10 s, and at the end of the turn the block is removed.
+  `🟢 **<Model>** · thinking. 42s`, then up to two recent tools like
+  `⠋ 🛠 edit bot.ts · 3s` → `🛠 edit bot.ts · 3s ✓`. Only the model is bold; labels
+  have no `*`/`_` and are at most 60 characters, the word `tool` is never printed.
+  The status is refreshed by an independent 2.5 s ticker (without text deltas); the
+  same tick moves the spinner and the `thinking.` dots, the line order is stable and
+  the message is edited in place. Repeats collapse (`×3`), finished lines hide
+  after ~10 s, and at the end of the turn the block is removed.
+- **Title status**: the thread is renamed to `⏳ <title>` on turn start and to
+  `✅ <title>` on success, then restored after ~10 s. Discord allows about two
+  renames per 10 minutes, so a rename is only attempted 5 minutes after the previous
+  one: a short turn may keep `⏳` until the window opens, then the original title is
+  restored. A session rename during the turn keeps the marker and becomes the new
+  original title.
 - **Subagents**: a child session (`parentID`) does not open a separate thread; it
   adds a line to the parent block — `🧩 explore · 12s`, then `✓`/`✗`
   (`🧩 general · 1m 03s ✓`). At most 2 lines, repeats collapse (`×2`), finished ones

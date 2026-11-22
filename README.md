@@ -29,6 +29,9 @@ sessions**; no OpenCode plugin is required.
   marker and one-click reattach (topic/thread).
 - **Atomic persistence and tests**: config/state are written via temp+rename with
   one `.bak`; `bun test` covers the pure modules in CI.
+- **Title status**: the topic/thread is marked `⏳` while a turn runs, `✅` when it
+  finishes and restored afterwards (rate-limit aware); the live block has a tool
+  spinner and animated `thinking.` dots.
 - **Voice input**: OGG/Opus → ffmpeg → HEX, fully local, no cloud.
 - **Media relay** between all bound chats (Telegram topic/chat ↔ Discord
   thread/channel), including files produced by the agent; over platform limits the
@@ -52,9 +55,9 @@ sessions**; no OpenCode plugin is required.
 
 ### Installer (Windows 10/11)
 
-1. Run `ocbridge-setup-standalone-0.7.0.exe` (offline) or `ocbridge-setup-lite-0.7.0.exe`
+1. Run `ocbridge-setup-standalone-0.7.1.exe` (offline) or `ocbridge-setup-lite-0.7.1.exe`
    (downloads the portable bundle, ~2 MB). The portable layout is also available
-   as `ocbridge-bundle-0.7.0.zip`.
+   as `ocbridge-bundle-0.7.1.zip`.
 2. Paste the bot token from [@BotFather](https://t.me/BotFather) - you may skip this
    and set it later in the panel `http://127.0.0.1:7788`.
 3. Send `/start` to the bot — the first user becomes administrator.
