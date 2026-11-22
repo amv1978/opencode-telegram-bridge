@@ -1,6 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { atomicWrite, hasPersistedFile, readJsonFile, readTextFile } from "./atomic.ts";
+import type { PermissionMode } from "./permissions.ts";
+import { isPermissionMode } from "./permissions.ts";
 
 export type Role = "admin" | "user";
 
@@ -44,6 +47,22 @@ export interface NotifyConfig {
   targets?: "admin" | "all" | string[];
 }
 
+/**
+ * Cost caps. `perTurnUsd` is compared with the cost growth of one turn,
+ * `dailyUsd` with the sum of turn deltas for the current UTC day.
+ * `action` decides what happens when a cap is exceeded: warn only, or interrupt.
+ */
+export interface BudgetConfig {
+  perTurnUsd?: number;
+  dailyUsd?: number;
+  action?: "warn" | "stop";
+}
+
+/** Default permission mode for newly created sessions; `/mode` changes one session. */
+export interface PermissionConfig {
+  mode?: PermissionMode;
+}
+
 export interface BridgeConfig {
   telegram: {
     token: string;
@@ -70,6 +89,10 @@ export interface BridgeConfig {
   update?: UpdateConfig;
   /** Lifecycle chat notifications (default: enabled, first admin). */
   notify?: NotifyConfig;
+  /** Cost caps and what to do when they are exceeded. */
+  budget?: BudgetConfig;
+  /** Permission preset applied to new sessions. */
+  permissions?: PermissionConfig;
   /** Forum supergroup chat id used in "topics" mode. */
   topicsChatId?: number;
   /** Default directory for new sessions (empty = current working directory). */
@@ -106,6 +129,8 @@ const DEFAULT_CONFIG: BridgeConfig = {
   media: { relay: "all", maxPhotoMb: 10 },
   update: { checkOnStart: true, intervalHours: 6, autoDownload: false },
   notify: { enabled: true, targets: "admin" },
+  budget: { action: "warn" },
+  permissions: { mode: "ask" },
   web: { port: 7788 },
   stream: { editIntervalMs: 1800, showReasoning: false, showTools: "compact", format: "rich" },
 };
@@ -153,22 +178,22 @@ function migrateLegacyData(exeDir: string, dataDir: string): void {
     if (!existsSync(legacyConfig)) return;
     mkdirSync(dataDir, { recursive: true });
     const configPath = join(dataDir, "config.json");
-    if (!existsSync(configPath)) {
-      writeFileSync(configPath, readFileSync(legacyConfig), "utf8");
+    if (!hasPersistedFile(configPath)) {
+      const text = readJsonFile(legacyConfig);
+      if (text !== undefined) atomicWrite(configPath, JSON.stringify(text, null, 2) + "\n");
     }
     const legacyState = join(exeDir, "state.json");
     const statePath = join(dataDir, "state.json");
     if (!existsSync(legacyState)) return;
-    const legacy = JSON.parse(readFileSync(legacyState, "utf8").replace(/^\uFEFF/, "")) as Record<string, any>;
-    const current = existsSync(statePath)
-      ? (JSON.parse(readFileSync(statePath, "utf8").replace(/^\uFEFF/, "")) as Record<string, any>)
-      : {};
+    const legacy = (readJsonFile(legacyState) ?? {}) as Record<string, any>;
+    const current = (readJsonFile(statePath) ?? {}) as Record<string, any>;
     const merged: Record<string, any> = {
+      ...current,
       topics: { ...(legacy.topics ?? {}), ...(current.topics ?? {}) },
       chats: { ...(legacy.chats ?? {}), ...(current.chats ?? {}) },
       sessions: { ...(legacy.sessions ?? {}), ...(current.sessions ?? {}) },
     };
-    writeFileSync(statePath, JSON.stringify(merged, null, 2), "utf8");
+    atomicWrite(statePath, JSON.stringify(merged, null, 2));
     // Mark legacy files so deleted bindings never come back on the next start.
     try {
       renameSync(legacyState, `${legacyState}.migrated`);
@@ -186,12 +211,12 @@ function migrateLegacyData(exeDir: string, dataDir: string): void {
 }
 
 export function loadConfig(paths: Paths): BridgeConfig {
-  if (!existsSync(paths.configFile)) {
-    mkdirSync(dirname(paths.configFile), { recursive: true });
-    writeFileSync(paths.configFile, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n", "utf8");
-    return { ...DEFAULT_CONFIG };
+  if (!hasPersistedFile(paths.configFile)) {
+    atomicWrite(paths.configFile, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n", { backup: false });
+    return structuredClone(DEFAULT_CONFIG);
   }
-  const raw = JSON.parse(readFileSync(paths.configFile, "utf8").replace(/^\uFEFF/, "")) as Partial<BridgeConfig>;
+  const stored = readJsonFile(paths.configFile);
+  const raw = (stored && typeof stored === "object" ? stored : {}) as Partial<BridgeConfig>;
   return {
     telegram: {
       token: raw.telegram?.token ?? "",
@@ -230,6 +255,14 @@ export function loadConfig(paths: Paths): BridgeConfig {
     topicsChatId: raw.topicsChatId,
     defaultDirectory: raw.defaultDirectory,
     autoTopics: raw.autoTopics ?? true,
+    budget: {
+      perTurnUsd: readUsd(raw.budget?.perTurnUsd),
+      dailyUsd: readUsd(raw.budget?.dailyUsd),
+      action: raw.budget?.action === "stop" ? "stop" : "warn",
+    },
+    permissions: {
+      mode: isPermissionMode(raw.permissions?.mode) ? raw.permissions.mode : "ask",
+    },
     ui: {
       theme: raw.ui?.theme ?? "opencode",
       scheme: raw.ui?.scheme ?? "system",
@@ -263,6 +296,14 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
   return Math.min(max, Math.max(min, Math.round(number)));
 }
 
+/** Positive USD amount with two decimals; empty/invalid means "no cap". */
+function readUsd(value: unknown): number | undefined {
+  if (value === "" || value === null || value === undefined) return undefined;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return undefined;
+  return Math.round(number * 100) / 100;
+}
+
 /**
  * The installer never rewrites config.json (it would drop unrelated sections).
  * It leaves installer.json with optional overrides; they are merged once here.
@@ -271,8 +312,10 @@ export function applyInstallerOverrides(paths: Paths, cfg: BridgeConfig, configE
   const file = join(dirname(paths.configFile), "installer.json");
   if (!existsSync(file)) return false;
   let raw: Record<string, any>;
+  const text = readTextFile(file);
+  if (text === undefined) return false;
   try {
-    raw = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, "")) as Record<string, any>;
+    raw = JSON.parse(text) as Record<string, any>;
   } catch {
     return false;
   }
@@ -309,7 +352,7 @@ export function applyInstallerOverrides(paths: Paths, cfg: BridgeConfig, configE
   delete raw.configOnlyIfNew;
   raw.configAppliedAt = new Date().toISOString();
   try {
-    writeFileSync(file, JSON.stringify(raw, null, 2) + "\n", "utf8");
+    atomicWrite(file, JSON.stringify(raw, null, 2) + "\n");
   } catch {
     /* best-effort */
   }
@@ -317,8 +360,7 @@ export function applyInstallerOverrides(paths: Paths, cfg: BridgeConfig, configE
 }
 
 export function saveConfig(paths: Paths, cfg: BridgeConfig): void {
-  mkdirSync(dirname(paths.configFile), { recursive: true });
-  writeFileSync(paths.configFile, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  atomicWrite(paths.configFile, JSON.stringify(cfg, null, 2) + "\n");
 }
 
 export function findUser(cfg: BridgeConfig, userId: number): UserConfig | undefined {

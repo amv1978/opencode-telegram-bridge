@@ -54,8 +54,46 @@ deleted, the binding is cleared and the final answer goes to the chat root.
 | `/status` | Title, id, folder, model, agent, busy state, cost, bridge version |
 | `/model [provider/id]` | Show or change the model |
 | `/agent [id]` | List agents or change the agent |
+| `/mode [ask\|auto\|plan]` | Show or change the session permission mode |
+| `/recent` | Recent sessions with a `🔔` unread marker; a button reattaches |
+| `/budget` | Cost caps, today's spend and a hint how to change them |
 | `/stop` | Interrupt the current turn |
 | `/fmt` | Rich-markup check |
+
+## Permission modes
+
+`/mode` shows the current preset derived from `session.permissions` and switches it
+with `PATCH /api/session/{id}`:
+
+- **ask** — the OpenCode default: every sensitive action asks (inline buttons);
+- **auto** — `{"action":"*","resource":"*","effect":"allow"}`: allow everything;
+- **plan** — allow everything except `write`, `edit` and `bash` (deny rules):
+  read-only planning, the agent cannot modify files or run commands.
+
+The preset from `config.json` → `permissions.mode` is applied to every new session;
+`/mode` changes only the current session.
+
+## Cost budgets
+
+`config.json`:
+
+```json
+"budget": { "perTurnUsd": 1.5, "dailyUsd": 10, "action": "stop" }
+```
+
+- the turn cost is the growth of `session.cost` from `session.execution.started` to
+  the end of the turn; the daily total sums turn deltas over the current UTC day and
+  is stored in `state.json` (survives restarts);
+- at **80%** of either cap the bound chat gets a warning; at **100%** the chat gets
+  an alert and, with `action: "stop"`, the turn is interrupted (`/interrupt`);
+- `/budget` shows the caps, today's spend and active turns.
+
+## Recent sessions
+
+`/recent` lists the last 10 root, non-archived sessions from all projects, newest
+first, with the folder, age and a `🔔` marker when `time.idle > time.viewed`
+(or the session is running). A button opens a forum topic for the session or binds
+it to a private chat.
 
 ## Turn status and footer
 

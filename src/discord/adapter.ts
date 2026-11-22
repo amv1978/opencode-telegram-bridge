@@ -39,6 +39,9 @@ import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFrom
 import { modelLabel, turnStats } from "./stats.ts";
 import { catalogFor } from "../model.ts";
 import { DiscordStreamer, resolveSendable } from "./stream.ts";
+import { isPermissionMode, MODE_SUMMARY, modeOf, rulesForMode } from "../permissions.ts";
+import { recentEntries, recentLine } from "../recent.ts";
+import { budgetReport, type BudgetSnapshot } from "../budget.ts";
 import {
   activeFields,
   buildAnswer,
@@ -81,6 +84,9 @@ const EVENT_TYPES = [
 ];
 
 const PERMISSION_TTL_MS = 15 * 60 * 1000;
+/** Discord allows ~2 thread renames per 10 minutes; keep ≥5 min between them. */
+const TITLE_MIN_MS = 5 * 60 * 1000;
+const TITLE_RESTORE_MS = 10_000;
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const AUDIO_EXT = /\.(ogg|opus|mp3|m4a|wav|webm|flac)$/i;
 
@@ -102,6 +108,15 @@ interface DiscordForm {
   page: number;
 }
 
+/** Thread title marker while a turn runs (`⏳` → `✅` → original). */
+interface DiscordTitle {
+  base: string;
+  phase: "idle" | "start" | "done";
+  lastRename: number;
+  version: number;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 interface ThreadParent {
   id: string;
   threads: {
@@ -114,6 +129,7 @@ export type DiscordState = "stopped" | "starting" | "running" | "retrying" | "er
 export interface DiscordOptions {
   onStateChange?: (state: DiscordState, error: string) => void;
   relay?: MediaRelay;
+  budget?: () => BudgetSnapshot | undefined;
 }
 
 /**
@@ -127,6 +143,8 @@ export class DiscordBridge {
   /** Choice forms rendered in chat, keyed by a short component token. */
   private readonly forms = new Map<string, DiscordForm>();
   private readonly seenForms = new Map<string, number>();
+  /** Per-session thread title markers (`⏳` / `✅`). */
+  private readonly titles = new Map<string, DiscordTitle>();
   private formTimer?: ReturnType<typeof setInterval>;
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent agent, so `execution.*` updates the parent block. */
@@ -254,6 +272,8 @@ export class DiscordBridge {
     if (this.formTimer) clearInterval(this.formTimer);
     this.formTimer = undefined;
     this.forms.clear();
+    for (const state of this.titles.values()) if (state.timer) clearTimeout(state.timer);
+    this.titles.clear();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     await this.streamer?.shutdown().catch(() => undefined);
@@ -529,6 +549,12 @@ export class DiscordBridge {
         return this.cmdModel(interaction);
       case "agent":
         return this.cmdAgent(interaction);
+      case "mode":
+        return this.cmdMode(interaction);
+      case "recent":
+        return this.cmdRecent(interaction);
+      case "budget":
+        return this.cmdBudget(interaction);
       case "fmt":
         return this.cmdFmt(interaction);
       default:
@@ -552,6 +578,9 @@ export class DiscordBridge {
         "`/status` — состояние сессии",
         "`/model [provider/id]` — модель",
         "`/agent [id]` — агент",
+        "`/mode [ask|auto|plan]` — режим разрешений",
+        "`/recent` — недавние сессии (🔔 = не прочитано)",
+        "`/budget` — лимиты стоимости и расход за день",
         "`/fmt` — проверка форматирования",
         "",
         "🎤 Голосовые распознаются локально через HEX.",
@@ -720,8 +749,68 @@ export class DiscordBridge {
     await interaction.editReply({ content: `✅ Агент: \`${arg}\``, allowedMentions: { parse: [] } });
   }
 
-  private async cmdFmt(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async cmdMode(interaction: ChatInputCommandInteraction): Promise<void> {
+    const sessionID = this.currentSession(interaction);
+    if (!sessionID) {
+      await interaction.editReply({ content: "Нет активной сессии. /new или /attach." });
+      return;
+    }
+    const arg = (interaction.options.getString("mode") ?? "").trim().toLowerCase();
+    if (!arg) {
+      const session = await this.oc.getSession(sessionID).catch(() => undefined);
+      const mode = modeOf(session?.permissions);
+      await interaction.editReply({
+        content: `🔐 Режим разрешений: **${mode}**\n_${MODE_SUMMARY[mode]}_\n\nСменить: \`/mode ask\`, \`/mode auto\`, \`/mode plan\`.`,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+    if (!isPermissionMode(arg)) {
+      await interaction.editReply({ content: "Формат: `/mode ask|auto|plan`", allowedMentions: { parse: [] } });
+      return;
+    }
+    await this.oc.setPermissions(sessionID, rulesForMode(arg));
     await interaction.editReply({
+      content: `✅ Режим: **${arg}** — _${MODE_SUMMARY[arg]}_`,
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  private async cmdRecent(interaction: ChatInputCommandInteraction): Promise<void> {
+    const list = await this.oc.listSessions({ limit: 20, order: "desc", archived: "false", parentID: null });
+    const entries = recentEntries(list, 10);
+    if (!entries.length) {
+      await interaction.editReply({ content: "Сессий нет." });
+      return;
+    }
+    const lines = ["🗂 **Недавние сессии**", ""];
+    for (const [index, entry] of entries.entries()) lines.push(recentLine(entry, index));
+    lines.push("", "_🔔 — есть непрочитанный ход. Нажмите кнопку, чтобы подключиться._");
+    const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+    let row = new ActionRowBuilder<ButtonBuilder>();
+    for (const [index, entry] of entries.entries()) {
+      const bell = entry.unread ? "🔔 " : "";
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`recent:${entry.id}`)
+          .setLabel(`${index + 1}. ${bell}${entry.title}`.slice(0, 80))
+          .setStyle(entry.unread ? ButtonStyle.Primary : ButtonStyle.Secondary),
+      );
+      if (row.components.length === 5) {
+        rows.push(row);
+        row = new ActionRowBuilder<ButtonBuilder>();
+      }
+    }
+    if (row.components.length) rows.push(row);
+    await interaction.editReply({ content: lines.join("\n"), components: rows, allowedMentions: { parse: [] } });
+  }
+
+  private async cmdBudget(interaction: ChatInputCommandInteraction): Promise<void> {
+    const lines = budgetReport(this.options.budget?.());
+    await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
+  }
+
+  private async cmdFmt(interaction: ChatInputCommandInteraction): Promise<void> {    await interaction.editReply({
       content: [
         "# Проверка разметки",
         "",
@@ -780,6 +869,7 @@ export class DiscordBridge {
         }
         await this.ensureStream(sessionID);
         this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
+        await this.markTitle(sessionID, "start");
         break;
       }      case "session.text.started":
         await this.ensureStream(sessionID);
@@ -836,6 +926,7 @@ export class DiscordBridge {
         if (stats.tps) parts.push(`⚡ ${stats.tps.toFixed(1)} tok/s`);
         if (stats.contextTokens) parts.push(`🧠 ${formatTokens(stats.contextTokens)}`);
         await this.streamer.end(sessionID, italicLine(parts.join(" · ")) || undefined);
+        await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
         log.info(`discord turn ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)}`);
         break;
@@ -862,9 +953,13 @@ export class DiscordBridge {
         if (!title) break;
         const threadId = this.store.locateDiscord(sessionID).threadId;
         if (!threadId || !this.client) break;
+        const state = this.titles.get(sessionID);
+        if (state) state.base = title;
+        const prefix = state?.phase === "start" ? "⏳ " : state?.phase === "done" ? "✅ " : "";
         try {
           const channel = await this.client.channels.fetch(threadId);
-          if (channel?.isThread()) await channel.setName(threadName(title));
+          if (channel?.isThread()) await channel.setName(threadName(`${prefix}${title}`));
+          if (state) state.lastRename = Date.now();
           this.store.setDiscordTitle(sessionID, title);
           log.info(`discord session renamed → thread: ${title}`);
         } catch (error) {
@@ -933,6 +1028,10 @@ export class DiscordBridge {
 
   private async onButton(interaction: ButtonInteraction): Promise<void> {
     const data = interaction.customId;
+    if (data.startsWith("recent:")) {
+      await this.onRecentButton(interaction, data.slice(7));
+      return;
+    }
     if (data.startsWith("form:")) {
       await this.onFormButton(interaction);
       return;
@@ -968,8 +1067,117 @@ export class DiscordBridge {
     }
   }
 
-  // ------------------------------------------------------------------- forms
+  // ------------------------------------------------------------------ titles
 
+  /**
+   * Thread title markers with Discord's rename budget in mind: a rename is only
+   * attempted 5 minutes after the previous one (≤2 per 10 min per channel).
+   * `⏳` on start, `✅` on end, original after ~10 s or when the window opens.
+   */
+  private async markTitle(sessionID: string, phase: "start" | "done"): Promise<void> {
+    if (!this.store.locateDiscord(sessionID).threadId) return;
+    let state = this.titles.get(sessionID);
+    if (!state) {
+      const meta = await this.sessionMeta(sessionID);
+      const base = (this.store.session[sessionID]?.title || meta.title || sessionID.slice(0, 12)).trim();
+      state = { base, phase: "idle", lastRename: 0, version: 0 };
+      this.titles.set(sessionID, state);
+    }
+    if (phase === "start") {
+      state.phase = "start";
+      state.version += 1;
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = undefined;
+      if (Date.now() - state.lastRename < TITLE_MIN_MS) return;
+      if (await this.setThreadTitle(sessionID, `⏳ ${state.base}`)) state.lastRename = Date.now();
+      return;
+    }
+    if (state.phase !== "start") return;
+    state.phase = "done";
+    const version = state.version;
+    if (Date.now() - state.lastRename >= TITLE_MIN_MS) {
+      if (await this.setThreadTitle(sessionID, `✅ ${state.base}`)) state.lastRename = Date.now();
+    }
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), TITLE_RESTORE_MS);
+    state.timer.unref?.();
+  }
+
+  private async restoreTitle(sessionID: string, version: number): Promise<void> {
+    const state = this.titles.get(sessionID);
+    if (!state || state.version !== version || state.phase !== "done") return;
+    state.timer = undefined;
+    const wait = TITLE_MIN_MS - (Date.now() - state.lastRename);
+    if (wait > 0) {
+      state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), wait + 500);
+      state.timer.unref?.();
+      return;
+    }
+    state.phase = "idle";
+    if (await this.setThreadTitle(sessionID, state.base)) state.lastRename = Date.now();
+  }
+
+  private async setThreadTitle(sessionID: string, name: string): Promise<boolean> {
+    const threadId = this.store.locateDiscord(sessionID).threadId;
+    if (!threadId || !this.client) return false;
+    try {
+      const channel = await this.client.channels.fetch(threadId);
+      if (!channel?.isThread()) return false;
+      await channel.setName(threadName(name));
+      return true;
+    } catch (error) {
+      log.debug("discord thread title:", (error as Error).message);
+      return false;
+    }
+  }
+
+  /** `/recent` button: create a thread for the session and bind it. */
+  private async onRecentButton(interaction: ButtonInteraction, sessionID: string): Promise<void> {
+    if (interaction.guildId && !this.allowedGuild(interaction.guildId)) return;
+    if (!this.allowedUser(interaction.user.id)) {
+      await interaction.reply({ content: "⛔️ Нет доступа.", ephemeral: true }).catch(() => undefined);
+      return;
+    }
+    const session = await this.oc.getSession(sessionID).catch(() => undefined);
+    if (!session) {
+      await interaction.reply({ content: "⌛️ Сессия не найдена.", ephemeral: true }).catch(() => undefined);
+      return;
+    }
+    const channel = interaction.channel;
+    const parent = channel?.isThread() ? channel.parent : channel;
+    const thread = parent ? await this.createThread(parent, session.title, session.id) : undefined;
+    if (thread) {
+      this.store.bindDiscordThread(thread.id, session.id, interaction.channelId);
+      await thread
+        .send({
+          content: `🔗 **${session.title}**\nid: \`${session.id}\`\n📁 \`${session.location?.directory ?? this.cfg.defaultDirectory ?? "?"}\``,
+          allowedMentions: { parse: [] },
+        })
+        .catch(() => undefined);
+      await interaction
+        .reply({ content: `🔗 Подключено в треде <#${thread.id}>`, ephemeral: true })
+        .catch(() => undefined);
+      return;
+    }
+    this.store.bindDiscordChannel(interaction.channelId, session.id);
+    await interaction
+      .reply({
+        content: `🔗 Подключено к каналу: **${session.title}**\n\`${session.id}\``,
+        ephemeral: true,
+        allowedMentions: { parse: [] },
+      })
+      .catch(() => undefined);
+  }
+
+  /** Budget/warning text from the central tracker. */
+  async sendSessionText(sessionID: string, text: string): Promise<boolean> {
+    const target = this.targetFor(sessionID);
+    if (!target) return false;
+    await this.send(target, text);
+    return true;
+  }
+
+  // ------------------------------------------------------------------- forms
   private async askForm(form: FormInfo | undefined): Promise<void> {
     if (!form?.id || !Array.isArray(form.fields) || !isChatRenderable(form)) return;
     if (this.findForm(form.id)) return;
@@ -1435,7 +1643,11 @@ export class DiscordBridge {
   // ------------------------------------------------------------------ helpers
 
   private async createSession(title: string): Promise<OcSession> {
-    return this.oc.createSession({ title, directory: this.cfg.defaultDirectory });
+    return this.oc.createSession({
+      title,
+      directory: this.cfg.defaultDirectory,
+      permissions: rulesForMode(this.cfg.permissions?.mode ?? "ask"),
+    });
   }
 
   private async createThread(channel: unknown, title: string, sessionID: string): Promise<ThreadChannel | undefined> {

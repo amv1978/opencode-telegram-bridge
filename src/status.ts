@@ -21,6 +21,8 @@ export interface StatusItem {
   count?: number;
   duration: string;
   mark?: string;
+  /** Running item: a spinner frame is drawn before the icon. */
+  active?: boolean;
 }
 
 export interface StatusSnapshot {
@@ -29,6 +31,24 @@ export interface StatusSnapshot {
   elapsed: string;
   tools: StatusItem[];
   subagents: StatusItem[];
+  /** Animation frame (changed by the status ticker). */
+  frame?: number;
+}
+
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/** Braille spinner frame; stays stable between two ticks of the same message. */
+export function spinnerFrame(frame = 0): string {
+  return SPINNER[Math.abs(Math.trunc(frame)) % SPINNER.length] ?? SPINNER[0]!;
+}
+
+/** `thinking…` / `subagents…` become `thinking.` / `thinking..` / `thinking...`. */
+export function animatedPhase(phase: string, frame = 0): string {
+  const dots = ".".repeat((Math.abs(Math.trunc(frame)) % 3) + 1);
+  if (phase.endsWith("…") || phase.endsWith("...")) {
+    return `${phase.replace(/(…|\.{1,3})$/, "")}${dots}`;
+  }
+  return phase;
 }
 
 /** One-line label; never the bare word `tool`; ≤60 chars on a word/path boundary. */
@@ -79,11 +99,12 @@ function htmlLabel(item: StatusItem): string {
   return item.code ? `<code>${label}</code>` : label;
 }
 
-function itemLine(item: StatusItem, render: (item: StatusItem) => string, bullet: boolean): string {
+function itemLine(item: StatusItem, render: (item: StatusItem) => string, bullet: boolean, frame: number): string {
   const count = item.count && item.count > 1 ? ` ×${item.count}` : "";
   const mark = item.mark ? ` ${item.mark}` : "";
   const prefix = bullet ? "- " : "";
-  return `${prefix}${item.icon} ${render(item)}${count} · ${item.duration}${mark}`;
+  const spin = item.active && !item.mark ? `${spinnerFrame(frame)} ` : "";
+  return `${prefix}${spin}${item.icon} ${render(item)}${count} · ${item.duration}${mark}`;
 }
 
 /**
@@ -92,11 +113,12 @@ function itemLine(item: StatusItem, render: (item: StatusItem) => string, bullet
  * lines (Discord).
  */
 export function statusMarkdown(snapshot: StatusSnapshot, bulletItems = false): string {
+  const frame = snapshot.frame ?? 0;
   const lines = [
-    `🟢 **${escapeMarkdown(statusLabel(sanitizeModelName(snapshot.model)))}** · ${snapshot.phase} ${snapshot.elapsed}`,
+    `🟢 **${escapeMarkdown(statusLabel(sanitizeModelName(snapshot.model)))}** · ${animatedPhase(snapshot.phase, frame)} ${snapshot.elapsed}`,
   ];
-  for (const item of snapshot.tools) lines.push(itemLine(item, markdownLabel, bulletItems));
-  for (const item of snapshot.subagents) lines.push(itemLine(item, markdownLabel, bulletItems));
+  for (const item of snapshot.tools) lines.push(itemLine(item, markdownLabel, bulletItems, frame));
+  for (const item of snapshot.subagents) lines.push(itemLine(item, markdownLabel, bulletItems, frame));
   return lines.join("\n");
 }
 
@@ -107,11 +129,12 @@ export function statusMarkdownList(snapshot: StatusSnapshot): string {
 
 /** Classic Telegram `parse_mode: "HTML"` variant of the same block. */
 export function statusHtml(snapshot: StatusSnapshot): string {
+  const frame = snapshot.frame ?? 0;
   const lines = [
-    `🟢 <b>${escapeHtml(statusLabel(sanitizeModelName(snapshot.model)))}</b> · ${escapeHtml(snapshot.phase)} ${snapshot.elapsed}`,
+    `🟢 <b>${escapeHtml(statusLabel(sanitizeModelName(snapshot.model)))}</b> · ${escapeHtml(animatedPhase(snapshot.phase, frame))} ${snapshot.elapsed}`,
   ];
-  for (const item of snapshot.tools) lines.push(itemLine(item, htmlLabel, true));
-  for (const item of snapshot.subagents) lines.push(itemLine(item, htmlLabel, true));
+  for (const item of snapshot.tools) lines.push(itemLine(item, htmlLabel, true, frame));
+  for (const item of snapshot.subagents) lines.push(itemLine(item, htmlLabel, true, frame));
   return lines.join("\n");
 }
 

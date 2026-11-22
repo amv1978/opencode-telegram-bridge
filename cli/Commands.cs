@@ -512,6 +512,101 @@ internal static class Commands
         return 0;
     }
 
+    // ---------------------------------------------------------------- budget
+
+    public static async Task<int> BudgetAsync(ApiClient api, List<string> args)
+    {
+        var asJson = args.Contains("--json") || args.Contains("-j");
+        var rest = args.Where(arg => arg is not ("--json" or "-j")).ToList();
+
+        if (rest.Count > 0)
+        {
+            var action = rest[0].ToLowerInvariant();
+            if (action is "off" or "clear")
+            {
+                await api.PostAsync("/api/config", new { budget = new { perTurnUsd = "", dailyUsd = "" } });
+                Console.WriteLine("Лимиты бюджета сняты.");
+                return 0;
+            }
+
+            if (action is not ("set" or "on"))
+                throw new UsageException($"неизвестный параметр budget: {rest[0]} (ожидается set, off или --json)");
+
+            var perTurn = "";
+            var daily = "";
+            var mode = "";
+            foreach (var pair in rest.Skip(1))
+            {
+                var at = pair.IndexOf('=');
+                if (at <= 0) throw new UsageException($"параметр должен быть key=value: {pair}");
+                var key = pair[..at].ToLowerInvariant();
+                var value = pair[(at + 1)..];
+                switch (key)
+                {
+                    case "per-turn" or "per-turn-usd" or "turn":
+                        perTurn = value;
+                        break;
+                    case "daily" or "daily-usd" or "day":
+                        daily = value;
+                        break;
+                    case "action":
+                        mode = value;
+                        break;
+                    default:
+                        throw new UsageException($"неизвестный параметр бюджета: {key}");
+                }
+            }
+            if (mode.Length > 0 && mode is not ("warn" or "stop"))
+                throw new UsageException("action должен быть warn или stop");
+
+            var body = new Dictionary<string, object?>();
+            var budget = new Dictionary<string, object?>();
+            if (perTurn.Length > 0) budget["perTurnUsd"] = perTurn;
+            if (daily.Length > 0) budget["dailyUsd"] = daily;
+            if (mode.Length > 0) budget["action"] = mode;
+            if (budget.Count == 0) throw new UsageException("укажите хотя бы per-turn= или daily=");
+            body["budget"] = budget;
+            await api.PostAsync("/api/config", body);
+            Console.WriteLine("Бюджет сохранён.");
+            return 0;
+        }
+
+        var node = await api.GetAsync("/api/budget");
+        var status = node?["budget"];
+        if (asJson)
+        {
+            Console.WriteLine(status?.ToJsonString(Program.PrettyJson) ?? "null");
+            return 0;
+        }
+
+        if (status is null)
+        {
+            Console.WriteLine("Бюджет не инициализирован: бот не запущен.");
+            return 0;
+        }
+
+        WriteRow("Лимит хода", Money(status["perTurnUsd"]));
+        WriteRow("Лимит дня", Money(status["dailyUsd"]));
+        WriteRow("Действие", Text(status["action"]) == "stop" ? "остановить ход" : "только предупредить");
+        WriteRow("День (UTC)", OrDash(Text(status["day"])));
+        WriteRow("Потрачено", Money(status["spentUsd"]));
+        if (status["active"] is JsonArray active && active.Count > 0)
+        {
+            WriteRow("Активных ходов", active.Count.ToString(CultureInfo.InvariantCulture));
+            foreach (var turn in active.Take(10))
+                Console.WriteLine($"  {Text(turn?["sessionID"])}  {Money(turn?["spentUsd"])}");
+        }
+        return 0;
+    }
+
+    /// <summary>USD amount with two/four decimals; "—" when no cap is configured.</summary>
+    private static string Money(JsonNode? node)
+    {
+        if (node is null) return "—";
+        if (!double.TryParse(Text(node), NumberStyles.Float, CultureInfo.InvariantCulture, out var value)) return "—";
+        return "$" + (value < 1 ? value.ToString("0.0000", CultureInfo.InvariantCulture) : value.ToString("0.00", CultureInfo.InvariantCulture));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static string Text(JsonNode? node) => Json.Text(node);

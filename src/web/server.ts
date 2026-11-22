@@ -45,6 +45,10 @@ async function handle(app: App, request: Request): Promise<Response> {
       return json({ sessions: await app.sessions() });
     }
 
+    if (request.method === "GET" && url.pathname === "/api/budget") {
+      return json({ budget: app.budgetSnapshot() ?? null });
+    }
+
     if (request.method === "GET" && url.pathname === "/api/log") {
       const lines = Number(url.searchParams.get("lines") ?? 120);
       return json({ log: tailLog(app.paths.logFile, Number.isFinite(lines) ? lines : 120) });

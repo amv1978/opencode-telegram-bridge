@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.7.0 — 2026-11-22
+
+Тесты и CI, атомарная запись конфига, бюджеты стоимости, режимы разрешений и `/recent`.
+
+### Новое
+
+- **Бюджеты стоимости.** `budget: { perTurnUsd, dailyUsd, action }` в config.json.
+  Стоимость хода считается по дельте `session.cost` (база — `execution.started`),
+  дневная — суммой ходов за сутки UTC и переживает перезапуск (state.json).
+  На 80% лимита — предупреждение в чат сессии, на 100% — предупреждение или
+  прерывание хода (`action: "stop"`). Команда `/budget` (TG + Discord) и
+  `ocbridge-cli budget [--json|set|off]`.
+- **Режимы разрешений.** `permissions.mode: "ask" | "auto" | "plan"` — пресет для
+  новых сессий; `/mode` показывает текущий режим (по `session.permissions`) и
+  переключает его через `PATCH /api/session/{id}`. `auto` разрешает всё,
+  `plan` запрещает `write`/`edit`/`bash`.
+- **`/recent`.** Последние 20 сессий из всех проектов, корневые и неархивные;
+  `🔔` — есть непрочитанный ход (`time.idle > time.viewed`). Подключение кнопкой:
+  Telegram открывает тему (форум) или привязывает личный чат, Discord создаёт тред
+  и привязывает сессию.
+- **Атомарная запись.** `config.json` и `state.json` пишутся через временный файл
+  и rename, предыдущая версия сохраняется как `.bak`; повреждённый основной файл
+  читается из `.bak`. Старые файлы мигрируют молча.
+- **Тесты и CI.** `bun test` для чистых модулей (status, stats, Discord markdown,
+  media relay, model, forms, budget, permissions, recent, config/state),
+  workflow `.github/workflows/ci.yml`: `bun install`, `bunx tsc --noEmit`, `bun test`.
+
+### Проверки
+
+- `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`.
+
 ## 0.6.3 — 2026-11-22
 
 Формы выбора (`form.created`) теперь приходят в чат и отвечаются из Telegram и Discord.

@@ -22,6 +22,8 @@ internal static class Help
         Console.WriteLine("  autostart on|off|status   автозапуск приложения");
         Console.WriteLine("  doctor                    диагностика API, демона, OpenCode, Telegram, конфига и автозапуска");
         Console.WriteLine("  update [--check|--install|--rollback] проверка, установка bundle или откат на предыдущую версию");
+        Console.WriteLine("  budget [--json]           лимиты стоимости, расход за день и активные ходы");
+        Console.WriteLine("  budget set per-turn=1.5 daily=10 action=stop | budget off — настроить или снять лимиты");
         Console.WriteLine("  version                   версия CLI и версия API");
         Console.WriteLine("  help [команда]            эта справка или справка по команде");
         Console.WriteLine();
@@ -74,6 +76,12 @@ internal static class Help
                 "путь к конфигу, поддержка автозапуска. Каждая проверка — строка ✔ или ✖.",
             },
             "version" => new[] { "version — версия CLI и версия API из /api/state." },
+            "budget" => new[]
+            {
+                "budget [--json] — лимиты стоимости хода и дня, расход за текущие сутки (UTC), активные ходы.",
+                "budget set per-turn=1.5 daily=10 action=warn|stop — записать лимиты в config.json.",
+                "budget off — снять оба лимита. Значения — в USD; 80% лимита даёт предупреждение в чат.",
+            },
             "update" => new[]
             {
                 "update [--check|--install|--rollback] — обновление из GitHub Releases.",

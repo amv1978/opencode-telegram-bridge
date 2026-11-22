@@ -72,7 +72,16 @@ Commands are registered per allowed server on connect.
 | `/status` | model, agent, directory, cost, bridge version |
 | `/model [provider/id]` | show/change the model |
 | `/agent [id]` | list/change the agent |
+| `/mode [ask\|auto\|plan]` | show/change the session permission mode |
+| `/recent` | recent sessions with a `🔔` unread marker; a button creates a thread |
 | `/fmt` | formatting check |
+
+Permission modes (`ask` / `auto` / `plan`) work exactly as in Telegram: the preset
+comes from `config.json` → `permissions.mode` for new sessions, `/mode` changes the
+current one through `PATCH /api/session/{id}` (auto allows everything, plan denies
+`write`/`edit`/`bash`). Budget caps are configured in `config.json`
+(`budget: { perTurnUsd, dailyUsd, action }`); warnings go to the bound thread and
+`/budget` in Telegram shows the same numbers.
 
 ## 4. Thread model
 

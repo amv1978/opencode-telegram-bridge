@@ -24,6 +24,9 @@ import {
   type FormInfo,
   type FormValues,
 } from "../forms.ts";
+import { isPermissionMode, MODE_SUMMARY, modeOf, rulesForMode } from "../permissions.ts";
+import { recentEntries, recentLine } from "../recent.ts";
+import { formatUsd, type BudgetSnapshot } from "../budget.ts";
 import { enableHexFileTranscription, transcribeAudio } from "../audio/transcribe.ts";
 import {
   collectAgentFiles,
@@ -83,6 +86,15 @@ interface TelegramForm {
   awaitText?: string;
 }
 
+/** Topic title marker while a turn runs (`⏳` → `✅` → original). */
+interface TelegramTitle {
+  base: string;
+  phase: "idle" | "start" | "done";
+  lastRename: number;
+  version: number;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 export class Bridge {
   private readonly bot: Bot;
   private readonly streamer: Streamer;
@@ -91,6 +103,8 @@ export class Bridge {
   private readonly forms = new Map<string, TelegramForm>();
   /** formID → last render attempt, so the poller does not spam unmapped sessions. */
   private readonly seenForms = new Map<string, number>();
+  /** Per-session topic title markers (`⏳` / `✅`). */
+  private readonly titles = new Map<string, TelegramTitle>();
   private formTimer?: ReturnType<typeof setInterval>;
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent binding, so `execution.*` updates the parent block. */
@@ -115,6 +129,7 @@ export class Bridge {
       relay?: MediaRelay;
       onConfigChange?: () => void;
       onPollingError?: (message: string) => void;
+      budget?: () => BudgetSnapshot | undefined;
     } = {},
   ) {
     this.bot = new Bot(cfg.telegram.token, options.fetch ? { client: { fetch: options.fetch } } : {});
@@ -182,6 +197,8 @@ export class Bridge {
     if (this.formTimer) clearInterval(this.formTimer);
     this.formTimer = undefined;
     this.forms.clear();
+    for (const state of this.titles.values()) if (state.timer) clearTimeout(state.timer);
+    this.titles.clear();
     this.unsubscribe?.();
     await this.streamer.shutdown();
     await this.bot.stop();
@@ -311,6 +328,9 @@ export class Bridge {
     this.bot.command("status", (ctx) => this.cmdStatus(ctx));
     this.bot.command("model", (ctx) => this.cmdModel(ctx));
     this.bot.command("agent", (ctx) => this.cmdAgent(ctx));
+    this.bot.command("mode", (ctx) => this.cmdMode(ctx));
+    this.bot.command("recent", (ctx) => this.cmdRecent(ctx));
+    this.bot.command("budget", (ctx) => this.cmdBudget(ctx));
     this.bot.command("chatid", (ctx) => this.cmdChatId(ctx));
     this.bot.command("fmt", (ctx) => this.cmdFmt(ctx));
     this.bot.command("detach", (ctx) => this.cmdDetach(ctx));
@@ -347,6 +367,8 @@ export class Bridge {
         "/status — состояние сессии",
         "/model [provider/id] — модель",
         "/agent [id] — агент",
+        "/mode [ask|auto|plan] — режим разрешений",
+        "/recent — недавние сессии (🔔 = не прочитано)",
         "",
         `Ваша роль: <b>${user?.role ?? "user"}</b>`,
       ].join("\n"),
@@ -356,11 +378,86 @@ export class Bridge {
 
   private async cmdNew(ctx: Context): Promise<void> {
     const directory = argText(ctx) || this.cfg.defaultDirectory;
-    const session = await this.oc.createSession({ title: "Telegram session", directory });
+    const session = await this.oc.createSession({
+      title: "Telegram session",
+      directory,
+      permissions: rulesForMode(this.cfg.permissions?.mode ?? "ask"),
+    });
     await this.bind(ctx, session);
     await ctx.reply(`🆕 Сессия <code>${session.id}</code>\n📁 <code>${escape(session.location?.directory ?? "?")}</code>`, {
       parse_mode: "HTML",
     });
+  }
+
+  private async cmdMode(ctx: Context): Promise<void> {
+    const sessionID = await this.currentSession(ctx, false);
+    if (!sessionID) {
+      await ctx.reply("Нет активной сессии. /new или /attach.");
+      return;
+    }
+    const arg = argText(ctx).toLowerCase();
+    if (!arg) {
+      const session = await this.oc.getSession(sessionID).catch(() => undefined);
+      const mode = modeOf(session?.permissions);
+      await ctx.reply(
+        `🔐 Режим разрешений: <b>${mode}</b>\n<i>${escape(MODE_SUMMARY[mode])}</i>\n\n` +
+          "Сменить: <code>/mode ask</code>, <code>/mode auto</code>, <code>/mode plan</code>.",
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+    if (!isPermissionMode(arg)) {
+      await ctx.reply("Формат: <code>/mode ask|auto|plan</code>", { parse_mode: "HTML" });
+      return;
+    }
+    await this.oc.setPermissions(sessionID, rulesForMode(arg));
+    await ctx.reply(`✅ Режим: <b>${arg}</b> — <i>${escape(MODE_SUMMARY[arg])}</i>`, { parse_mode: "HTML" });
+  }
+
+  private async cmdRecent(ctx: Context): Promise<void> {    const list = await this.oc.listSessions({ limit: 20, order: "desc", archived: "false", parentID: null });
+    const entries = recentEntries(list, 10);
+    if (!entries.length) {
+      await ctx.reply("Сессий нет.");
+      return;
+    }
+    const lines = ["🗂 <b>Недавние сессии</b>", ""];
+    for (const [index, entry] of entries.entries()) lines.push(escape(recentLine(entry, index)));
+    lines.push("", "<i>🔔 — есть непрочитанный ход. Нажмите кнопку, чтобы подключиться.</i>");
+    const keyboard = new InlineKeyboard();
+    for (const [index, entry] of entries.entries()) {
+      const bell = entry.unread ? "🔔 " : "";
+      keyboard.text(`${index + 1}. ${bell}${entry.title}`.slice(0, 60), `recent:${entry.id}`).row();
+    }
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML", reply_markup: keyboard });
+  }
+
+  private async cmdBudget(ctx: Context): Promise<void> {
+    const snapshot = this.options.budget?.();
+    if (!snapshot) {
+      await ctx.reply("💰 Бюджет: демон не запущен.");
+      return;
+    }
+    const lines = ["💰 <b>Бюджет</b>"];
+    const limits: string[] = [];
+    if (snapshot.perTurnUsd) limits.push(`ход ${formatUsd(snapshot.perTurnUsd)}`);
+    if (snapshot.dailyUsd) limits.push(`день ${formatUsd(snapshot.dailyUsd)}`);
+    lines.push(limits.length ? `Лимиты: ${escape(limits.join(" · "))}` : "Лимиты не заданы.");
+    lines.push(
+      snapshot.dailyUsd
+        ? `Сегодня (UTC): ${formatUsd(snapshot.spentUsd)} из ${formatUsd(snapshot.dailyUsd)}`
+        : `Сегодня (UTC): ${formatUsd(snapshot.spentUsd)}`,
+    );
+    lines.push(`Действие: ${snapshot.action === "stop" ? "остановить ход" : "предупредить"}`);
+    if (snapshot.active.length) {
+      lines.push(`Активные ходы: ${snapshot.active.length}`);
+      for (const turn of snapshot.active.slice(0, 5)) {
+        const pct = snapshot.perTurnUsd ? Math.round((turn.spentUsd / snapshot.perTurnUsd) * 100) : 0;
+        lines.push(`· <code>${escape(turn.sessionID.slice(0, 16))}…</code> ${formatUsd(turn.spentUsd)}${pct ? ` (${pct}%)` : ""}`);
+      }
+    }
+    if (!limits.length) lines.push("", "Настройка: <code>ocbridge-cli budget set per-turn=1 daily=5</code>.");
+    else if (snapshot.perTurnUsd) lines.push("", `<i>80% — предупреждение, 100% — ${snapshot.action === "stop" ? "прерывание" : "ещё одно предупреждение"}.</i>`);
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
   }
 
   private async cmdSessions(ctx: Context): Promise<void> {
@@ -404,7 +501,11 @@ export class Bridge {
     }
     const title = argText(ctx) || "OpenCode";
     const topic = await this.bot.api.createForumTopic(this.cfg.topicsChatId, title);
-    const session = await this.oc.createSession({ title, directory: this.cfg.defaultDirectory });
+    const session = await this.oc.createSession({
+      title,
+      directory: this.cfg.defaultDirectory,
+      permissions: rulesForMode(this.cfg.permissions?.mode ?? "ask"),
+    });
     this.store.bindThread(topic.message_thread_id, session.id);
     this.store.upsert({ id: session.id, title: session.title, chatId: this.cfg.topicsChatId, threadId: topic.message_thread_id });
     await this.bot.api.sendMessage(this.cfg.topicsChatId, `🆕 Сессия <code>${session.id}</code>`, {
@@ -592,7 +693,11 @@ export class Bridge {
         const title = text.replace(/\s+/g, " ").slice(0, 48) || "Изображение";
         const topic = await this.bot.api.createForumTopic(chatId, title);
         topicID = topic.message_thread_id;
-        const session = await this.oc.createSession({ title, directory: this.cfg.defaultDirectory });
+        const session = await this.oc.createSession({
+          title,
+          directory: this.cfg.defaultDirectory,
+          permissions: rulesForMode(this.cfg.permissions?.mode ?? "ask"),
+        });
         sessionID = session.id;
         this.store.bindThread(topicID, session.id);
         this.store.upsert({ id: session.id, title: session.title, chatId, threadId: topicID });
@@ -880,6 +985,11 @@ export class Bridge {
       return;
     }
 
+    if (data.startsWith("recent:")) {
+      await this.onRecentCallback(ctx, data.slice(7));
+      return;
+    }
+
     if (data.startsWith("form:")) {
       const [, token, action, arg] = data.split(":");
       if (token && action) await this.onFormCallback(ctx, token, action, arg);
@@ -948,6 +1058,7 @@ export class Bridge {
           // appears so it never keeps "unknown model" or a stale /model value.
           catalogFor(this.oc).forget(sessionID);
           this.streamer.setModel(sessionID, await this.modelLabel(sessionID, true));
+          await this.markTitle(sessionID, "start");
         }
         await this.ensureStream(sessionID);
         break;
@@ -1003,6 +1114,7 @@ export class Bridge {
         if (stats.tps) parts.push(`⚡ ${stats.tps.toFixed(1)} tok/s`);
         if (stats.contextTokens) parts.push(`🧠 ${formatTokens(stats.contextTokens)}`);
         await this.streamer.end(sessionID, parts.join(" · "));
+        await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
         log.info(`turn ${event.type.replace("session.execution.", "")} ${sessionID.slice(0, 16)}`);
         break;
@@ -1034,8 +1146,12 @@ export class Bridge {
         if (this.appliedTitles.get(sessionID) === title) break;
         const target = this.targetFor(sessionID);
         if (!target?.threadId) break;
+        const state = this.titles.get(sessionID);
+        if (state) state.base = title;
+        const prefix = state?.phase === "start" ? "⏳ " : state?.phase === "done" ? "✅ " : "";
         try {
-          await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: title.slice(0, 128) });
+          await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: `${prefix}${title}`.slice(0, 128) });
+          if (state) state.lastRename = Date.now();
           this.appliedTitles.set(sessionID, title);
           this.store.setTitle(sessionID, title);
           log.info(`session renamed → topic: ${title}`);
@@ -1262,8 +1378,123 @@ export class Bridge {
     );
   }
 
-  // ------------------------------------------------------------------- forms
+  /** `/recent` button: attach a private chat or open a forum topic for the session. */
+  private async onRecentCallback(ctx: Context, sessionID: string): Promise<void> {
+    const session = await this.oc.getSession(sessionID).catch(() => undefined);
+    if (!session) {
+      await ctx.editMessageText("⌛️ Сессия не найдена.").catch(() => undefined);
+      return;
+    }
+    const chat = ctx.chat;
+    const isForum = Boolean(chat && (chat as { is_forum?: boolean }).is_forum) && chat?.type === "supergroup";
+    if (isForum && chat) {
+      const existing = this.store.session[sessionID];
+      if (existing?.threadId && existing.chatId === chat.id) {
+        try {
+          await this.bot.api.sendMessage(chat.id, "🗂 Тема этой сессии:", { message_thread_id: existing.threadId });
+          await ctx.editMessageText(`🗂 Сессия уже в теме «${escape(existing.title ?? session.title)}».`, {
+            parse_mode: "HTML",
+          });
+          return;
+        } catch {
+          // Topic was deleted — fall through and create a fresh one.
+        }
+      }
+      const topic = await this.openTopicForSession(chat.id, session);
+      await ctx.editMessageText(`🗂 Открыл тему «${escape(topic.title)}» — сессия продолжит жить, даже если тему закрыть.`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    if (chat) {
+      this.store.bindChat(chat.id, sessionID);
+      this.store.upsert({ id: sessionID, title: session.title, chatId: chat.id });
+    }
+    await ctx.editMessageText(
+      `🔗 Подключено: <b>${escape(session.title)}</b>\n<code>${session.id}</code>\n📁 <code>${escape(session.location?.directory ?? "?")}</code>`,
+      { parse_mode: "HTML" },
+    );
+  }
 
+  /** Budget/warning text from the central tracker. */
+  async sendSessionText(sessionID: string, text: string): Promise<boolean> {
+    const target = this.targetFor(sessionID);
+    if (!target) return false;
+    try {
+      await this.bot.api.sendMessage(target.chatId, text, {
+        ...(target.threadId ? { message_thread_id: target.threadId } : {}),
+      });
+      return true;
+    } catch (error) {
+      log.warn("send session text failed:", (error as Error).message);
+      return false;
+    }
+  }
+
+  // ------------------------------------------------------------------ titles
+
+  /**
+   * Topic title markers: `⏳ <title>` on turn start, `✅ <title>` on success and
+   * the original title after ~10 s. Telegram rate limits renames, so a second
+   * rename within 60 s is skipped and the restore is retried after the window.
+   */
+  private async markTitle(sessionID: string, phase: "start" | "done"): Promise<void> {
+    const target = this.targetFor(sessionID);
+    if (!target?.threadId) return;
+    let state = this.titles.get(sessionID);
+    if (!state) {
+      const meta = await this.sessionMeta(sessionID);
+      const base = (meta.title || this.store.session[sessionID]?.title || sessionID.slice(0, 12)).trim();
+      state = { base, phase: "idle", lastRename: 0, version: 0 };
+      this.titles.set(sessionID, state);
+    }
+    if (phase === "start") {
+      state.phase = "start";
+      state.version += 1;
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = undefined;
+      if (Date.now() - state.lastRename < 60_000) return;
+      if (await this.setTopicTitle(sessionID, `⏳ ${state.base}`)) state.lastRename = Date.now();
+      return;
+    }
+    if (state.phase !== "start") return;
+    state.phase = "done";
+    const version = state.version;
+    if (Date.now() - state.lastRename >= 60_000) {
+      if (await this.setTopicTitle(sessionID, `✅ ${state.base}`)) state.lastRename = Date.now();
+    }
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), 10_000);
+    state.timer.unref?.();
+  }
+
+  private async restoreTitle(sessionID: string, version: number): Promise<void> {
+    const state = this.titles.get(sessionID);
+    if (!state || state.version !== version || state.phase !== "done") return;
+    state.timer = undefined;
+    const wait = 60_000 - (Date.now() - state.lastRename);
+    if (wait > 0) {
+      state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), wait + 500);
+      state.timer.unref?.();
+      return;
+    }
+    state.phase = "idle";
+    if (await this.setTopicTitle(sessionID, state.base)) state.lastRename = Date.now();
+  }
+
+  private async setTopicTitle(sessionID: string, name: string): Promise<boolean> {
+    const target = this.targetFor(sessionID);
+    if (!target?.threadId) return false;
+    try {
+      await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: name.slice(0, 128) });
+      return true;
+    } catch (error) {
+      log.debug("topic title:", (error as Error).message);
+      return false;
+    }
+  }
+
+  // ------------------------------------------------------------------- forms
   /** Renders a pending form as one message: question text + inline options. */
   private async askForm(form: FormInfo | undefined): Promise<void> {
     if (!form?.id || !Array.isArray(form.fields) || !isChatRenderable(form)) return;

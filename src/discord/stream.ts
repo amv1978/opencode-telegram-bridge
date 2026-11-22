@@ -394,6 +394,7 @@ export class DiscordStreamer {
           count: tool.count,
           duration: formatDuration((tool.finishedAt ?? now) - tool.startedAt),
           mark: tool.state === "ok" ? "✓" : tool.state === "fail" ? "✗" : "",
+          active: tool.state === "running",
         });
       }
     }
@@ -413,6 +414,7 @@ export class DiscordStreamer {
       elapsed: formatDuration(now - state.startedAt),
       tools,
       subagents,
+      frame: Math.floor(now / 120),
     });
   }
 

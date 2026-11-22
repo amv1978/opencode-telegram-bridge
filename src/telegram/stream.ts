@@ -372,6 +372,7 @@ export class Streamer {
           count: tool.count,
           duration: formatElapsed((tool.finishedAt ?? now) - tool.startedAt),
           mark: tool.state === "ok" ? "✓" : tool.state === "fail" ? "✗" : "",
+          active: tool.state === "running",
         });
       }
     }
@@ -391,6 +392,7 @@ export class Streamer {
       elapsed,
       tools,
       subagents,
+      frame: Math.floor(now / 120),
     };
     return html ? statusHtml(snapshot) : statusMarkdownList(snapshot);
   }

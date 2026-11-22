@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { atomicWrite, readJsonFile } from "../atomic.ts";
 
 export interface SessionRecord {
   id: string;
@@ -29,6 +29,8 @@ export interface State {
   update?: Record<string, unknown>;
   /** Version replaced by the last successful bundle update ({app}\prev). */
   prevVersion?: string;
+  /** Cost spent today (UTC) for the budget tracker, survives restarts. */
+  budget?: { day: string; spentUsd: number };
 }
 
 const emptyState = (): State => ({ topics: {}, chats: {}, sessions: {}, discordThreads: {}, discordChannels: {}, discordSessions: {} });
@@ -39,23 +41,17 @@ export class Store {
 
   constructor(private readonly file: string) {
     this.data = emptyState();
-    if (!existsSync(file)) return;
-    try {
-      const raw = readFileSync(file, "utf8").replace(/^\uFEFF/, "");
-      const parsed = JSON.parse(raw) as Partial<State>;
-      const base = emptyState();
-      this.data = {
-        ...base,
-        ...parsed,
-        // Older state.json has no Discord maps: default them to empty objects.
-        discordThreads: parsed.discordThreads ?? {},
-        discordChannels: parsed.discordChannels ?? {},
-        discordSessions: parsed.discordSessions ?? {},
-      };
-    } catch {
-      // Corrupted state must not prevent the bot from starting.
-      this.data = emptyState();
-    }
+    const parsed = readJsonFile(file) as Partial<State> | undefined;
+    if (!parsed || typeof parsed !== "object") return;
+    const base = emptyState();
+    this.data = {
+      ...base,
+      ...parsed,
+      // Older state.json has no Discord maps: default them to empty objects.
+      discordThreads: parsed.discordThreads ?? {},
+      discordChannels: parsed.discordChannels ?? {},
+      discordSessions: parsed.discordSessions ?? {},
+    };
   }
 
   get session(): State["sessions"] {
@@ -223,12 +219,22 @@ export class Store {
     return this.data.prevVersion;
   }
 
+  budgetState(): { day: string; spentUsd: number } | undefined {
+    return this.data.budget;
+  }
+
+  setBudgetState(value: { day: string; spentUsd: number } | undefined): void {
+    if (value) this.data.budget = value;
+    else delete this.data.budget;
+    this.save();
+  }
+
   /** Flush immediately: the process is about to be replaced by the updater. */
   saveNow(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     try {
-      writeFileSync(this.file, JSON.stringify(this.data, null, 2), "utf8");
+      atomicWrite(this.file, JSON.stringify(this.data, null, 2));
     } catch {
       /* state persistence is best-effort */
     }
@@ -250,7 +256,7 @@ export class Store {
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       try {
-        writeFileSync(this.file, JSON.stringify(this.data, null, 2), "utf8");
+        atomicWrite(this.file, JSON.stringify(this.data, null, 2));
       } catch {
         /* state persistence is best-effort */
       }

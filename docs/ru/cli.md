@@ -16,7 +16,7 @@ HTTP-таймаут — 10 с.
 ```
 > ocbridge-cli status
 Состояние     running
-Версия        0.6.3
+Версия        0.7.0
 Пользователь  @my_bot
 OpenCode      2.3.2 (http://127.0.0.1:28894)
 Telegram      pinned 149.154.167.220
@@ -114,6 +114,29 @@ both
 Автозапуск включён.
 ```
 
+## budget
+
+```
+> ocbridge-cli budget
+Лимит хода     $1.50
+Лимит дня      $10.00
+Действие       остановить ход
+День (UTC)     2026-11-22
+Потрачено      $0.42
+Активных ходов 1
+  ses_e10c85685ffe…  $0.07
+
+> ocbridge-cli budget set per-turn=2 daily=15 action=stop
+Бюджет сохранён.
+
+> ocbridge-cli budget off
+Лимиты бюджета сняты.
+```
+
+`--json` печатает сырой снапшот `GET /api/budget`. Расход — сумма дельт
+стоимости ходов за текущие сутки UTC; на 80% в чат уходит предупреждение, на
+100% ход прерывается при `action = "stop"`.
+
 ## doctor
 
 ```
@@ -135,8 +158,8 @@ both
 
 ```
 > ocbridge-cli version
-ocbridge-cli 0.6.3
-API: 0.6.3
+ocbridge-cli 0.7.0
+API: 0.7.0
 OpenCode: 2.3.2
 
 > ocbridge-cli help logs

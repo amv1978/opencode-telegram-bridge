@@ -20,6 +20,8 @@ import { DiscordBridge } from "./discord/adapter.ts";
 import { MediaRelay } from "./media/relay.ts";
 import { Updater, type UpdateCache } from "./updater.ts";
 import { changelogBetween } from "./changelog.ts";
+import { BudgetTracker, type BudgetSnapshot } from "./budget.ts";
+import { isPermissionMode } from "./permissions.ts";
 
 export type BotState = "stopped" | "starting" | "running" | "error";
 
@@ -102,6 +104,10 @@ export class App {
   private discordRetryAttempt = 0;
   private ocVersion = "";
   private ocUrl = "";
+  private budget?: BudgetTracker;
+  private budgetUnsub?: () => void;
+  private budgetTimer?: ReturnType<typeof setInterval>;
+  private budgetChain: Promise<void> = Promise.resolve();
   private lastStartNotice = 0;
   private lastFailureNotice = 0;
   private suppressLifecycleNotice = false;
@@ -203,6 +209,7 @@ export class App {
       this.client = new OcClient(endpoint.baseUrl, endpoint.password);
       this.ocUrl = endpoint.baseUrl;
       this.ocVersion = (await this.client.info()).version;
+      this.startBudget();
       this.relay = new MediaRelay({
         store: this.store,
         media: () => this.cfg.media ?? { relay: "all", maxPhotoMb: 10 },
@@ -224,6 +231,7 @@ export class App {
         this.bridge = new Bridge(this.cfg, this.client, this.store, {
           fetch: this.net.fetch,
           relay: this.relay,
+          budget: () => this.budgetSnapshot(),
           onConfigChange: () => saveConfig(this.paths, this.cfg),
           onPollingError: (message) => {
             if (/409/.test(message)) {
@@ -250,6 +258,7 @@ export class App {
       this.error = (error as Error).message;
       log.error("start failed:", this.error);
       void this.sendFailureNotice(this.error);
+      this.stopBudget();
       await this.bridge?.stop().catch(() => undefined);
       await this.discord?.stop().catch(() => undefined);
       this.net?.stop();
@@ -261,11 +270,80 @@ export class App {
     }
   }
 
+  /** Budget caps are enforced centrally, independently of Telegram/Discord. */
+  private startBudget(): void {
+    if (!this.client || this.budget) return;
+    const client = this.client;
+    this.budget = new BudgetTracker({
+      config: () => this.cfg.budget,
+      costOf: async (sessionID) => (await client.getSession(sessionID)).cost,
+      interrupt: async (sessionID) => {
+        await client.interrupt(sessionID);
+        log.warn(`budget: interrupted ${sessionID.slice(0, 16)}`);
+      },
+      notify: (sessionID, text) => this.notifySession(sessionID, text),
+      load: () => this.store.budgetState(),
+      save: (state) => this.store.setBudgetState(state),
+    });
+    this.budgetUnsub = client.subscribe(
+      [
+        "session.execution.started",
+        "session.execution.succeeded",
+        "session.execution.failed",
+        "session.execution.interrupted",
+      ],
+      (event) => {
+        const sessionID = String(event.data?.sessionID ?? "");
+        if (!sessionID || !this.budget) return;
+        this.budgetChain = this.budgetChain
+          .then(() =>
+            event.type === "session.execution.started"
+              ? this.budget!.startTurn(sessionID)
+              : this.budget!.finishTurn(sessionID),
+          )
+          .catch((error) => log.warn("budget:", (error as Error).message));
+      },
+      (state) => log.info(`budget event stream ${state}`),
+    );
+    this.budgetTimer = setInterval(() => void this.budget?.tick(), 5_000);
+    this.budgetTimer.unref?.();
+  }
+
+  private stopBudget(): void {
+    this.budgetUnsub?.();
+    this.budgetUnsub = undefined;
+    if (this.budgetTimer) clearInterval(this.budgetTimer);
+    this.budgetTimer = undefined;
+    this.budget = undefined;
+    this.budgetChain = Promise.resolve();
+  }
+
+  budgetSnapshot(): BudgetSnapshot | undefined {
+    return this.budget?.snapshot();
+  }
+
+  /** Budget/warning text for a session: its chats first, admin notifications as a fallback. */
+  async notifySession(sessionID: string, text: string): Promise<void> {
+    let delivered = false;
+    try {
+      delivered = (await this.bridge?.sendSessionText(sessionID, text)) ?? false;
+    } catch (error) {
+      log.warn("budget notify (telegram):", (error as Error).message);
+    }
+    try {
+      delivered = (await this.discord?.sendSessionText(sessionID, text)) || delivered;
+    } catch (error) {
+      log.warn("budget notify (discord):", (error as Error).message);
+    }
+    if (!delivered) await this.notify(text);
+  }
+
   /** Discord is optional: any failure is logged and Telegram keeps running. */
   private async startDiscord(): Promise<void> {
     if (!this.client || !isDiscordConfigured(this.cfg) || this.discord) return;
     this.discord = new DiscordBridge(this.cfg, this.client, this.store, {
       relay: this.relay,
+      budget: () => this.budgetSnapshot(),
       onStateChange: (state, error) => {
         this.discordState = state;
         this.discordError = error;
@@ -346,6 +424,7 @@ export class App {
   }
 
   async stopBot(reason: "quit" | "restart" | "error" | "update" = "quit"): Promise<void> {
+    this.stopBudget();
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = undefined;
@@ -440,6 +519,18 @@ export class App {
         ...(this.cfg.notify ?? {}),
         targets: notify.targets.map((id) => String(id).trim()).filter(Boolean),
       };
+    }
+
+    const budget = (patch.budget ?? {}) as Record<string, unknown>;
+    const nextBudget = { ...(this.cfg.budget ?? { action: "warn" as const }) };
+    if ("perTurnUsd" in budget) nextBudget.perTurnUsd = readBudgetValue(budget.perTurnUsd);
+    if ("dailyUsd" in budget) nextBudget.dailyUsd = readBudgetValue(budget.dailyUsd);
+    if (budget.action === "warn" || budget.action === "stop") nextBudget.action = budget.action;
+    this.cfg.budget = nextBudget;
+
+    const permissions = (patch.permissions ?? {}) as Record<string, unknown>;
+    if (isPermissionMode(permissions.mode)) {
+      this.cfg.permissions = { ...(this.cfg.permissions ?? {}), mode: permissions.mode };
     }
 
     const ui = (patch.ui ?? {}) as Record<string, unknown>;
@@ -624,6 +715,14 @@ export function exeDir(): string {
   return isCompiled() ? dirname(process.execPath) : process.cwd();
 }
 
+/** Positive USD amount or `undefined` (cap disabled). */
+function readBudgetValue(value: unknown): number | undefined {
+  if (value === "" || value === null || value === undefined) return undefined;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return undefined;
+  return Math.round(number * 100) / 100;
+}
+
 function isAutostartEnabled(): boolean {
   if (process.platform !== "win32") return false;
   const result = spawnSync(
@@ -640,8 +739,7 @@ export function openBrowser(url: string): void {
   else spawnSync("xdg-open", [url]);
 }
 
-function formatUptime(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000));
+function formatUptime(ms: number): string {  const seconds = Math.max(0, Math.round(ms / 1000));
   if (seconds < 60) return `${seconds}с`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}м`;
@@ -651,8 +749,7 @@ function formatUptime(ms: number): string {
 }
 
 /** Accepts an array (API) or a comma/space separated string (manual config edits). */
-function parseIdList(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+function parseIdList(value: unknown): string[] {  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
   if (typeof value === "string") {
     return value
       .split(/[\s,;]+/)

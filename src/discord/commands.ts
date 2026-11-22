@@ -24,6 +24,17 @@ export const COMMANDS = [
     .setName("agent")
     .setDescription("Агент сессии")
     .addStringOption((option) => option.setName("agent").setDescription("id агента")),
+  new SlashCommandBuilder()
+    .setName("mode")
+    .setDescription("Режим разрешений: ask / auto / plan")
+    .addStringOption((option) =>
+      option
+        .setName("mode")
+        .setDescription("Новый режим (без аргумента — показать текущий)")
+        .addChoices({ name: "ask", value: "ask" }, { name: "auto", value: "auto" }, { name: "plan", value: "plan" }),
+    ),
+  new SlashCommandBuilder().setName("recent").setDescription("Недавние сессии, 🔔 = не прочитано"),
+  new SlashCommandBuilder().setName("budget").setDescription("Лимиты стоимости и расход за день"),
   new SlashCommandBuilder().setName("fmt").setDescription("Проверка форматирования Discord"),
 ].map((command) => command.toJSON());
 

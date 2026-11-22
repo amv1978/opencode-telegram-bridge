@@ -7,7 +7,7 @@ namespace OcbridgeCli;
 
 internal static class Program
 {
-    public const string Version = "0.6.3";
+    public const string Version = "0.7.0";
     public const string DefaultUrl = "http://127.0.0.1:7788";
 
     public static readonly JsonSerializerOptions PrettyJson = new()
@@ -80,6 +80,8 @@ internal static class Program
                 return await Commands.DoctorAsync(api);
             case "update":
                 return await Commands.UpdateAsync(api, args);
+            case "budget":
+                return await Commands.BudgetAsync(api, args);
             case "version" or "--version" or "-v":
                 return await Commands.VersionAsync(api);
             default:

@@ -16,7 +16,7 @@ HTTP timeout — 10 s.
 ```
 > ocbridge-cli status
 State         running
-Version       0.6.3
+Version       0.7.0
 User          @my_bot
 OpenCode      2.3.2 (http://127.0.0.1:28894)
 Telegram      pinned 149.154.167.220
@@ -116,6 +116,29 @@ Supported      yes
 Autostart enabled.
 ```
 
+## budget
+
+```
+> ocbridge-cli budget
+Лимит хода     $1.50
+Лимит дня      $10.00
+Действие       остановить ход
+День (UTC)     2026-11-22
+Потрачено      $0.42
+Активных ходов 1
+  ses_e10c85685ffe…  $0.07
+
+> ocbridge-cli budget set per-turn=2 daily=15 action=stop
+Бюджет сохранён.
+
+> ocbridge-cli budget off
+Лимиты бюджета сняты.
+```
+
+`--json` prints the raw snapshot from `GET /api/budget`. Spend is the sum of turn
+cost deltas for the current UTC day; at 80% the chat gets a warning and at 100%
+the turn is stopped when `action = "stop"`.
+
 ## doctor
 
 ```
@@ -137,8 +160,8 @@ If the daemon is not running, doctor exits immediately with code 3 and a hint.
 
 ```
 > ocbridge-cli version
-ocbridge-cli 0.6.3
-API: 0.6.3
+ocbridge-cli 0.7.0
+API: 0.7.0
 OpenCode: 2.3.2
 
 > ocbridge-cli help logs

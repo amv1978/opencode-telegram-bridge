@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "../log.ts";
 import type { FormAnswer, FormInfo } from "../forms.ts";
+import type { PermissionRule } from "../permissions.ts";
 
 export interface OcSession {
   id: string;
@@ -12,9 +13,9 @@ export interface OcSession {
   model?: { id: string; providerID: string; variant?: string };
   cost?: number;
   tokens?: { input: number; output: number; reasoning?: number; cache?: { read: number; write: number } };
-  time: { created: number; updated: number; busy?: number; idle?: number };
+  time: { created: number; updated: number; busy?: number; idle?: number; viewed?: number; archived?: number };
   location?: { directory: string };
-  permissions?: unknown[];
+  permissions?: PermissionRule[] | null;
 }
 
 export interface OcPart {
@@ -157,19 +158,33 @@ export class OcClient {
     return this.call("GET", "/api/info");
   }
 
-  async listSessions(params: { limit?: number; search?: string } = {}): Promise<OcSession[]> {
+  async listSessions(params: {
+    limit?: number;
+    search?: string;
+    order?: "asc" | "desc";
+    archived?: "true" | "false";
+    parentID?: string | null;
+  } = {}): Promise<OcSession[]> {
     const qs = new URLSearchParams();
     if (params.limit) qs.set("limit", String(params.limit));
     if (params.search) qs.set("search", params.search);
+    if (params.order) qs.set("order", params.order);
+    if (params.archived) qs.set("archived", params.archived);
+    if (params.parentID === null) qs.set("parentID", "null");
+    else if (params.parentID) qs.set("parentID", params.parentID);
     const data = await this.call<{ data: OcSession[] }>("GET", `/api/session${qs.size ? `?${qs}` : ""}`);
     return data.data;
   }
 
-  async createSession(input: { title?: string; directory?: string; permissions?: unknown[] }): Promise<OcSession> {
+  async createSession(input: {
+    title?: string;
+    directory?: string;
+    permissions?: PermissionRule[] | null;
+  }): Promise<OcSession> {
     const data = await this.call<{ data: OcSession }>("POST", "/api/session", {
       title: input.title,
       location: input.directory ? { directory: input.directory } : undefined,
-      permissions: input.permissions,
+      permissions: input.permissions ?? undefined,
     });
     return data.data;
   }
@@ -180,6 +195,11 @@ export class OcClient {
 
   async updateSession(sessionID: string, patch: { title?: string }): Promise<OcSession> {
     return (await this.call<{ data: OcSession }>("PATCH", `/api/session/${sessionID}`, patch)).data;
+  }
+
+  /** Replaces the session permission ruleset; `null` resets it to agent defaults. */
+  async setPermissions(sessionID: string, rules: PermissionRule[] | null): Promise<void> {
+    await this.call("PATCH", `/api/session/${sessionID}`, { permissions: rules });
   }
 
   async messages(sessionID: string, params: { limit?: number; order?: "asc" | "desc" } = {}): Promise<OcMessage[]> {

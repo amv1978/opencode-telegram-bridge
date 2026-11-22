@@ -18,6 +18,7 @@
 ```bash
 bun install
 bun run typecheck
+bun test                      # pure modules: status, stats, render, media, config
 bun run build                 # dist\ocbridge.exe
 ```
 
