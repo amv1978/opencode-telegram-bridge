@@ -1,6 +1,6 @@
 {
   "name": "opencode-telegram-bridge",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "type": "module",
   "description": "Telegram <-> OpenCode bridge: drive your coding sessions from chat",

@@ -25,6 +25,9 @@ start` or Desktop), so the bridge sees the same sessions as TUI and the desktop 
 | GET | `/api/model` | Configured models: `providerID`, `id`, `modelID`, `name` |
 | GET | `/api/session/active` | Sessions currently executing |
 | GET | `/api/session/{id}/inbox` | Prompts accepted but not started |
+| GET | `/api/session/{id}/form` | Pending forms (`Form.Info[]`) |
+| POST | `/api/session/{id}/form/{formID}/reply` | `{ answer: { key: value } }` |
+| DELETE | `/api/session/{id}/form/{formID}?message=` | Cancel a pending form |
 | GET | `/api/event?types=…` | SSE stream |
 
 Auth is Basic `opencode:<password>`; the password comes from `service.json`, the
@@ -53,8 +56,22 @@ The repeated `types` parameter is mandatory: OpenCode does not accept a comma li
 | `session.created` | Caches `parentID`/`agent`/`title` of a new session |
 | `session.model.selected` | Refreshes the model label in a live block |
 | `session.synthetic` | Subagent report (`<subagent>`) into the parent chat |
+| `form.created` | Posts a choice form (`{form}` payload, no top-level sessionID) |
+| `form.replied` | Closes the chat form with the chosen labels |
+| `form.cancelled` | Marks the chat form as cancelled |
 
 `session.idle` never arrives — the end of a turn is defined only by `session.execution.*`.
+
+**Forms.** `Form.Info` is `{ id: "frm_…", sessionID, title, metadata, fields[] }`;
+`metadata.kind` is `question`, `mcp-elicitation` or `websearch.provider`. Field types:
+`string` (with `options[]` → single choice, `custom` → free text), `multiselect`
+(`minItems`/`maxItems`), `boolean`, `number`, `integer` (`minimum`/`maximum`),
+`external` (a URL, not answered in chat). Common flags: `required`, `hidden`,
+`when[{key,op,value}]`, `default`. The reply body is
+`{ answer: { [key]: string | number | boolean | string[] } }`; invalid answers are
+`400 FormInvalidAnswerError`, settled forms `409 FormAlreadySettledError`.
+`form.created` is ephemeral and may be missed, so the adapters also poll
+`GET …/form` for bound sessions every 20 s.
 
 **Model label.** `session.model` is mapped through `/api/model` (`providerID/id` →
 `name`, also `modelID`); without a name the label is `providerID/id`, without a model

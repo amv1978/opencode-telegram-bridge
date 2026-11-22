@@ -25,6 +25,9 @@
 | GET | `/api/model` | Настроенные модели: `providerID`, `id`, `modelID`, `name` |
 | GET | `/api/session/active` | Сессии, которые сейчас выполняются |
 | GET | `/api/session/{id}/inbox` | Принятые, но не начатые prompt'ы |
+| GET | `/api/session/{id}/form` | Ожидающие формы (`Form.Info[]`) |
+| POST | `/api/session/{id}/form/{formID}/reply` | `{ answer: { key: value } }` |
+| DELETE | `/api/session/{id}/form/{formID}?message=` | Отменить ожидающую форму |
 | GET | `/api/event?types=…` | SSE-поток |
 
 Авторизация — Basic `opencode:<password>`; пароль из `service.json`, конфига или
@@ -53,8 +56,22 @@
 | `session.created` | Кэширует `parentID`/`agent`/`title` новой сессии |
 | `session.model.selected` | Обновляет имя модели в живом блоке |
 | `session.synthetic` | Отчёт субагента (`<subagent>`) в чат родителя |
+| `form.created` | Публикует форму выбора (payload `{form}`, sessionID внутри) |
+| `form.replied` | Закрывает форму в чате с выбранными подписями |
+| `form.cancelled` | Помечает форму в чате как отменённую |
 
 `session.idle` не приходит вообще — конец хода определяется только `session.execution.*`.
+
+**Формы.** `Form.Info` — это `{ id: "frm_…", sessionID, title, metadata, fields[] }`;
+`metadata.kind` — `question`, `mcp-elicitation` или `websearch.provider`. Типы полей:
+`string` (с `options[]` — один вариант, `custom` — свой текст), `multiselect`
+(`minItems`/`maxItems`), `boolean`, `number`, `integer` (`minimum`/`maximum`),
+`external` (ссылка, в чате не отвечается). Общие флаги: `required`, `hidden`,
+`when[{key,op,value}]`, `default`. Тело ответа —
+`{ answer: { [key]: string | number | boolean | string[] } }`; неверный ответ —
+`400 FormInvalidAnswerError`, уже отвеченная форма — `409 FormAlreadySettledError`.
+`form.created` эфемерно и может потеряться, поэтому адаптеры дополнительно опрашивают
+`GET …/form` привязанных сессий раз в 20 с.
 
 **Имя модели.** `session.model` сопоставляется с `/api/model` (`providerID/id` →
 `name`, а также `modelID`); без имени — `providerID/id`, без модели — `unknown model`.

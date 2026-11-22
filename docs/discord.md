@@ -124,6 +124,21 @@ Commands are registered per allowed server on connect.
   without asterisks so the markup does not break.
 - **Permissions**: `permission.asked` → a message with “Allow / Always / Deny”
   buttons, TTL 15 minutes.
+- **Forms**: `form.created` (`question`, `mcp-elicitation`, `websearch.provider`)
+  is posted as one message: title, `1/2 · Field`, then
+  - buttons for up to 5 options, a `StringSelectMenu` for 6–25, paged buttons
+    (15 per page) when there are more than 25;
+  - multi-select uses a select menu (`min`/`max` values) or toggles, confirmed by
+    **✅ Done**;
+  - boolean → `✅ Yes` / `❌ No`; text and number fields and **✍️ Own answer** open
+    a **modal** (free text, no message-based pending state);
+  - **⏭ Skip** for optional fields, **✖️ Cancel** calls
+    `DELETE …/form/{id}?message=Отменено в Discord`.
+  Answers go to `POST /api/session/{id}/form/{formID}/reply` with typed values;
+  the message becomes `✅ Answer sent` with the chosen labels and loses its
+  components. TTL 15 minutes (“Form expired — answer in OpenCode”);
+  `form.replied`/`form.cancelled` from Desktop/TUI close the message, and a 20 s
+  poll of bound sessions catches forms whose ephemeral event was missed.
 - **Attachments** (images and documents ≤ 20 MB) are downloaded and sent into the
   session as `files: [{uri: "data:…", name}]`.
 - **Voice/audio**: downloaded and recognised via HEX (`transcribeAudio`); the thread

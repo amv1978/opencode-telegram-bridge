@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "../log.ts";
+import type { FormAnswer, FormInfo } from "../forms.ts";
 
 export interface OcSession {
   id: string;
@@ -229,6 +230,22 @@ export class OcClient {
 
   async pendingPermissions(sessionID: string): Promise<Array<Record<string, any>>> {
     return (await this.call<{ data: Array<Record<string, any>> }>("GET", `/api/session/${sessionID}/permission`)).data;
+  }
+
+  /** Pending choice forms (`form.created`) for a session. */
+  async listForms(sessionID: string): Promise<FormInfo[]> {
+    return (await this.call<{ data: FormInfo[] }>("GET", `/api/session/${sessionID}/form`)).data;
+  }
+
+  /** Submits answers; values are typed per field (string/number/boolean/string[]). */
+  async replyForm(sessionID: string, formID: string, answer: FormAnswer): Promise<void> {
+    await this.call("POST", `/api/session/${sessionID}/form/${formID}/reply`, { answer });
+  }
+
+  /** Cancels a pending form, optionally telling the asker why. */
+  async cancelForm(sessionID: string, formID: string, message?: string): Promise<void> {
+    const qs = message ? `?message=${encodeURIComponent(message)}` : "";
+    await this.call("DELETE", `/api/session/${sessionID}/form/${formID}${qs}`);
   }
 
   /** Queued prompts that OpenCode has not started yet. */

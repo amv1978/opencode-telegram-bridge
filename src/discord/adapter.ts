@@ -6,11 +6,18 @@ import {
   Client,
   Events,
   GatewayIntentBits,
+  ModalBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type Attachment,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Interaction,
   type Message,
+  type ModalSubmitInteraction,
+  type StringSelectMenuInteraction,
   type ThreadChannel,
 } from "discord.js";
 import type { BridgeConfig } from "../config.ts";
@@ -32,6 +39,23 @@ import { DISCORD_CHUNK, chunkText, quoteBlock, italicLine, threadName, titleFrom
 import { modelLabel, turnStats } from "./stats.ts";
 import { catalogFor } from "../model.ts";
 import { DiscordStreamer, resolveSendable } from "./stream.ts";
+import {
+  activeFields,
+  buildAnswer,
+  defaultValues,
+  fieldHint,
+  fieldTitle,
+  fieldWidget,
+  FORM_TTL_MS,
+  isChatRenderable,
+  nextField,
+  parseText,
+  summarize,
+  type FormAnswer,
+  type FormField,
+  type FormInfo,
+  type FormValues,
+} from "../forms.ts";
 import pkg from "../../package.json";
 
 const EVENT_TYPES = [
@@ -47,6 +71,9 @@ const EVENT_TYPES = [
   "session.execution.interrupted",
   "session.inbox.enqueued",
   "permission.asked",
+  "form.created",
+  "form.replied",
+  "form.cancelled",
   "session.renamed",
   "session.created",
   "session.model.selected",
@@ -61,6 +88,18 @@ interface PendingPermission {
   sessionID: string;
   requestID: string;
   createdAt: number;
+}
+
+/** One chat-side form: draft answers and the message whose components it edits. */
+interface DiscordForm {
+  token: string;
+  form: FormInfo;
+  createdAt: number;
+  channelId: string;
+  messageId: string;
+  values: FormValues;
+  done: Set<string>;
+  page: number;
 }
 
 interface ThreadParent {
@@ -85,6 +124,10 @@ export class DiscordBridge {
   private client?: Client;
   private streamer?: DiscordStreamer;
   private readonly pending = new Map<string, PendingPermission>();
+  /** Choice forms rendered in chat, keyed by a short component token. */
+  private readonly forms = new Map<string, DiscordForm>();
+  private readonly seenForms = new Map<string, number>();
+  private formTimer?: ReturnType<typeof setInterval>;
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent agent, so `execution.*` updates the parent block. */
   private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
@@ -200,10 +243,17 @@ export class DiscordBridge {
 
     this.setState("running", "");
     log.info(`discord bot @${this.username} started (guilds=${guilds.length})`);
+    this.formTimer = setInterval(() => void this.tickForms(), 20_000);
+    this.formTimer.unref?.();
+    const firstPoll = setTimeout(() => void this.tickForms(), 6_000);
+    firstPoll.unref?.();
     return this.username;
   }
 
   async stop(): Promise<void> {
+    if (this.formTimer) clearInterval(this.formTimer);
+    this.formTimer = undefined;
+    this.forms.clear();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     await this.streamer?.shutdown().catch(() => undefined);
@@ -416,6 +466,14 @@ export class DiscordBridge {
   private async onInteraction(interaction: Interaction): Promise<void> {
     if (interaction.isButton()) {
       await this.onButton(interaction);
+      return;
+    }
+    if (interaction.isStringSelectMenu()) {
+      await this.onFormSelect(interaction);
+      return;
+    }
+    if (interaction.isModalSubmit()) {
+      await this.onFormModal(interaction);
       return;
     }
     if (!interaction.isChatInputCommand()) return;
@@ -696,6 +754,12 @@ export class DiscordBridge {
       return;
     }
 
+    if (event.type === "form.created") {
+      // Payload is `{form}` only: no sessionID at the top level.
+      await this.askForm(event.data.form as FormInfo);
+      return;
+    }
+
     const sessionID = String(event.data?.sessionID ?? "");
     if (!sessionID) return;
 
@@ -778,6 +842,12 @@ export class DiscordBridge {
       }
       case "permission.asked":
         await this.askPermission(event);
+        break;
+      case "form.replied":
+        await this.settleForm(String(event.data.id), "✅ Ответ отправлен", event.data.answer as FormAnswer | undefined);
+        break;
+      case "form.cancelled":
+        await this.settleForm(String(event.data.id), "⌛️ Форма отменена в OpenCode.");
         break;
       case "session.synthetic":
         await this.subagentReport(sessionID, event.data);
@@ -863,6 +933,10 @@ export class DiscordBridge {
 
   private async onButton(interaction: ButtonInteraction): Promise<void> {
     const data = interaction.customId;
+    if (data.startsWith("form:")) {
+      await this.onFormButton(interaction);
+      return;
+    }
     if (!data.startsWith("perm:")) return;
     if (interaction.guildId && !this.allowedGuild(interaction.guildId)) return;
     if (!this.allowedUser(interaction.user.id)) {
@@ -891,6 +965,470 @@ export class DiscordBridge {
       await interaction
         .update({ content: `⚠️ ${(error as Error).message.slice(0, 200)}`, components: [] })
         .catch(() => undefined);
+    }
+  }
+
+  // ------------------------------------------------------------------- forms
+
+  private async askForm(form: FormInfo | undefined): Promise<void> {
+    if (!form?.id || !Array.isArray(form.fields) || !isChatRenderable(form)) return;
+    if (this.findForm(form.id)) return;
+    const channelId = this.targetFor(String(form.sessionID ?? ""));
+    if (!channelId || !this.client) {
+      log.info(`discord form ${form.id.slice(0, 12)} for a session without a thread`);
+      return;
+    }
+    const state: DiscordForm = {
+      token: Math.random().toString(36).slice(2, 8),
+      form,
+      createdAt: Date.now(),
+      channelId,
+      messageId: "",
+      values: defaultValues(form),
+      done: new Set(),
+      page: 0,
+    };
+    this.forms.set(state.token, state);
+    this.seenForms.set(form.id, Date.now());
+    const view = this.formView(state);
+    try {
+      const channel = await resolveSendable(this.client, channelId);
+      if (!channel) throw new Error("channel unavailable");
+      const message = await channel.send({ ...view, allowedMentions: { parse: [] } });
+      state.messageId = message.id;
+      log.info(`discord form ${form.id.slice(0, 12)} (${String(form.metadata?.kind ?? "?")}) → ${channelId}`);
+      if (!nextField(activeFields(form, state.values), state.values, state.done)) await this.submitForm(state);
+    } catch (error) {
+      this.forms.delete(state.token);
+      log.warn("discord form message failed:", (error as Error).message);
+    }
+  }
+
+  private findForm(formID: string): DiscordForm | undefined {
+    for (const state of this.forms.values()) if (state.form.id === formID) return state;
+    return undefined;
+  }
+
+  private formView(state: DiscordForm, note?: string): { content: string; components: ActionRowBuilder<any>[] } {
+    const fields = activeFields(state.form, state.values);
+    const field = nextField(fields, state.values, state.done);
+    const lines = [`❓ **${(state.form.title || "Вопрос").slice(0, 200)}**`];
+    const message = String(state.form.metadata?.message ?? "").trim().slice(0, 300);
+    if (message) lines.push(`_${message}_`);
+    lines.push("");
+    if (!field) {
+      lines.push("Все вопросы отвечены — отправляю…");
+      return { content: lines.join("\n"), components: [] };
+    }
+    const index = fields.findIndex((item) => item.key === field.key) + 1;
+    lines.push(`**${index}/${fields.length}** · **${fieldTitle(field).slice(0, 120)}**`);
+    if (field.description) lines.push(field.description.slice(0, 300));
+    if (field.type === "external") lines.push(field.url.slice(0, 200));
+    const hint = fieldHint(field);
+    if (hint) lines.push(`_${hint}_`);
+    if (note) lines.push("", `⚠️ ${note}`);
+    return { content: lines.join("\n"), components: this.formComponents(state, field) };
+  }
+
+  /** Buttons for few options, a select menu for 6–25, paged buttons for more. */
+  private formComponents(state: DiscordForm, field: FormField): ActionRowBuilder<any>[] {
+    const rows: ActionRowBuilder<any>[] = [];
+    const token = state.token;
+    const widget = fieldWidget(field);
+    const options = "options" in field && Array.isArray(field.options) ? field.options : [];
+    const selected = Array.isArray(state.values[field.key]) ? (state.values[field.key] as string[]) : [];
+    if ((widget === "choice" || widget === "multi") && options.length) {
+      if (options.length > 5 && options.length <= 25) {
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId(`form:${token}:select`)
+          .setPlaceholder(widget === "multi" ? "Выберите один или несколько" : "Выберите вариант")
+          .addOptions(
+            options.map((option, index) => {
+              const item = new StringSelectMenuOptionBuilder()
+                .setLabel(option.label.slice(0, 100))
+                .setValue(String(index))
+                .setDefault(selected.includes(option.value));
+              if (option.description) item.setDescription(option.description.slice(0, 100));
+              return item;
+            }),
+          );
+        if (field.type === "multiselect") {
+          const min = Math.max(0, Math.min(field.minItems ?? 1, options.length));
+          const max = Math.min(field.maxItems ?? options.length, options.length);
+          menu.setMinValues(min).setMaxValues(Math.max(min, max));
+        }
+        rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
+      } else {
+        const pageSize = options.length > 25 ? 15 : options.length;
+        const pages = Math.max(1, Math.ceil(options.length / pageSize));
+        const page = Math.min(Math.max(0, state.page), pages - 1);
+        const slice = options.slice(page * pageSize, (page + 1) * pageSize);
+        let row = new ActionRowBuilder<ButtonBuilder>();
+        slice.forEach((option, index) => {
+          const absolute = page * pageSize + index;
+          const mark = selected.includes(option.value) ? "🔹 " : "";
+          const action = widget === "multi" ? "toggle" : "pick";
+          row.addComponents(
+            new ButtonBuilder()
+              .setCustomId(`form:${token}:${action}:${absolute}`)
+              .setLabel(`${mark}${option.label}`.slice(0, 80))
+              .setStyle(selected.includes(option.value) ? ButtonStyle.Primary : ButtonStyle.Secondary),
+          );
+          if (row.components.length === 5) {
+            rows.push(row);
+            row = new ActionRowBuilder<ButtonBuilder>();
+          }
+        });
+        if (row.components.length) rows.push(row);
+        if (pages > 1) {
+          rows.push(
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder().setCustomId(`form:${token}:page:${(page - 1 + pages) % pages}`).setLabel("◀").setStyle(ButtonStyle.Secondary),
+              new ButtonBuilder().setCustomId(`form:${token}:noop`).setLabel(`${page + 1}/${pages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+              new ButtonBuilder().setCustomId(`form:${token}:page:${(page + 1) % pages}`).setLabel("▶").setStyle(ButtonStyle.Secondary),
+            ),
+          );
+        }
+      }
+    }
+    const controls = new ActionRowBuilder<ButtonBuilder>();
+    if (widget === "flag") {
+      controls.addComponents(
+        new ButtonBuilder().setCustomId(`form:${token}:flag:1`).setLabel("✅ Да").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`form:${token}:flag:0`).setLabel("❌ Нет").setStyle(ButtonStyle.Danger),
+      );
+    }
+    if (widget === "text" || widget === "number") {
+      controls.addComponents(
+        new ButtonBuilder().setCustomId(`form:${token}:custom`).setLabel("✍️ Ввести ответ").setStyle(ButtonStyle.Primary),
+      );
+    }
+    if (widget === "multi") {
+      controls.addComponents(
+        new ButtonBuilder().setCustomId(`form:${token}:done`).setLabel("✅ Готово").setStyle(ButtonStyle.Success),
+      );
+    }
+    if ("custom" in field && field.custom && (widget === "choice" || widget === "multi")) {
+      controls.addComponents(
+        new ButtonBuilder().setCustomId(`form:${token}:custom`).setLabel("✍️ Свой ответ").setStyle(ButtonStyle.Primary),
+      );
+    }
+    if (!field.required) {
+      controls.addComponents(
+        new ButtonBuilder().setCustomId(`form:${token}:skip`).setLabel("⏭ Пропустить").setStyle(ButtonStyle.Secondary),
+      );
+    }
+    controls.addComponents(
+      new ButtonBuilder().setCustomId(`form:${token}:cancel`).setLabel("✖️ Отменить").setStyle(ButtonStyle.Danger),
+    );
+    rows.push(controls);
+    return rows.slice(0, 5);
+  }
+
+  private async onFormButton(interaction: ButtonInteraction): Promise<void> {
+    if (interaction.guildId && !this.allowedGuild(interaction.guildId)) return;
+    if (!this.allowedUser(interaction.user.id)) {
+      await interaction.reply({ content: "⛔️ Нет доступа.", ephemeral: true }).catch(() => undefined);
+      return;
+    }
+    const [, token, action, arg] = interaction.customId.split(":");
+    const state = token ? this.forms.get(token) : undefined;
+    if (!state) {
+      await interaction.update({ content: "⌛️ Форма устарела — ответьте в OpenCode.", components: [] }).catch(() => undefined);
+      return;
+    }
+    if (Date.now() - state.createdAt > FORM_TTL_MS) {
+      await this.expireForm(state, interaction);
+      return;
+    }
+    if (action === "noop") return;
+    if (action === "cancel") {
+      this.forms.delete(state.token);
+      await interaction
+        .update({ content: `✖️ **Форма отменена**\n_${state.form.title}_`, components: [] })
+        .catch(() => undefined);
+      await this.oc
+        .cancelForm(state.form.sessionID, state.form.id, "Отменено в Discord")
+        .catch((error) => log.warn("discord form cancel:", (error as Error).message));
+      return;
+    }
+    const fields = activeFields(state.form, state.values);
+    const field = nextField(fields, state.values, state.done);
+    if (!field) {
+      await this.submitForm(state, interaction);
+      return;
+    }
+    const options = "options" in field && Array.isArray(field.options) ? field.options : [];
+    switch (action) {
+      case "pick": {
+        const option = options[Number(arg)];
+        if (!option) return;
+        state.values[field.key] = option.value;
+        state.done.add(field.key);
+        state.page = 0;
+        break;
+      }
+      case "toggle": {
+        const option = options[Number(arg)];
+        if (!option) return;
+        const current = Array.isArray(state.values[field.key]) ? [...(state.values[field.key] as string[])] : [];
+        const at = current.indexOf(option.value);
+        if (at >= 0) current.splice(at, 1);
+        else current.push(option.value);
+        state.values[field.key] = current;
+        break;
+      }
+      case "done": {
+        const value = state.values[field.key];
+        if (!Array.isArray(value) || value.length === 0) {
+          await interaction.reply({ content: "Выберите хотя бы один вариант.", ephemeral: true }).catch(() => undefined);
+          return;
+        }
+        state.done.add(field.key);
+        state.page = 0;
+        break;
+      }
+      case "flag": {
+        state.values[field.key] = arg === "1";
+        state.done.add(field.key);
+        break;
+      }
+      case "page": {
+        state.page = Math.max(0, Number(arg) || 0);
+        break;
+      }
+      case "custom": {
+        // A modal is the only way to type free text in Discord.
+        await this.showFormModal(interaction, state, field).catch((error) =>
+          log.warn("discord form modal:", (error as Error).message),
+        );
+        return;
+      }
+      case "skip": {
+        delete state.values[field.key];
+        state.done.add(field.key);
+        state.page = 0;
+        break;
+      }
+      default:
+        return;
+    }
+    await this.advanceForm(state, interaction);
+  }
+
+  private async showFormModal(
+    interaction: ButtonInteraction,
+    state: DiscordForm,
+    field: FormField,
+  ): Promise<void> {
+    const multiline = field.type === "string" || field.type === "multiselect";
+    const input = new TextInputBuilder()
+      .setCustomId("value")
+      .setLabel(fieldTitle(field).slice(0, 45))
+      .setStyle(multiline ? TextInputStyle.Paragraph : TextInputStyle.Short)
+      .setRequired(field.required === true)
+      .setMaxLength(Math.min(multiline ? 4000 : 256, field.type === "string" ? field.maxLength ?? 4000 : 256));
+    if (field.type === "string" && field.placeholder) input.setPlaceholder(field.placeholder.slice(0, 100));
+    const modal = new ModalBuilder()
+      .setCustomId(`form:${state.token}:modal`)
+      .setTitle(fieldTitle(field).slice(0, 45))
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    await interaction.showModal(modal);
+  }
+
+  private async onFormSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+    if (interaction.guildId && !this.allowedGuild(interaction.guildId)) return;
+    if (!this.allowedUser(interaction.user.id)) {
+      await interaction.reply({ content: "⛔️ Нет доступа.", ephemeral: true }).catch(() => undefined);
+      return;
+    }
+    const [, token] = interaction.customId.split(":");
+    const state = token ? this.forms.get(token) : undefined;
+    if (!state) {
+      await interaction.update({ content: "⌛️ Форма устарела — ответьте в OpenCode.", components: [] }).catch(() => undefined);
+      return;
+    }
+    if (Date.now() - state.createdAt > FORM_TTL_MS) {
+      await this.expireForm(state, interaction);
+      return;
+    }
+    const fields = activeFields(state.form, state.values);
+    const field = nextField(fields, state.values, state.done);
+    if (!field || !("options" in field) || !Array.isArray(field.options)) return;
+    const picked = interaction.values
+      .map((value) => field.options?.[Number(value)]?.value)
+      .filter((value): value is string => Boolean(value));
+    if (field.type === "multiselect") {
+      state.values[field.key] = picked;
+      // Multi-select keeps the draft open: «Готово» confirms the selection.
+      await this.advanceForm(state, interaction);
+      return;
+    }
+    if (!picked.length) return;
+    state.values[field.key] = picked[0]!;
+    state.done.add(field.key);
+    state.page = 0;
+    await this.advanceForm(state, interaction);
+  }
+
+  private async onFormModal(interaction: ModalSubmitInteraction): Promise<void> {
+    const [, token] = interaction.customId.split(":");
+    const state = token ? this.forms.get(token) : undefined;
+    if (!state) {
+      await interaction.reply({ content: "⌛️ Форма устарела — ответьте в OpenCode.", ephemeral: true }).catch(() => undefined);
+      return;
+    }
+    if (interaction.guildId && !this.allowedGuild(interaction.guildId)) return;
+    if (!this.allowedUser(interaction.user.id)) {
+      await interaction.reply({ content: "⛔️ Нет доступа.", ephemeral: true }).catch(() => undefined);
+      return;
+    }
+    if (Date.now() - state.createdAt > FORM_TTL_MS) {
+      await interaction.deferUpdate().catch(() => undefined);
+      await this.expireForm(state);
+      return;
+    }
+    const fields = activeFields(state.form, state.values);
+    const field = nextField(fields, state.values, state.done);
+    if (!field) return;
+    const text = interaction.fields.getTextInputValue("value") ?? "";
+    if (field.type === "multiselect") {
+      const current = Array.isArray(state.values[field.key]) ? [...(state.values[field.key] as string[])] : [];
+      const value = text.trim();
+      if (value && !current.includes(value)) current.push(value);
+      state.values[field.key] = current;
+    } else {
+      const parsed = parseText(field, text);
+      if (parsed.error) {
+        await interaction.reply({ content: `⚠️ ${parsed.error}`, ephemeral: true }).catch(() => undefined);
+        return;
+      }
+      if (parsed.value === undefined) delete state.values[field.key];
+      else state.values[field.key] = parsed.value;
+    }
+    state.done.add(field.key);
+    await interaction.deferUpdate().catch(() => undefined);
+    await this.advanceForm(state);
+  }
+
+  private async advanceForm(
+    state: DiscordForm,
+    interaction?: ButtonInteraction | StringSelectMenuInteraction,
+  ): Promise<void> {
+    const fields = activeFields(state.form, state.values);
+    if (!nextField(fields, state.values, state.done)) {
+      await this.submitForm(state, interaction);
+      return;
+    }
+    await this.renderForm(state, undefined, interaction);
+  }
+
+  private async submitForm(
+    state: DiscordForm,
+    interaction?: ButtonInteraction | StringSelectMenuInteraction,
+  ): Promise<void> {
+    const fields = activeFields(state.form, state.values);
+    const { answer, error } = buildAnswer(fields, state.values);
+    if (!answer) {
+      await this.renderForm(state, error, interaction);
+      return;
+    }
+    try {
+      await this.oc.replyForm(state.form.sessionID, state.form.id, answer);
+    } catch (failure) {
+      const message = (failure as Error).message;
+      if (/\b(404|409)\b/.test(message)) {
+        this.forms.delete(state.token);
+        await this.finishForm(state, `⌛️ **Форма устарела** — ответьте в OpenCode.\n_${state.form.title}_`);
+      } else {
+        log.warn("discord form reply:", message);
+        await this.renderForm(state, message.slice(0, 200), interaction);
+      }
+      return;
+    }
+    this.forms.delete(state.token);
+    const lines = ["✅ **Ответ отправлен**", `_${state.form.title}_`, ""];
+    for (const row of summarize(state.form, answer).slice(0, 20)) lines.push(`• ${row.slice(0, 300)}`);
+    await this.finishForm(state, lines.join("\n"));
+    log.info(`discord form ${state.form.id.slice(0, 12)} answered`);
+  }
+
+  private async renderForm(
+    state: DiscordForm,
+    note?: string,
+    interaction?: ButtonInteraction | StringSelectMenuInteraction,
+  ): Promise<void> {
+    const view = this.formView(state, note);
+    try {
+      if (interaction) {
+        await interaction.update(view);
+        return;
+      }
+      const channel = this.client ? await resolveSendable(this.client, state.channelId) : undefined;
+      if (!channel) return;
+      const message = await channel.messages.fetch(state.messageId);
+      await message.edit(view);
+    } catch (error) {
+      log.debug("discord form edit failed:", (error as Error).message);
+    }
+  }
+
+  private async finishForm(state: DiscordForm, content: string): Promise<void> {
+    try {
+      const channel = this.client ? await resolveSendable(this.client, state.channelId) : undefined;
+      if (!channel) return;
+      const message = await channel.messages.fetch(state.messageId);
+      await message.edit({ content, components: [] });
+    } catch (error) {
+      log.debug("discord form final edit failed:", (error as Error).message);
+    }
+  }
+
+  private async expireForm(state: DiscordForm, interaction?: ButtonInteraction | StringSelectMenuInteraction): Promise<void> {
+    this.forms.delete(state.token);
+    const content = `⌛️ **Форма устарела** — ответьте в OpenCode.\n_${state.form.title}_`;
+    if (interaction) {
+      await interaction.update({ content, components: [] }).catch(() => undefined);
+      return;
+    }
+    await this.finishForm(state, content);
+  }
+
+  /** `form.replied` / `form.cancelled` from Desktop or the TUI. */
+  private async settleForm(formID: string, label: string, answer?: FormAnswer): Promise<void> {
+    for (const state of [...this.forms.values()]) {
+      if (state.form.id !== formID) continue;
+      this.forms.delete(state.token);
+      const lines = [label, `_${state.form.title}_`];
+      if (answer) {
+        const rows = summarize(state.form, answer);
+        if (rows.length) lines.push("", ...rows.slice(0, 20).map((row) => `• ${row.slice(0, 300)}`));
+      }
+      await this.finishForm(state, lines.join("\n"));
+    }
+  }
+
+  /** Polls bound sessions for forms whose ephemeral event was missed. */
+  private async tickForms(): Promise<void> {
+    const now = Date.now();
+    for (const state of [...this.forms.values()]) {
+      if (now - state.createdAt > FORM_TTL_MS) await this.expireForm(state);
+    }
+    for (const [formID, at] of this.seenForms) {
+      if (now - at > 60 * 60_000) this.seenForms.delete(formID);
+    }
+    let scanned = 0;
+    for (const sessionID of Object.keys(this.store.session)) {
+      if (scanned >= 20) break;
+      if (!this.targetFor(sessionID)) continue;
+      scanned += 1;
+      const forms = await this.oc.listForms(sessionID).catch(() => []);
+      for (const form of forms) {
+        if (this.findForm(form.id)) continue;
+        const attempted = this.seenForms.get(form.id) ?? 0;
+        if (now - attempted < 5 * 60_000) continue;
+        await this.askForm(form);
+      }
     }
   }
 

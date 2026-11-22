@@ -115,6 +115,32 @@ A `permission.asked` request arrives as a message with buttons:
 The request lives for 15 minutes; an expired button answers “Request expired”.
 Multiple requests are stored independently (key in callback data).
 
+## Forms and choices
+
+When OpenCode asks a question with options (`form.created`, kinds `question`,
+`mcp-elicitation`, `websearch.provider`), the bridge posts it to the bound chat as
+one message:
+
+- the form title, the optional description and `1/2 · Field name` when there are
+  several fields;
+- one inline button per option (8 per page, `◀ 2/3 ▶` for long lists);
+- **multi-select** fields toggle (`🔹`) and confirm with **✅ Done**;
+- **boolean** fields — `✅ Yes` / `❌ No`;
+- **text/number** fields — the **✍️ Enter answer** button, then the answer is typed
+  as the next message (the form remembers which field is waiting);
+- **custom answer** (`custom: true`) — **✍️ Own answer**, then the text message;
+- **⏭ Skip** for optional fields, **✖️ Cancel form** answers the API with
+  `DELETE …/form/{id}?message=Отменено в Telegram`.
+
+Answers are posted to `POST /api/session/{id}/form/{formID}/reply` with typed
+values (`string`, `number`, `boolean`, `string[]`); the message is edited to
+`✅ Answer sent` with the chosen labels and the keyboard is removed. The form
+lives for 15 minutes: an expired button says “Form expired — answer in OpenCode”.
+`form.replied`/`form.cancelled` (answered in Desktop/TUI) edit the message to the
+same final state, so the chat never shows a stale question. Forms created before
+the bridge started (or with a missed ephemeral event) are picked up by a 20 s
+poll of bound sessions.
+
 ## Echo protection
 
 The bridge mirrors a prompt typed in Desktop/TUI into the bound chat (as a quote).

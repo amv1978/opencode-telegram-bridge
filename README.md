@@ -18,6 +18,9 @@ sessions**; no OpenCode plugin is required.
 - **Slash commands** on both transports: `/help`, `/new`, `/sessions`, `/attach`,
   `/detach`, `/stop`, `/status`, `/model`, `/agent`, `/fmt`.
 - **Permission buttons**: Allow / Always / Deny (Telegram and Discord).
+- **Forms and choices**: OpenCode questions (`form.created`) arrive as option
+  buttons, multi-select toggles and select menus/modals; answers are posted back to
+  the form API and the message is edited to the chosen labels.
 - **Voice input**: OGG/Opus → ffmpeg → HEX, fully local, no cloud.
 - **Media relay** between all bound chats (Telegram topic/chat ↔ Discord
   thread/channel), including files produced by the agent; over platform limits the
@@ -41,9 +44,9 @@ sessions**; no OpenCode plugin is required.
 
 ### Installer (Windows 10/11)
 
-1. Run `ocbridge-setup-standalone-0.6.2.exe` (offline) or `ocbridge-setup-lite-0.6.2.exe`
+1. Run `ocbridge-setup-standalone-0.6.3.exe` (offline) or `ocbridge-setup-lite-0.6.3.exe`
    (downloads the portable bundle, ~2 MB). The portable layout is also available
-   as `ocbridge-bundle-0.6.2.zip`.
+   as `ocbridge-bundle-0.6.3.zip`.
 2. Paste the bot token from [@BotFather](https://t.me/BotFather) - you may skip this
    and set it later in the panel `http://127.0.0.1:7788`.
 3. Send `/start` to the bot — the first user becomes administrator.

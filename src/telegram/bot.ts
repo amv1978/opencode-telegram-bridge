@@ -7,6 +7,23 @@ import { catalogFor, resolveModelLabel, sanitizeModelName, UNKNOWN_MODEL } from 
 import type { Store } from "../state/store.ts";
 import { entitiesToMarkdown } from "./entities.ts";
 import { Streamer, type Target } from "./stream.ts";
+import {
+  activeFields,
+  buildAnswer,
+  defaultValues,
+  fieldHint,
+  fieldTitle,
+  fieldWidget,
+  FORM_TTL_MS,
+  isChatRenderable,
+  nextField,
+  parseText,
+  summarize,
+  type FormAnswer,
+  type FormField,
+  type FormInfo,
+  type FormValues,
+} from "../forms.ts";
 import { enableHexFileTranscription, transcribeAudio } from "../audio/transcribe.ts";
 import {
   collectAgentFiles,
@@ -32,6 +49,9 @@ const EVENT_TYPES = [
   "session.execution.interrupted",
   "session.inbox.enqueued",
   "permission.asked",
+  "form.created",
+  "form.replied",
+  "form.cancelled",
   "session.renamed",
   "session.created",
   "session.model.selected",
@@ -48,10 +68,30 @@ interface PendingPermission {
   createdAt: number;
 }
 
+/** One chat-side form: question index, draft answers and the message it edits. */
+interface TelegramForm {
+  token: string;
+  form: FormInfo;
+  createdAt: number;
+  chatId: number;
+  threadId?: number;
+  messageId: number;
+  values: FormValues;
+  done: Set<string>;
+  page: number;
+  /** Field key waiting for a typed answer. */
+  awaitText?: string;
+}
+
 export class Bridge {
   private readonly bot: Bot;
   private readonly streamer: Streamer;
   private readonly pending = new Map<string, PendingPermission>();
+  /** Choice forms rendered in chat, keyed by a short callback token. */
+  private readonly forms = new Map<string, TelegramForm>();
+  /** formID → last render attempt, so the poller does not spam unmapped sessions. */
+  private readonly seenForms = new Map<string, number>();
+  private formTimer?: ReturnType<typeof setInterval>;
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent binding, so `execution.*` updates the parent block. */
   private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
@@ -127,12 +167,21 @@ export class Bridge {
     // usually means a stuck/busy session. Log it once and show a UI hint.
     this.doctorTimer = setInterval(() => this.checkAdmitted(), 5_000);
     this.doctorTimer.unref?.();
+    // `form.created` is ephemeral and can be missed (Desktop also falls back to
+    // a form sync), so bound sessions are polled for pending forms.
+    this.formTimer = setInterval(() => void this.tickForms(), 20_000);
+    this.formTimer.unref?.();
+    const firstPoll = setTimeout(() => void this.tickForms(), 4_000);
+    firstPoll.unref?.();
     return username;
   }
 
   async stop(): Promise<void> {
     if (this.doctorTimer) clearInterval(this.doctorTimer);
     this.doctorTimer = undefined;
+    if (this.formTimer) clearInterval(this.formTimer);
+    this.formTimer = undefined;
+    this.forms.clear();
     this.unsubscribe?.();
     await this.streamer.shutdown();
     await this.bot.stop();
@@ -519,6 +568,7 @@ export class Bridge {
       log.warn("ignored echo of a bridge-posted message");
       return;
     }
+    if (await this.handleFormText(ctx, text)) return;
     await this.submitTask(ctx, text);
   }
 
@@ -830,6 +880,12 @@ export class Bridge {
       return;
     }
 
+    if (data.startsWith("form:")) {
+      const [, token, action, arg] = data.split(":");
+      if (token && action) await this.onFormCallback(ctx, token, action, arg);
+      return;
+    }
+
     if (data.startsWith("perm:")) {
       const [, key, decision] = data.split(":");
       const pending = key ? this.pending.get(key) : undefined;
@@ -852,6 +908,12 @@ export class Bridge {
   // ------------------------------------------------------------------ events
 
   private async onEvent(event: OcEvent): Promise<void> {
+    if (event.type === "form.created") {
+      // Payload is `{form}` only: no sessionID at the top level.
+      await this.askForm(event.data.form as FormInfo);
+      return;
+    }
+
     if (event.type === "session.created") {
       const data = event.data ?? {};
       const session = data.session as { id?: string } | undefined;
@@ -947,6 +1009,12 @@ export class Bridge {
       }
       case "permission.asked":
         await this.askPermission(event);
+        break;
+      case "form.replied":
+        await this.settleForm(String(event.data.id), "✅ Ответ отправлен", event.data.answer as FormAnswer | undefined);
+        break;
+      case "form.cancelled":
+        await this.settleForm(String(event.data.id), "⌛️ Форма отменена в OpenCode.");
         break;
       case "session.synthetic":
         await this.subagentReport(sessionID, event.data);
@@ -1192,6 +1260,347 @@ export class Bridge {
         ...(target.threadId ? { message_thread_id: target.threadId } : {}),
       },
     );
+  }
+
+  // ------------------------------------------------------------------- forms
+
+  /** Renders a pending form as one message: question text + inline options. */
+  private async askForm(form: FormInfo | undefined): Promise<void> {
+    if (!form?.id || !Array.isArray(form.fields) || !isChatRenderable(form)) return;
+    if (this.findForm(form.id)) return;
+    const sessionID = String(form.sessionID ?? "");
+    const target = this.targetFor(sessionID);
+    if (!target) {
+      log.info(`form ${form.id.slice(0, 12)} for a session without a chat binding`);
+      return;
+    }
+    const state: TelegramForm = {
+      token: Math.random().toString(36).slice(2, 8),
+      form,
+      createdAt: Date.now(),
+      chatId: target.chatId,
+      threadId: target.threadId,
+      messageId: 0,
+      values: defaultValues(form),
+      done: new Set(),
+      page: 0,
+    };
+    this.forms.set(state.token, state);
+    this.seenForms.set(form.id, Date.now());
+    const view = this.formView(state);
+    try {
+      const message = await this.bot.api.sendMessage(target.chatId, view.text, {
+        parse_mode: "HTML",
+        reply_markup: view.keyboard,
+        ...(target.threadId ? { message_thread_id: target.threadId } : {}),
+      });
+      state.messageId = message.message_id;
+      log.info(`form ${form.id.slice(0, 12)} (${String(form.metadata?.kind ?? "?")}) → chat ${target.chatId}`);
+      if (!nextField(activeFields(form, state.values), state.values, state.done)) await this.submitForm(state);
+    } catch (error) {
+      this.forms.delete(state.token);
+      log.warn("form message failed:", (error as Error).message);
+    }
+  }
+
+  private findForm(formID: string): TelegramForm | undefined {
+    for (const state of this.forms.values()) if (state.form.id === formID) return state;
+    return undefined;
+  }
+
+  private formView(state: TelegramForm): { text: string; keyboard: InlineKeyboard } {
+    const fields = activeFields(state.form, state.values);
+    const field = nextField(fields, state.values, state.done);
+    const lines = [`❓ <b>${escape((state.form.title || "Вопрос").slice(0, 200))}</b>`];
+    const message = String(state.form.metadata?.message ?? "").trim().slice(0, 300);
+    if (message) lines.push(`<i>${escape(message)}</i>`);
+    lines.push("");
+    if (!field) {
+      lines.push("Все вопросы отвечены — отправляю…");
+      return { text: lines.join("\n"), keyboard: new InlineKeyboard() };
+    }
+    const index = fields.findIndex((item) => item.key === field.key) + 1;
+    lines.push(`<b>${index}/${fields.length}</b> · <b>${escape(fieldTitle(field).slice(0, 120))}</b>`);
+    if (field.description) lines.push(escape(field.description.slice(0, 300)));
+    if (field.type === "external") lines.push(`🔗 ${escape(field.url.slice(0, 200))}`);
+    const hint = fieldHint(field);
+    if (hint) lines.push(`<i>${escape(hint)}</i>`);
+    if (state.awaitText === field.key) lines.push("", "✍️ Отправьте ответ текстом следующим сообщением.");
+    return { text: lines.join("\n"), keyboard: this.formKeyboard(state, field) };
+  }
+
+  /** Option buttons; multi-select toggles with «Готово», long lists paginate. */
+  private formKeyboard(state: TelegramForm, field: FormField): InlineKeyboard {
+    const keyboard = new InlineKeyboard();
+    const token = state.token;
+    const widget = fieldWidget(field);
+    if (widget === "choice" || widget === "multi") {
+      const options = "options" in field && Array.isArray(field.options) ? field.options : [];
+      const selected = Array.isArray(state.values[field.key]) ? (state.values[field.key] as string[]) : [];
+      const pageSize = 8;
+      const pages = Math.max(1, Math.ceil(options.length / pageSize));
+      const page = Math.min(Math.max(0, state.page), pages - 1);
+      const slice = options.slice(page * pageSize, (page + 1) * pageSize);
+      slice.forEach((option, index) => {
+        const absolute = page * pageSize + index;
+        const mark = selected.includes(option.value) ? "🔹 " : "";
+        const action = widget === "multi" ? "toggle" : "pick";
+        keyboard.text(`${mark}${option.label}`.slice(0, 60), `form:${token}:${action}:${absolute}`);
+        if (index % 2 === 1) keyboard.row();
+      });
+      if (slice.length % 2 === 1) keyboard.row();
+      if (pages > 1) {
+        keyboard
+          .text("◀", `form:${token}:page:${(page - 1 + pages) % pages}`)
+          .text(`${page + 1}/${pages}`, `form:${token}:noop`)
+          .text("▶", `form:${token}:page:${(page + 1) % pages}`)
+          .row();
+      }
+      if (widget === "multi") keyboard.text("✅ Готово", `form:${token}:done`).row();
+      if ("custom" in field && field.custom) keyboard.text("✍️ Свой ответ", `form:${token}:custom`).row();
+    }
+    if (widget === "flag") {
+      keyboard.text("✅ Да", `form:${token}:flag:1`).text("❌ Нет", `form:${token}:flag:0`).row();
+    }
+    if (widget === "text" || widget === "number") {
+      keyboard.text("✍️ Ввести ответ", `form:${token}:custom`).row();
+    }
+    if (!field.required) keyboard.text("⏭ Пропустить", `form:${token}:skip`).row();
+    keyboard.text("✖️ Отменить форму", `form:${token}:cancel`);
+    return keyboard;
+  }
+
+  private async onFormCallback(ctx: Context, token: string, action: string, arg?: string): Promise<void> {
+    const state = this.forms.get(token);
+    if (!state) {
+      if (action !== "noop") await ctx.editMessageText("⌛️ Форма устарела — ответьте в OpenCode.").catch(() => undefined);
+      return;
+    }
+    if (Date.now() - state.createdAt > FORM_TTL_MS && action !== "noop") {
+      await this.expireForm(state);
+      return;
+    }
+    if (action === "noop") return;
+    if (action === "cancel") {
+      this.forms.delete(token);
+      await this.finishForm(state, `✖️ <b>Форма отменена</b>\n<i>${escape(state.form.title)}</i>`);
+      await this.oc
+        .cancelForm(state.form.sessionID, state.form.id, "Отменено в Telegram")
+        .catch((error) => log.warn("form cancel:", (error as Error).message));
+      return;
+    }
+
+    const fields = activeFields(state.form, state.values);
+    let field = nextField(fields, state.values, state.done);
+    if (!field) {
+      await this.submitForm(state);
+      return;
+    }
+    const options = "options" in field && Array.isArray(field.options) ? field.options : [];
+    switch (action) {
+      case "pick": {
+        const option = options[Number(arg)];
+        if (!option) return;
+        state.values[field.key] = option.value;
+        state.done.add(field.key);
+        state.page = 0;
+        state.awaitText = undefined;
+        break;
+      }
+      case "toggle": {
+        const option = options[Number(arg)];
+        if (!option) return;
+        const current = Array.isArray(state.values[field.key]) ? [...(state.values[field.key] as string[])] : [];
+        const at = current.indexOf(option.value);
+        if (at >= 0) current.splice(at, 1);
+        else current.push(option.value);
+        state.values[field.key] = current;
+        state.awaitText = undefined;
+        break;
+      }
+      case "done": {
+        const value = state.values[field.key];
+        if (!Array.isArray(value) || value.length === 0) {
+          await ctx.answerCallbackQuery({ text: "Выберите хотя бы один вариант." }).catch(() => undefined);
+          return;
+        }
+        state.done.add(field.key);
+        state.page = 0;
+        break;
+      }
+      case "flag": {
+        state.values[field.key] = arg === "1";
+        state.done.add(field.key);
+        break;
+      }
+      case "page": {
+        state.page = Math.max(0, Number(arg) || 0);
+        break;
+      }
+      case "custom": {
+        state.awaitText = field.key;
+        break;
+      }
+      case "skip": {
+        delete state.values[field.key];
+        state.done.add(field.key);
+        state.page = 0;
+        state.awaitText = undefined;
+        break;
+      }
+      default:
+        return;
+    }
+    await this.advanceForm(state);
+  }
+
+  /** Typed answers for text/number fields and «Свой ответ». */
+  private async handleFormText(ctx: Context, text: string): Promise<boolean> {
+    if (!text || text.startsWith("/")) return false;
+    const chatId = ctx.chat?.id;
+    if (!chatId) return false;
+    const threadId = (ctx.message as { message_thread_id?: number } | undefined)?.message_thread_id;
+    let state: TelegramForm | undefined;
+    for (const candidate of this.forms.values()) {
+      if (candidate.chatId !== chatId) continue;
+      if ((candidate.threadId ?? 0) !== (threadId ?? 0)) continue;
+      if (candidate.awaitText) {
+        state = candidate;
+        break;
+      }
+    }
+    if (!state) return false;
+    if (Date.now() - state.createdAt > FORM_TTL_MS) {
+      await this.expireForm(state);
+      return true;
+    }
+    const fields = activeFields(state.form, state.values);
+    const field = fields.find((item) => item.key === state!.awaitText);
+    if (!field) {
+      state.awaitText = undefined;
+      return false;
+    }
+    if (field.type === "multiselect") {
+      const current = Array.isArray(state.values[field.key]) ? [...(state.values[field.key] as string[])] : [];
+      const value = text.trim();
+      if (value && !current.includes(value)) current.push(value);
+      state.values[field.key] = current;
+    } else {
+      const parsed = parseText(field, text);
+      if (parsed.error) {
+        await ctx.reply(`⚠️ ${parsed.error}`).catch(() => undefined);
+        return true;
+      }
+      if (parsed.value === undefined) delete state.values[field.key];
+      else state.values[field.key] = parsed.value;
+    }
+    state.done.add(field.key);
+    state.awaitText = undefined;
+    await this.advanceForm(state);
+    return true;
+  }
+
+  private async advanceForm(state: TelegramForm): Promise<void> {
+    const fields = activeFields(state.form, state.values);
+    if (!nextField(fields, state.values, state.done)) {
+      await this.submitForm(state);
+      return;
+    }
+    await this.renderForm(state);
+  }
+
+  private async submitForm(state: TelegramForm): Promise<void> {
+    const fields = activeFields(state.form, state.values);
+    const { answer, error } = buildAnswer(fields, state.values);
+    if (!answer) {
+      await this.renderForm(state, error);
+      return;
+    }
+    try {
+      await this.oc.replyForm(state.form.sessionID, state.form.id, answer);
+    } catch (failure) {
+      const message = (failure as Error).message;
+      if (/\b(404|409)\b/.test(message)) {
+        this.forms.delete(state.token);
+        await this.finishForm(state, `⌛️ <b>Форма устарела</b> — ответьте в OpenCode.\n<i>${escape(state.form.title)}</i>`);
+      } else {
+        log.warn("form reply:", message);
+        await this.renderForm(state, `⚠️ ${message.slice(0, 200)}`);
+      }
+      return;
+    }
+    this.forms.delete(state.token);
+    const lines = [`✅ <b>Ответ отправлен</b>`, `<i>${escape(state.form.title)}</i>`, ""];
+    for (const row of summarize(state.form, answer).slice(0, 20)) lines.push(`• ${escape(row.slice(0, 300))}`);
+    await this.finishForm(state, lines.join("\n"));
+    log.info(`form ${state.form.id.slice(0, 12)} answered`);
+  }
+
+  private async renderForm(state: TelegramForm, note?: string): Promise<void> {
+    const view = this.formView(state);
+    const text = note ? `${view.text}\n\n⚠️ ${escape(note)}` : view.text;
+    try {
+      await this.bot.api.editMessageText(state.chatId, state.messageId, text, {
+        parse_mode: "HTML",
+        reply_markup: view.keyboard,
+      });
+    } catch (error) {
+      log.debug("form edit failed:", (error as Error).message);
+    }
+  }
+
+  private async finishForm(state: TelegramForm, text: string): Promise<void> {
+    try {
+      await this.bot.api.editMessageText(state.chatId, state.messageId, text, { parse_mode: "HTML" });
+    } catch (error) {
+      log.debug("form final edit failed:", (error as Error).message);
+    }
+  }
+
+  private async expireForm(state: TelegramForm): Promise<void> {
+    this.forms.delete(state.token);
+    await this.finishForm(
+      state,
+      `⌛️ <b>Форма устарела</b> — ответьте в OpenCode.\n<i>${escape(state.form.title)}</i>`,
+    );
+  }
+
+  /** `form.replied` / `form.cancelled` from Desktop or the TUI. */
+  private async settleForm(formID: string, label: string, answer?: FormAnswer): Promise<void> {
+    for (const state of [...this.forms.values()]) {
+      if (state.form.id !== formID) continue;
+      this.forms.delete(state.token);
+      const lines = [label, `<i>${escape(state.form.title)}</i>`];
+      if (answer) {
+        const rows = summarize(state.form, answer);
+        if (rows.length) lines.push("", ...rows.slice(0, 20).map((row) => `• ${escape(row.slice(0, 300))}`));
+      }
+      await this.finishForm(state, lines.join("\n"));
+    }
+  }
+
+  /** Polls bound sessions for forms whose ephemeral event was missed. */
+  private async tickForms(): Promise<void> {
+    const now = Date.now();
+    for (const state of [...this.forms.values()]) {
+      if (now - state.createdAt > FORM_TTL_MS) await this.expireForm(state);
+    }
+    for (const [formID, at] of this.seenForms) {
+      if (now - at > 60 * 60_000) this.seenForms.delete(formID);
+    }
+    let scanned = 0;
+    for (const sessionID of Object.keys(this.store.session)) {
+      if (scanned >= 20) break;
+      if (!this.targetFor(sessionID)) continue;
+      scanned += 1;
+      const forms = await this.oc.listForms(sessionID).catch(() => []);
+      for (const form of forms) {
+        if (this.findForm(form.id)) continue;
+        const attempted = this.seenForms.get(form.id) ?? 0;
+        if (now - attempted < 5 * 60_000) continue;
+        await this.askForm(form);
+      }
+    }
   }
 
   // ------------------------------------------------------------------ helpers
