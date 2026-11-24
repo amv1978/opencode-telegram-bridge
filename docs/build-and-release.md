@@ -96,12 +96,16 @@ open the release page for the standalone installer.
 
 Both installers:
 
-- never rewrite `config.json`; they leave `installer.json` with the install kind,
-  directory, autostart flag and optional one-shot config overrides, which the
-  app merges on the next start;
+- never rewrite `config.json`; they leave `installer.json` with every choice
+  (install kind, directory, autostart, language, mode, projects folder,
+  `topicsChatId`) and optional one-shot config overrides, which the app merges on
+  the next start and then drops;
 - prefill the wizard from `%APPDATA%\opencode-telegram-bridge\config.json`
   (mode, projects folder, `topicsChatId`; the token is masked, empty = keep) and
-  from the previous `installer.json`;
+  fall back to the previous `installer.json`, so a re-run restores all answers;
+- pick the post-install info text by `ActiveLanguage`: `docs/INSTALL.en.txt` or
+  `docs/INSTALL.ru.txt` is embedded with `dontcopy` and shown in a read-only page
+  (Inno reads `InfoAfterFile` at compile time, so it cannot switch by language);
 - terminate processes with `*OpenCodeTelegramBridge*` in their path before
   installing; on uninstall `%APPDATA%\opencode-telegram-bridge\` is preserved.
 

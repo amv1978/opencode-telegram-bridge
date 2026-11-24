@@ -27,6 +27,9 @@ english.LiteDownloadDesc=The lite installer downloads the portable bundle for th
 english.LiteDownloadFailed=The bundle could not be downloaded or its SHA256 did not match. Open the release page to download the full installer manually?
 english.LiteMissingBundle=The bundle was not downloaded. Open the release page and install the full setup manually.
 english.LiteExtractFailed=The bundle was downloaded but could not be extracted. Open the release page and install the full setup manually.
+english.InfoPageTitle=Installation complete
+english.InfoPageSubtitle=First start and useful links
+english.InfoPageDesc=The text below is chosen by the installer language.
 
 russian.SetupModeTitle=Способ установки
 russian.SetupModeSubtitle=Сколько настроить сразу
@@ -56,3 +59,6 @@ russian.LiteDownloadDesc=Облегчённый установщик скача�
 russian.LiteDownloadFailed=Не удалось скачать bundle или SHA256 не совпал. Открыть страницу релиза и скачать полный установщик вручную?
 russian.LiteMissingBundle=Bundle не скачан. Откройте страницу релиза и установите полный setup вручную.
 russian.LiteExtractFailed=Bundle скачан, но распаковать его не удалось. Откройте страницу релиза и установите полный setup вручную.
+russian.InfoPageTitle=Установка завершена
+russian.InfoPageSubtitle=Первый запуск и полезные ссылки
+russian.InfoPageDesc=Текст ниже выбирается по языку установщика.

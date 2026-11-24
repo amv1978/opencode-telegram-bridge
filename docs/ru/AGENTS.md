@@ -50,7 +50,7 @@ CLI: см. `docs/build-and-release.md`. Установщик: `ISCC installer\oc
   `providerID/id` → `unknown model`; кэш на сессию, сброс по `session.model.selected`.
 - Если prompt принят, а `session.execution.started` не пришёл за 30 с — это зависший
   ход: журнал + предупреждение в панели + подсказка `/stop` (doctor).
-- Тестового набора нет. Проверка = `bun run typecheck`, `bun run src/doctor.ts`,
+- Проверка: `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`,
   затем ручной проход по Telegram (личный чат + тема + голос + кнопка разрешения).
 
 ## Документация

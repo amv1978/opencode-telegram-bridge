@@ -3,9 +3,15 @@ var
   InstallModePage: TInputOptionWizardPage;
   ConfigPage: TInputQueryWizardPage;
   ModePage: TInputOptionWizardPage;
+  InfoPage: TWizardPage;
+  InfoMemo: TNewMemo;
   SavedConfig: String;
+  Previous: String;
   SavedToken: String;
   SavedTokenMask: String;
+  SavedMode: String;
+  SavedTopics: Int64;
+  SavedProjectsDir: String;
 
 function ConfigPath: String;
 begin
@@ -105,11 +111,51 @@ begin
   Result := StrToInt64Def(Digits, 0);
 end;
 
+(* Boolean value of a top-level key: true/false right after the colon. *)
+function JsonBoolValue(const Json, Key: String): Boolean;
+var
+  Tag, Rest: String;
+  P: Integer;
+begin
+  Result := False;
+  Tag := '"' + Key + '"';
+  P := Pos(Tag, Json);
+  if P = 0 then exit;
+  Rest := TrimLeft(Copy(Json, P + Length(Tag), Length(Json)));
+  P := Pos(':', Rest);
+  if P = 0 then exit;
+  Rest := TrimLeft(Copy(Rest, P + 1, Length(Rest)));
+  Result := Pos('true', Lowercase(Copy(Rest, 1, 5))) = 1;
+end;
+
+(* Inno reads InfoAfterFile at compile time, so a single run cannot pick
+   INSTALL.en.txt vs INSTALL.ru.txt. Instead both files are embedded (see the
+   file list at the end of this include) and a read-only page after installation
+   shows the one that matches ActiveLanguage — no bilingual text in either file. *)
+procedure CreateInfoPage;
+var
+  Name: String;
+begin
+  InfoPage := CreateCustomPage(wpInstalling,
+    CustomMessage('InfoPageTitle'),
+    CustomMessage('InfoPageSubtitle'));
+  InfoMemo := TNewMemo.Create(InfoPage);
+  InfoMemo.Parent := InfoPage.Surface;
+  InfoMemo.SetBounds(0, 0, InfoPage.SurfaceWidth, InfoPage.SurfaceHeight);
+  InfoMemo.ScrollBars := ssVertical;
+  InfoMemo.ReadOnly := True;
+  InfoMemo.WordWrap := True;
+  if ActiveLanguage = 'russian' then Name := 'INSTALL.ru.txt'
+  else Name := 'INSTALL.en.txt';
+  ExtractTemporaryFile(Name);
+  InfoMemo.Text := LoadTextFile(ExpandConstant('{tmp}\') + Name);
+end;
+
 procedure InitializeWizard;
 var
-  Previous: String;
-  Dir, Mode, Topics: String;
+  Dir, Topics, Lang: String;
 begin
+  CreateInfoPage;
   SavedConfig := LoadTextFile(ConfigPath);
   Previous := LoadTextFile(InstallerPath);
 
@@ -119,6 +165,28 @@ begin
   SavedTokenMask := '';
   if Length(SavedToken) > 4 then
     SavedTokenMask := '****' + Copy(SavedToken, Length(SavedToken) - 3, 4);
+
+  // Restore every previous choice: config.json (live values) wins, then the
+  // record the wizard wrote on the previous run.
+  SavedMode := JsonStringValueLast(SavedConfig, 'mode');
+  if (SavedMode <> 'both') and (SavedMode <> 'private') and (SavedMode <> 'topics') then
+    SavedMode := JsonStringValue(Previous, 'mode');
+  if (SavedMode <> 'both') and (SavedMode <> 'private') and (SavedMode <> 'topics') then
+    SavedMode := 'both';
+
+  SavedTopics := JsonNumberValue(SavedConfig, 'topicsChatId');
+  if SavedTopics = 0 then
+    SavedTopics := JsonNumberValue(Previous, 'topicsChatId');
+
+  SavedProjectsDir := JsonStringValue(SavedConfig, 'defaultDirectory');
+  if SavedProjectsDir = '' then
+    SavedProjectsDir := JsonStringValue(Previous, 'defaultDirectory');
+  if SavedProjectsDir = '' then
+    SavedProjectsDir := ExpandConstant('{userdocs}');
+
+  Lang := JsonStringValue(Previous, 'language');
+  if Lang = '' then
+    Lang := JsonStringValue(SavedConfig, 'lang');
 
   InstallModePage := CreateInputOptionPage(wpWelcome,
     CustomMessage('SetupModeTitle'), CustomMessage('SetupModeSubtitle'),
@@ -136,17 +204,11 @@ begin
   ConfigPage.Add(CustomMessage('TokenLabel'), False);
   ConfigPage.Add(CustomMessage('DirLabel'), False);
   ConfigPage.Add(CustomMessage('TopicsLabel'), False);
-
-  Dir := JsonStringValue(SavedConfig, 'defaultDirectory');
-  if Dir = '' then
-    Dir := JsonStringValue(Previous, 'directory');
-  if Dir = '' then
-    Dir := ExpandConstant('{userdocs}');
-  ConfigPage.Values[1] := Dir;
-
-  Topics := '';
-  if JsonNumberValue(SavedConfig, 'topicsChatId') <> 0 then
-    Topics := IntToStr(JsonNumberValue(SavedConfig, 'topicsChatId'));
+  ConfigPage.Values[1] := SavedProjectsDir;
+  if SavedTopics <> 0 then
+    Topics := IntToStr(SavedTopics)
+  else
+    Topics := '';
   ConfigPage.Values[2] := Topics;
 
   ConfigPage.Values[0] := SavedTokenMask;
@@ -160,10 +222,9 @@ begin
   ModePage.Add(CustomMessage('ModePrivate'));
   ModePage.Add(CustomMessage('ModeTopics'));
   ModePage.Values[0] := True;
-  Mode := JsonStringValueLast(SavedConfig, 'mode');
-  if Mode = 'private' then
+  if SavedMode = 'private' then
     ModePage.Values[1] := True
-  else if Mode = 'topics' then
+  else if SavedMode = 'topics' then
     ModePage.Values[2] := True;
 
   // Remember the previous install directory, but never override an explicit /DIR.
@@ -171,7 +232,7 @@ begin
   if (Dir <> '') and
      (CompareText(WizardForm.DirEdit.Text, ExpandConstant('{autopf}\OpenCodeTelegramBridge')) = 0) then
     WizardForm.DirEdit.Text := Dir;
-  if Pos('"autostart": true', Previous) > 0 then
+  if JsonBoolValue(Previous, 'autostart') then
     WizardSelectTasks('autostart');
 
   #ifdef LITE
@@ -195,16 +256,28 @@ end;
 
 procedure WriteInstallerJson;
 var
-  Token, Dir, Mode, Lang, Json: String;
+  Token, Mode, Lang, ProjectsDir, Json: String;
   Topics: Int64;
 begin
-  Lang := 'en';
-  if ActiveLanguage = 'russian' then Lang := 'ru';
+  if ActiveLanguage = 'russian' then Lang := 'ru'
+  else Lang := 'en';
+
+  // Values not touched on the advanced pages stay as they were.
+  Mode := SavedMode;
+  Topics := SavedTopics;
+  ProjectsDir := SavedProjectsDir;
+  if InstallModePage.Values[1] then
+  begin
+    if ModePage.Values[0] then Mode := 'both'
+    else if ModePage.Values[1] then Mode := 'private'
+    else Mode := 'topics';
+    Topics := StrToInt64Def(Trim(ConfigPage.Values[2]), 0);
+    ProjectsDir := Trim(ConfigPage.Values[1]);
+  end;
 
   Json := '{' + #13#10 +
     '  "version": "' + '{#AppVersion}' + '",' + #13#10 +
     '  "installKind": "';
-
   if InstallModePage.Values[1] then
     Json := Json + 'advanced",' + #13#10
   else
@@ -216,6 +289,12 @@ begin
     Json := Json + 'true,' + #13#10
   else
     Json := Json + 'false,' + #13#10;
+
+  Json := Json + '  "language": "' + Lang + '",' + #13#10 +
+    '  "mode": "' + Mode + '",' + #13#10 +
+    '  "defaultDirectory": "' + JsonEscape(ProjectsDir) + '",' + #13#10;
+  if Topics <> 0 then
+    Json := Json + '  "topicsChatId": ' + IntToStr(Topics) + ',' + #13#10;
   Json := Json + '  "writtenAt": "' + GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + '",' + #13#10;
 
   if not InstallModePage.Values[1] then
@@ -230,18 +309,13 @@ begin
     Token := Trim(ConfigPage.Values[0]);
     if (Token = SavedTokenMask) or (Token = '') then
       Token := '';
-    Dir := Trim(ConfigPage.Values[1]);
-    if ModePage.Values[0] then Mode := 'both'
-    else if ModePage.Values[1] then Mode := 'private'
-    else Mode := 'topics';
-    Topics := StrToInt64Def(Trim(ConfigPage.Values[2]), 0);
 
     Json := Json + '  "config": {' + #13#10;
     if Token <> '' then
       Json := Json + '    "telegramToken": "' + JsonEscape(Token) + '",' + #13#10;
     Json := Json +
       '    "mode": "' + Mode + '",' + #13#10 +
-      '    "defaultDirectory": "' + JsonEscape(Dir) + '"';
+      '    "defaultDirectory": "' + JsonEscape(ProjectsDir) + '"';
     // Never override an existing interface language just because the installer
     // ran in another language; only a brand-new config gets the chosen one.
     if (SavedConfig = '') or (JsonStringValue(SavedConfig, 'lang') = '') then
@@ -277,3 +351,8 @@ begin
     #endif
   end;
 end;
+
+[Files]
+; Language-specific "finished" page, extracted by PrepareInfoFile.
+Source: "..\docs\INSTALL.en.txt"; DestDir: "{tmp}"; Flags: dontcopy
+Source: "..\docs\INSTALL.ru.txt"; DestDir: "{tmp}"; Flags: dontcopy

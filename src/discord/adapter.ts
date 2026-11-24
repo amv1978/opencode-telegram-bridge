@@ -1114,15 +1114,17 @@ export class DiscordBridge {
       case "session.renamed": {
         const title = String(event.data.title ?? "").trim();
         if (!title) break;
-        const threadId = this.store.locateDiscord(sessionID).threadId;
-        if (!threadId || !this.client) break;
         const state = this.titles.get(sessionID);
         if (state) state.base = title;
+        this.store.setDiscordTitle(sessionID, title);
+        // Renames are opt-in (`discord.titleStatus: "rename"`).
+        if (this.cfg.discord?.titleStatus !== "rename") break;
+        const threadId = this.store.locateDiscord(sessionID).threadId;
+        if (!threadId || !this.client) break;
         try {
           const channel = await this.client.channels.fetch(threadId);
           if (channel?.isThread()) await channel.setName(titleWithMarker(title, state?.phase ?? "idle", 100));
           if (state) state.lastRename = Date.now();
-          this.store.setDiscordTitle(sessionID, title);
           log.info(`discord session renamed → thread: ${title}`);
         } catch (error) {
           log.warn("discord thread rename failed:", (error as Error).message);
@@ -1238,6 +1240,9 @@ export class DiscordBridge {
    * `⏳` on start, `✅` on end, original after ~10 s or when the window opens.
    */
   private async markTitle(sessionID: string, phase: "start" | "done"): Promise<void> {
+    // Threads have no icons, so status markers are opt-in via
+    // `discord.titleStatus: "rename"`. Default: no renames, no service messages.
+    if (this.cfg.discord?.titleStatus !== "rename") return;
     if (!this.store.locateDiscord(sessionID).threadId) return;
     let state = this.titles.get(sessionID);
     if (!state) {

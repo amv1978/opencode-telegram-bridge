@@ -1,0 +1,16 @@
+OpenCode Telegram Bridge — install / first start
+
+1. The app starts after install (window + tray).
+2. If the token was not set in the installer, open Settings → Telegram in the
+   app window and paste it (the panel also has a first-launch form).
+3. Send /start to the bot in Telegram — you become the admin.
+4. Topics: create a group, enable Topics, add the bot as admin with
+   "Manage topics", then send /chatid in the group.
+5. Send a task in a private chat or a topic. /fmt shows formatting.
+6. Re-running the installer keeps every previous choice (install type, folder,
+   autostart, mode, language, topics chat id); the saved token is shown masked
+   and is never written to installer.json.
+
+Tray: status / start / stop / settings / log / autostart / quit
+CLI: ocbridge-cli.exe help
+Data: %APPDATA%\opencode-telegram-bridge\ (config.json, state.json, bridge.log)

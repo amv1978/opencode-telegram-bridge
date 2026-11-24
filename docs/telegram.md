@@ -181,13 +181,23 @@ observed session ids live in `state.json` (`observe`). `/observe status` lists t
 
 ### Title status
 
-While a turn runs the bound forum topic is renamed once to `⏳ <original title>`
-(`session.execution.started`). On the end of the turn it becomes
-`✅ <original title>` and after ~10 s the original title is restored. Renames are
-throttled to one per 60 s, so a very short turn may only show `⏳` and then the
-original; the General chat is never renamed. A session rename during a turn keeps
-the marker and becomes the new original title. Chat title changes are cosmetic:
-the OpenCode session title is not modified.
+`ui.titleStatus` controls how the bound forum topic shows a running turn:
+
+- `icon` (default) — the topic icon is changed with `editForumTopic`
+  (`icon_custom_emoji_id`): `⏳` while the turn runs, `✅` when it ends, then the
+  default icon is restored after ~10 s. Icons post no “renamed the topic” service
+  messages. The ids are resolved once from `getForumTopicIconStickers`, so the bot
+  needs “Manage topics” but no extra rights.
+- `rename` (opt-in) — the legacy behaviour: `⏳ <title>` on start, `✅ <title>` on a
+  long turn and the original title after ~10 s. Every rename posts a service
+  message and Telegram rate-limits renames to one per 60 s, so a short turn skips
+  the intermediate `✅` and is restored when the window opens. The General chat is
+  never touched.
+- `off` — no status marker.
+
+A session rename during a turn updates the stored original title; in `icon` mode
+the topic name is never changed. Chat decorations are cosmetic: the OpenCode
+session title is not modified.
 
 ## Permissions
 

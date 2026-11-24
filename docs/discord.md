@@ -114,12 +114,14 @@ current one through `PATCH /api/session/{id}` (auto allows everything, plan deni
   same tick moves the spinner and the `thinking.` dots, the line order is stable and
   the message is edited in place. Repeats collapse (`×3`), finished lines hide
   after ~10 s, and at the end of the turn the block is removed.
-- **Title status**: the thread is renamed to `⏳ <title>` on turn start and to
-  `✅ <title>` on success, then restored after ~10 s. Discord allows about two
-  renames per 10 minutes, so a rename is only attempted 5 minutes after the previous
-  one: a short turn may keep `⏳` until the window opens, then the original title is
-  restored. A session rename during the turn keeps the marker and becomes the new
-  original title.
+- **Title status**: Discord threads have no icons, so status markers are **off by
+  default**. Set `discord.titleStatus: "rename"` to opt in: the thread is renamed to
+  `⏳ <title>` on turn start and `✅ <title>` on success, then restored after ~10 s.
+  Discord allows about two renames per 10 minutes, so a rename is only attempted
+  5 minutes after the previous one: a short turn may keep `⏳` until the window
+  opens, then the original title is restored. A session rename during the turn
+  keeps the marker and becomes the new original title. `ui.titleStatus` applies
+  only to Telegram.
 - **Subagents**: a child session (`parentID`) does not open a separate thread; it
   adds a line to the parent block — `🧩 explore · 12s`, then `✓`/`✗`
   (`🧩 general · 1m 03s ✓`). At most 2 lines, repeats collapse (`×2`), finished ones

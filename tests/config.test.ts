@@ -39,6 +39,32 @@ describe("config merge", () => {
     expect(cfg.permissions?.mode).toBe("ask");
     expect(cfg.budget?.dailyUsd).toBeUndefined();
   });
+
+  test("title status defaults to icons and applies only to Telegram", () => {
+    const paths = tempPaths();
+    const defaults = loadConfig(paths);
+    expect(defaults.ui?.titleStatus).toBe("icon");
+    expect(defaults.telegram.enabled).toBe(true);
+    expect(defaults.discord?.titleStatus).toBe("off");
+
+    writeFileSync(
+      paths.configFile,
+      JSON.stringify({ ui: { titleStatus: "rename" }, telegram: { enabled: false }, discord: { titleStatus: "rename" } }),
+      "utf8",
+    );
+    const cfg = loadConfig(paths);
+    expect(cfg.ui?.titleStatus).toBe("rename");
+    expect(cfg.telegram.enabled).toBe(false);
+    expect(cfg.discord?.titleStatus).toBe("rename");
+  });
+
+  test("invalid title status falls back to icon, Discord markers stay off", () => {
+    const paths = tempPaths();
+    writeFileSync(paths.configFile, JSON.stringify({ ui: { titleStatus: "icons" }, discord: { titleStatus: "icon" } }), "utf8");
+    const cfg = loadConfig(paths);
+    expect(cfg.ui?.titleStatus).toBe("icon");
+    expect(cfg.discord?.titleStatus).toBe("off");
+  });
 });
 
 describe("atomic persistence", () => {

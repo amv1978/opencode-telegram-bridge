@@ -37,6 +37,8 @@ export interface State {
    * running yet".
    */
   observe?: Record<string, string[]>;
+  /** Panel-only preferences: sessions hidden from "Current sessions". */
+  ui?: { hiddenSessions?: string[] };
 }
 
 const emptyState = (): State => ({
@@ -47,6 +49,7 @@ const emptyState = (): State => ({
   discordChannels: {},
   discordSessions: {},
   observe: {},
+  ui: { hiddenSessions: [] },
 });
 
 export class Store {
@@ -66,6 +69,7 @@ export class Store {
       discordChannels: parsed.discordChannels ?? {},
       discordSessions: parsed.discordSessions ?? {},
       observe: normalizeObserve(parsed.observe),
+      ui: { hiddenSessions: normalizeIdList(parsed.ui?.hiddenSessions) },
     };
   }
 
@@ -295,6 +299,36 @@ export class Store {
     }
   }
 
+  // ------------------------------------------------------------- panel state
+
+  /** Sessions hidden in the panel only; nothing is deleted in OpenCode. */
+  hiddenSessions(): string[] {
+    return [...(this.data.ui?.hiddenSessions ?? [])];
+  }
+
+  isSessionHidden(sessionID: string): boolean {
+    return (this.data.ui?.hiddenSessions ?? []).includes(sessionID);
+  }
+
+  hideSession(sessionID: string): void {
+    const id = String(sessionID ?? "").trim();
+    if (!id) return;
+    this.data.ui ??= { hiddenSessions: [] };
+    const hidden = this.data.ui.hiddenSessions ?? [];
+    if (hidden.includes(id)) return;
+    this.data.ui.hiddenSessions = [...hidden, id];
+    this.saveNow();
+  }
+
+  showSession(sessionID: string): void {
+    const id = String(sessionID ?? "").trim();
+    if (!id) return;
+    const hidden = this.data.ui?.hiddenSessions ?? [];
+    if (!hidden.includes(id)) return;
+    this.data.ui = { ...(this.data.ui ?? {}), hiddenSessions: hidden.filter((item) => item !== id) };
+    this.saveNow();
+  }
+
   /** Flush immediately: the process is about to be replaced by the updater. */
   saveNow(): void {
     if (this.timer) clearTimeout(this.timer);
@@ -332,8 +366,12 @@ export class Store {
 }
 
 /** Tolerates old/hand-edited state: strings, arrays, junk entries. */
-function normalizeObserve(value: unknown): Record<string, string[]> {
-  if (!value || typeof value !== "object") return {};
+function normalizeIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => String(item ?? "").trim()).filter(Boolean))];
+}
+
+function normalizeObserve(value: unknown): Record<string, string[]> {  if (!value || typeof value !== "object") return {};
   const result: Record<string, string[]> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (typeof entry === "string" && entry.trim()) {

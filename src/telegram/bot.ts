@@ -27,7 +27,7 @@ import {
 import { isPermissionMode, MODE_SUMMARY, modeOf, rulesForMode } from "../permissions.ts";
 import { recentEntries, recentLine } from "../recent.ts";
 import { formatUsd, type BudgetSnapshot } from "../budget.ts";
-import { canRename, renameWait, titleWithMarker } from "../titles.ts";
+import { canRename, normalizeTitleStatus, pickTopicIcon, renameWait, titleWithMarker } from "../titles.ts";
 import { enableHexFileTranscription, transcribeAudio } from "../audio/transcribe.ts";
 import {
   collectAgentFiles,
@@ -96,13 +96,16 @@ interface TelegramForm {
   awaitText?: string;
 }
 
-/** Topic title marker while a turn runs (`⏳` → `✅` → original). */
+/** Topic status marker state: icon (`⏳`/`✅`), legacy rename, or off. */
 interface TelegramTitle {
   base: string;
   phase: "idle" | "start" | "done";
   lastRename: number;
   version: number;
   timer?: ReturnType<typeof setTimeout>;
+  /** Last applied topic icon: "start", "done" or null (default icon). */
+  icon?: "start" | "done" | null;
+  lastIconAt?: number;
 }
 
 export class Bridge {
@@ -113,8 +116,11 @@ export class Bridge {
   private readonly forms = new Map<string, TelegramForm>();
   /** formID → last render attempt, so the poller does not spam unmapped sessions. */
   private readonly seenForms = new Map<string, number>();
-  /** Per-session topic title markers (`⏳` / `✅`). */
+  /** Per-session topic status markers (icon by default, rename opt-in). */
   private readonly titles = new Map<string, TelegramTitle>();
+  /** Standard forum icon ids resolved once from `getForumTopicIconStickers`. */
+  private topicIcons?: { start?: string; done?: string };
+  private topicIconsFailedAt = 0;
   private formTimer?: ReturnType<typeof setInterval>;
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent binding, so `execution.*` updates the parent block. */
@@ -1316,16 +1322,17 @@ export class Bridge {
         if (!title) break;
         if (this.appliedTitles.get(sessionID) === title) break;
         const target = this.targetFor(sessionID);
-        if (!target?.threadId) break;
         const state = this.titles.get(sessionID);
         if (state) state.base = title;
+        this.store.setTitle(sessionID, title);
+        // Renames are cosmetic and opt-in: icon mode must never touch the name.
+        if (!target?.threadId || normalizeTitleStatus(this.cfg.ui?.titleStatus) !== "rename") break;
         try {
           await this.bot.api.editForumTopic(target.chatId, target.threadId, {
             name: titleWithMarker(title, state?.phase ?? "idle"),
           });
           if (state) state.lastRename = Date.now();
           this.appliedTitles.set(sessionID, title);
-          this.store.setTitle(sessionID, title);
           log.info(`session renamed → topic: ${title}`);
         } catch (error) {
           log.warn("topic rename failed:", (error as Error).message);
@@ -1606,19 +1613,32 @@ export class Bridge {
   // ------------------------------------------------------------------ titles
 
   /**
-   * Topic title markers: `⏳ <title>` on turn start, `✅ <title>` on success and
-   * the original title after ~10 s. Telegram rate limits renames, so a second
-   * rename within 60 s is skipped and the restore is retried after the window.
+   * Turn status on a forum topic.
+   *
+   * `ui.titleStatus`:
+   * - `icon` (default) - the topic icon becomes ⏳ while the turn runs and ✅
+   *   when it ends, then the default icon is restored after ~10 s. Icons do
+   *   not post "renamed the topic" service messages;
+   * - `rename` (opt-in) - legacy behaviour: `⏳ title` on start, `✅ title` on
+   *   success and the original after ~10 s (each rename posts a service
+   *   message; Telegram rate-limits renames to one per 60 s);
+   * - `off` - nothing.
    */
   private async markTitle(sessionID: string, phase: "start" | "done"): Promise<void> {
+    const mode = normalizeTitleStatus(this.cfg.ui?.titleStatus);
+    if (mode === "off") return;
     const target = this.targetFor(sessionID);
     if (!target?.threadId) return;
     let state = this.titles.get(sessionID);
     if (!state) {
       const meta = await this.sessionMeta(sessionID);
       const base = (meta.title || this.store.session[sessionID]?.title || sessionID.slice(0, 12)).trim();
-      state = { base, phase: "idle", lastRename: 0, version: 0 };
+      state = { base, phase: "idle", lastRename: 0, version: 0, icon: null };
       this.titles.set(sessionID, state);
+    }
+    if (mode === "icon") {
+      await this.markIcon(sessionID, state, phase);
+      return;
     }
     if (phase === "start") {
       state.phase = "start";
@@ -1632,12 +1652,91 @@ export class Bridge {
     if (state.phase !== "start") return;
     state.phase = "done";
     const version = state.version;
-    if (canRename(state.lastRename)) {
+    // A short turn restores the name directly: renaming to ✅ and back within a
+    // few seconds produced the double service message users complained about.
+    const shortTurn = Date.now() - state.lastRename < 10_000;
+    if (!shortTurn && canRename(state.lastRename)) {
       if (await this.setTopicTitle(sessionID, titleWithMarker(state.base, "done"))) state.lastRename = Date.now();
     }
     if (state.timer) clearTimeout(state.timer);
     state.timer = setTimeout(() => void this.restoreTitle(sessionID, version), 10_000);
     state.timer.unref?.();
+  }
+
+  private async markIcon(sessionID: string, state: TelegramTitle, phase: "start" | "done"): Promise<void> {
+    if (phase === "start") {
+      state.phase = "start";
+      state.version += 1;
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = undefined;
+      if (state.icon === "start") return;
+      const id = await this.topicIcon("start");
+      if (!id) return;
+      if (await this.setTopicIcon(sessionID, id)) {
+        state.icon = "start";
+        state.lastIconAt = Date.now();
+      }
+      return;
+    }
+    if (state.phase !== "start") return;
+    state.phase = "done";
+    const version = state.version;
+    // Turns shorter than a second or two are not worth a second icon request.
+    if (Date.now() - (state.lastIconAt ?? 0) >= 1_500) {
+      const id = await this.topicIcon("done");
+      if (id && (await this.setTopicIcon(sessionID, id))) {
+        state.icon = "done";
+        state.lastIconAt = Date.now();
+      }
+    }
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(() => void this.restoreIcon(sessionID, version), 10_000);
+    state.timer.unref?.();
+  }
+
+  private async restoreIcon(sessionID: string, version: number): Promise<void> {
+    const state = this.titles.get(sessionID);
+    if (!state || state.version !== version || state.phase !== "done") return;
+    state.timer = undefined;
+    state.phase = "idle";
+    // Empty string = back to the default (pencil) topic icon.
+    if (await this.setTopicIcon(sessionID, "")) state.icon = null;
+  }
+
+  /** Resolves the standard forum icon ids once; failures degrade to no icon. */
+  private async topicIcon(phase: "start" | "done"): Promise<string | undefined> {
+    if (this.topicIcons && (this.topicIcons.start || this.topicIcons.done)) return this.topicIcons[phase];
+    // Retry a failed lookup after 10 minutes; a transient network error must not
+    // disable the status marker for the whole process lifetime.
+    if (this.topicIconsFailedAt && Date.now() - this.topicIconsFailedAt < 10 * 60_000) return undefined;
+    try {
+      const stickers = await this.bot.api.getForumTopicIconStickers();
+      this.topicIcons = {
+        start: pickTopicIcon(stickers, "start"),
+        done: pickTopicIcon(stickers, "done"),
+      };
+      this.topicIconsFailedAt = 0;
+      if (!this.topicIcons.start || !this.topicIcons.done) {
+        log.warn("topic icons: standard pack has no hourglass/check emoji, icon status disabled");
+      }
+    } catch (error) {
+      this.topicIconsFailedAt = Date.now();
+      log.warn("topic icons unavailable:", (error as Error).message);
+      return undefined;
+    }
+    return this.topicIcons?.[phase];
+  }
+
+  private async setTopicIcon(sessionID: string, iconCustomEmojiId: string): Promise<boolean> {
+    const target = this.targetFor(sessionID);
+    if (!target?.threadId) return false;
+    try {
+      await this.bot.api.editForumTopic(target.chatId, target.threadId, { icon_custom_emoji_id: iconCustomEmojiId });
+      return true;
+    } catch (error) {
+      log.debug("topic icon:", (error as Error).message);
+      return false;
+    }
   }
 
   private async restoreTitle(sessionID: string, version: number): Promise<void> {
@@ -1657,8 +1756,9 @@ export class Bridge {
   private async setTopicTitle(sessionID: string, name: string): Promise<boolean> {
     const target = this.targetFor(sessionID);
     if (!target?.threadId) return false;
+    const clean = titleWithMarker(name, "idle");
     try {
-      await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: titleWithMarker(name, "idle") });
+      await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: clean });
       return true;
     } catch (error) {
       log.debug("topic title:", (error as Error).message);

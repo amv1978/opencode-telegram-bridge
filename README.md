@@ -29,9 +29,15 @@ sessions**; no OpenCode plugin is required.
   marker and one-click reattach (topic/thread).
 - **Atomic persistence and tests**: config/state are written via temp+rename with
   one `.bak`; `bun test` covers the pure modules in CI.
-- **Title status**: the topic/thread is marked `⏳` while a turn runs, `✅` when it
-  finishes and restored afterwards (rate-limit aware); the live block has a tool
-  spinner and animated `thinking.` dots.
+- **Quiet title status**: the forum topic icon becomes `⏳` while a turn runs and
+  `✅` when it ends, then the default icon returns after ~10 s — no service
+  messages. Topic/thread renames are opt-in (`ui.titleStatus: "rename"`; Discord
+  markers are off by default).
+- **Panel with sections**: Status, Settings, Telegram, Discord, Updates and Log
+  behind a left navigation that collapses to an icon rail below 900 px; Telegram
+  and Discord have independent `enabled` toggles.
+- **Log and sessions**: log pause, download, line count, level filter and search;
+  “Current sessions” with per-row hide (panel only) and refresh.
 - **Honest end of turn**: an abnormal finish says why (`⚠️ остановлено: /stop`,
   `⛔ бюджет: $X из $Y`, `⚠️ лимит шагов`, `⚠️ ошибка: …`) and counts blocked tool
   calls; the stats line stays last. Same text in Telegram and Discord.
@@ -56,7 +62,8 @@ sessions**; no OpenCode plugin is required.
 - **Tray app**: status dot, start/stop/restart, log, autostart, quick links.
 - **CLI** `ocbridge-cli` (.NET): status, sessions, logs, config, doctor, update.
 - **Installer**: simple/advanced modes, RU/EN wizard, autostart, data preserved in
-  `%APPDATA%`.
+  `%APPDATA%`; a re-run restores every previous choice (type, folder, autostart,
+  mode, language, topics chat, masked token).
 - **GitHub auto-update**: background checks, panel banner, tray and CLI, SHA256
   verification.
 
@@ -64,9 +71,9 @@ sessions**; no OpenCode plugin is required.
 
 ### Installer (Windows 10/11)
 
-1. Run `ocbridge-setup-standalone-0.7.2.exe` (offline) or `ocbridge-setup-lite-0.7.2.exe`
+1. Run `ocbridge-setup-standalone-0.8.0.exe` (offline) or `ocbridge-setup-lite-0.8.0.exe`
    (downloads the portable bundle, ~2 MB). The portable layout is also available
-   as `ocbridge-bundle-0.7.2.zip`.
+   as `ocbridge-bundle-0.8.0.zip`.
 2. Paste the bot token from [@BotFather](https://t.me/BotFather) - you may skip this
    and set it later in the panel `http://127.0.0.1:7788`.
 3. Send `/start` to the bot — the first user becomes administrator.

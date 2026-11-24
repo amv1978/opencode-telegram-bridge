@@ -29,6 +29,7 @@ export type BotState = "stopped" | "starting" | "running" | "error";
 export interface Snapshot {
   version: string;
   configured: boolean;
+  telegramEnabled: boolean;
   state: BotState;
   error: string;
   username: string;
@@ -52,6 +53,7 @@ export interface Snapshot {
       theme: "opencode" | "matrix";
       scheme: "system" | "light" | "dark";
       lang: "system" | "ru" | "en";
+      titleStatus: "icon" | "rename" | "off";
       seenChangelog: string[];
     };
     proxy?: string;
@@ -71,12 +73,15 @@ export interface Snapshot {
     attempt: number;
     allowedGuilds: string[];
     allowedUsers: string[];
+    titleStatus: "off" | "rename";
   };
   webPort: number;
   autostart: boolean;
   autostartSupported: boolean;
   configPath: string;
-  sessions: Array<{ id: string; title: string; directory?: string }>;
+  sessions: Array<{ id: string; title: string; directory?: string; active?: boolean; updatedAt?: number }>;
+  /** Sessions hidden from the panel list (still exist in OpenCode). */
+  hiddenSessions: string[];
   /** Doctor warnings (stalled prompts, etc.) shown in the panel. */
   warnings: string[];
   update: ReturnType<Updater["snapshot"]>;
@@ -137,6 +142,7 @@ export class App {
     return {
       version: pkg.version,
       configured: Boolean(this.cfg.telegram.token),
+      telegramEnabled: this.cfg.telegram.enabled !== false,
       state: this.state,
       error: this.error,
       username: this.username,
@@ -170,6 +176,7 @@ export class App {
           theme: this.cfg.ui?.theme ?? "opencode",
           scheme: this.cfg.ui?.scheme ?? "system",
           lang: this.cfg.ui?.lang ?? "system",
+          titleStatus: this.cfg.ui?.titleStatus ?? "icon",
           seenChangelog: this.cfg.ui?.seenChangelog ?? [],
         },
         proxy: this.cfg.telegram.proxy,
@@ -189,12 +196,14 @@ export class App {
         attempt: ds?.attempt ?? this.discordRetryAttempt,
         allowedGuilds: this.cfg.discord?.allowedGuilds ?? [],
         allowedUsers: this.cfg.discord?.allowedUsers ?? [],
+        titleStatus: this.cfg.discord?.titleStatus === "rename" ? "rename" : "off",
       },
       webPort: this.cfg.web.port,
       autostart: isAutostartEnabled(),
       autostartSupported: process.platform === "win32" && isCompiled(),
       configPath: this.paths.configFile,
       sessions: [],
+      hiddenSessions: this.store.hiddenSessions(),
       warnings: this.bridge?.warnings() ?? [],
       update: this.updater.snapshot(),
     };
@@ -202,8 +211,9 @@ export class App {
 
   async startBot(): Promise<void> {
     if (this.state === "running" || this.state === "starting") return;
-    const hasTelegram = Boolean(this.cfg.telegram.token);
-    if (!hasTelegram && !isDiscordConfigured(this.cfg)) throw new Error("Не указан токен бота");
+    if (!this.telegramOn() && !isDiscordConfigured(this.cfg)) {
+      throw new Error("Нет активных адаптеров: включите Telegram (нужен токен) или Discord");
+    }
     this.state = "starting";
     this.error = "";
     try {
@@ -228,23 +238,7 @@ export class App {
         },
       });
 
-      if (hasTelegram) {
-        this.net = await this.connectTelegram();
-        this.bridge = new Bridge(this.cfg, this.client, this.store, {
-          fetch: this.net.fetch,
-          relay: this.relay,
-          budget: () => this.budgetSnapshot(),
-          stops: this.stops,
-          onConfigChange: () => saveConfig(this.paths, this.cfg),
-          onPollingError: (message) => {
-            if (/409/.test(message)) {
-              this.error = "Другой экземпляр бота уже запущен (409 Conflict). Закройте его в диспетчере задач.";
-              log.error(this.error);
-            }
-          },
-        });
-        this.username = await this.bridge.start();
-      }
+      if (this.telegramOn()) await this.startTelegram();
       // Discord may be slow or temporarily unreachable; Telegram must not wait
       // for its login retries (up to ~7 min) before the panel says "running".
       void this.startDiscord();
@@ -271,6 +265,31 @@ export class App {
       this.scheduleRetry();
       throw error;
     }
+  }
+
+  /** Telegram runs only when its toggle is on and a token exists. */
+  private telegramOn(): boolean {
+    return this.cfg.telegram.enabled !== false && Boolean(this.cfg.telegram.token);
+  }
+
+  /** Starts the Telegram adapter alone (Discord is started separately). */
+  private async startTelegram(): Promise<void> {
+    if (!this.client || this.bridge || !this.telegramOn()) return;
+    this.net = await this.connectTelegram();
+    this.bridge = new Bridge(this.cfg, this.client, this.store, {
+      fetch: this.net.fetch,
+      relay: this.relay,
+      budget: () => this.budgetSnapshot(),
+      stops: this.stops,
+      onConfigChange: () => saveConfig(this.paths, this.cfg),
+      onPollingError: (message) => {
+        if (/409/.test(message)) {
+          this.error = "Другой экземпляр бота уже запущен (409 Conflict). Закройте его в диспетчере задач.";
+          log.error(this.error);
+        }
+      },
+    });
+    this.username = await this.bridge.start();
   }
 
   /** Budget caps are enforced centrally, independently of Telegram/Discord. */
@@ -374,8 +393,57 @@ export class App {
     }
   }
 
-  private scheduleDiscordRetry(): void {
-    if (this.discordRetryTimer || this.state !== "running" || !isDiscordConfigured(this.cfg)) return;
+  /**
+   * Applies a Telegram/Discord enable toggle without restarting the other
+   * adapter: each transport starts and stops on its own.
+   */
+  async syncAdapters(): Promise<void> {
+    if (!this.client) {
+      if (this.telegramOn() || isDiscordConfigured(this.cfg)) await this.startBot();
+      return;
+    }
+    if (this.telegramOn()) {
+      if (!this.bridge) {
+        try {
+          await this.startTelegram();
+        } catch (error) {
+          this.error = (error as Error).message;
+          log.error("telegram start failed:", this.error);
+        }
+      }
+    } else if (this.bridge) {
+      await this.bridge.stop().catch((error) => log.warn("telegram stop:", (error as Error).message));
+      this.bridge = undefined;
+      this.net?.stop();
+      this.net = undefined;
+      this.username = "";
+      log.info("telegram adapter stopped (disabled)");
+    }
+
+    if (isDiscordConfigured(this.cfg)) {
+      if (!this.discord) await this.startDiscord();
+    } else if (this.discord) {
+      await this.discord.stop().catch((error) => log.warn("discord stop:", (error as Error).message));
+      this.discord = undefined;
+      this.discordState = "off";
+      this.discordError = "";
+      this.discordRetryAt = 0;
+      this.discordRetryAttempt = 0;
+      if (this.discordRetryTimer) {
+        clearTimeout(this.discordRetryTimer);
+        this.discordRetryTimer = undefined;
+      }
+      log.info("discord adapter stopped (disabled)");
+    }
+
+    if (!this.bridge && !this.discord) {
+      await this.stopBot("restart");
+      return;
+    }
+    this.state = "running";
+  }
+
+  private scheduleDiscordRetry(): void {    if (this.discordRetryTimer || this.state !== "running" || !isDiscordConfigured(this.cfg)) return;
     const delay = Math.min(300_000, 60_000 * 2 ** Math.min(this.discordRetryAttempt, 3));
     this.discordRetryAttempt += 1;
     this.discordRetryAt = Date.now() + delay;
@@ -448,8 +516,7 @@ export class App {
     this.net?.stop();
     this.bridge = undefined;
     this.discord = undefined;
-    this.discordState = isDiscordConfigured(this.cfg) ? "stopped" : "off";
-    this.discordError = "";
+    this.discordState = isDiscordConfigured(this.cfg) ? "stopped" : "off";    this.discordError = "";
     this.discordRetryAt = 0;
     this.discordRetryAttempt = 0;
     this.net = undefined;
@@ -471,9 +538,12 @@ export class App {
 
   async updateConfig(patch: Record<string, unknown>): Promise<void> {
     const wasRunning = this.state === "running";
+    const telegramWasEnabled = this.cfg.telegram.enabled !== false;
+    const discordWasEnabled = Boolean(this.cfg.discord?.enabled);
     const telegram = (patch.telegram ?? {}) as Record<string, unknown>;
     const token = typeof telegram.token === "string" ? telegram.token.trim() : "";
     if (token) this.cfg.telegram.token = token;
+    if (typeof telegram.enabled === "boolean") this.cfg.telegram.enabled = telegram.enabled;
     if (typeof telegram.proxy === "string") this.cfg.telegram.proxy = telegram.proxy.trim() || undefined;
     if (typeof telegram.apiIp === "string") this.cfg.telegram.apiIp = telegram.apiIp.trim() || undefined;
 
@@ -485,6 +555,9 @@ export class App {
     if (discord.allowedGuilds !== undefined) this.discordCfg().allowedGuilds = parseIdList(discord.allowedGuilds);
     if (discord.allowedUsers !== undefined) this.discordCfg().allowedUsers = parseIdList(discord.allowedUsers);
     if (discord.mode === "threads") this.discordCfg().mode = "threads";
+    if (discord.titleStatus === "off" || discord.titleStatus === "rename") {
+      this.discordCfg().titleStatus = discord.titleStatus;
+    }
 
     if (patch.mode === "topics" || patch.mode === "private" || patch.mode === "both") this.cfg.mode = patch.mode;
     if (patch.topicsChatId !== undefined) {
@@ -551,6 +624,9 @@ export class App {
     if (ui.lang === "system" || ui.lang === "ru" || ui.lang === "en") {
       this.cfg.ui = { ...(this.cfg.ui ?? {}), lang: ui.lang };
     }
+    if (ui.titleStatus === "icon" || ui.titleStatus === "rename" || ui.titleStatus === "off") {
+      this.cfg.ui = { ...(this.cfg.ui ?? {}), titleStatus: ui.titleStatus };
+    }
 
     const stream = (patch.stream ?? {}) as Record<string, unknown>;
     if (typeof stream.editIntervalMs === "number") {
@@ -562,8 +638,17 @@ export class App {
     if (stream.format === "rich" || stream.format === "html") this.cfg.stream.format = stream.format;
 
     saveConfig(this.paths, this.cfg);
-    if (wasRunning) await this.restartBot();
-    else if (this.state === "error" && (this.cfg.telegram.token || isDiscordConfigured(this.cfg))) {
+    const adapterToggled =
+      telegramWasEnabled !== (this.cfg.telegram.enabled !== false) ||
+      discordWasEnabled !== Boolean(this.cfg.discord?.enabled);
+    if (wasRunning) {
+      // Toggles stop/start just that adapter; anything else may need a full
+      // reconnect (token, mode, networking, throttling).
+      if (adapterToggled) await this.syncAdapters();
+      else await this.restartBot();
+    } else if (this.state === "error" && (this.telegramOn() || isDiscordConfigured(this.cfg))) {
+      await this.startBot().catch(() => undefined);
+    } else if (this.state === "stopped" && adapterToggled && (this.telegramOn() || isDiscordConfigured(this.cfg))) {
       await this.startBot().catch(() => undefined);
     }
   }
@@ -573,16 +658,36 @@ export class App {
     return this.cfg.discord;
   }
 
-  async sessions(): Promise<Array<{ id: string; title: string; directory?: string }>> {
+  /** Active and recent root sessions, hidden ones excluded unless asked. */
+  async sessions(includeHidden = false): Promise<Array<{ id: string; title: string; directory?: string; active?: boolean; updatedAt?: number }>> {
     if (!this.client) return [];
     try {
-      const list = await this.client.listSessions({ limit: 8 });
+      const list = await this.client.listSessions({ limit: 25 });
+      const hidden = new Set(this.store.hiddenSessions());
       return list
         .filter((session) => !session.parentID)
-        .map((session) => ({ id: session.id, title: session.title, directory: session.location?.directory }));
+        .filter((session) => includeHidden || !hidden.has(session.id))
+        .map((session) => ({
+          id: session.id,
+          title: (session.title ?? "").trim() || session.id.slice(0, 12),
+          directory: session.location?.directory,
+          active: Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0),
+          updatedAt: Number(session.time?.updated ?? session.time?.created ?? 0),
+        }))
+        .sort((left, right) => Number(Boolean(right.active)) - Number(Boolean(left.active)) || (right.updatedAt ?? 0) - (left.updatedAt ?? 0))
+        .slice(0, 10);
     } catch {
       return [];
     }
+  }
+
+  /** Hides a session in the panel only; OpenCode keeps the session. */
+  hideSession(sessionID: string): void {
+    this.store.hideSession(sessionID);
+  }
+
+  showSession(sessionID: string): void {
+    this.store.showSession(sessionID);
   }
 
   // ------------------------------------------------------------ notifications

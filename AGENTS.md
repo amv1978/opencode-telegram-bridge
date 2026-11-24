@@ -47,7 +47,7 @@ CLI: see `docs/build-and-release.md`. Installer: `ISCC installer\ocbridge.iss`.
   `providerID/id` → `unknown model`; cache per session, drop on `session.model.selected`.
 - A prompt accepted without `session.execution.started` within 30 s is a stuck turn:
   log + panel warning + `/stop` hint (doctor).
-- No test suite. Verification = `bun run typecheck`, `bun run src/doctor.ts`, then a manual
+- Verification: `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`, then a manual
   Telegram pass (private chat + topic + voice + permission button).
 
 ## Docs

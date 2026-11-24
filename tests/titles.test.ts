@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { canRename, renameWait, titleWithMarker } from "../src/titles.ts";
+import { canRename, normalizeTitleStatus, pickTopicIcon, renameWait, titleWithMarker } from "../src/titles.ts";
 
 describe("title markers", () => {
   test("prefix by phase and restore the original", () => {
@@ -31,5 +31,33 @@ describe("rename window", () => {
     expect(renameWait(0, now)).toBe(0);
     expect(renameWait(now - 30_000, now)).toBe(30_000);
     expect(renameWait(now - 6 * 60_000, now, 5 * 60_000)).toBe(0);
+  });
+});
+
+describe("title status mode", () => {
+  test("defaults to the quiet icon mode, never to renames", () => {
+    expect(normalizeTitleStatus(undefined)).toBe("icon");
+    expect(normalizeTitleStatus("bogus")).toBe("icon");
+    expect(normalizeTitleStatus("icon")).toBe("icon");
+    expect(normalizeTitleStatus("rename")).toBe("rename");
+    expect(normalizeTitleStatus("off")).toBe("off");
+  });
+
+  test("picks hourglass and check from the standard topic icon pack", () => {
+    const stickers = [
+      { emoji: "📊", custom_emoji_id: "1" },
+      { emoji: "✅", custom_emoji_id: "2" },
+      { emoji: "⏳", custom_emoji_id: "3" },
+    ];
+    expect(pickTopicIcon(stickers, "start")).toBe("3");
+    expect(pickTopicIcon(stickers, "done")).toBe("2");
+  });
+
+  test("matches emoji with variation selectors and ignores junk", () => {
+    const stickers = [{ emoji: "☑️", custom_emoji_id: "9" }, { emoji: "⏰", custom_emoji_id: "8" }];
+    expect(pickTopicIcon(stickers, "done")).toBe("9");
+    expect(pickTopicIcon(stickers, "start")).toBe("8");
+    expect(pickTopicIcon([], "start")).toBeUndefined();
+    expect(pickTopicIcon([{ emoji: "✅" }], "done")).toBeUndefined();
   });
 });

@@ -1,9 +1,11 @@
 import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { atomicWrite, hasPersistedFile, readJsonFile, readTextFile } from "./atomic.ts";
+import { atomicWrite, hasPersistedFile, readJsonFile } from "./atomic.ts";
 import type { PermissionMode } from "./permissions.ts";
 import { isPermissionMode } from "./permissions.ts";
+import { installerDefaults, readInstallerState, writeInstallerState, type InstallerState } from "./installer.ts";
+import { normalizeTitleStatus } from "./titles.ts";
 
 export type Role = "admin" | "user";
 
@@ -23,6 +25,11 @@ export interface DiscordConfig {
   allowedUsers?: string[];
   /** v1 supports threads only. */
   mode?: "threads";
+  /**
+   * Discord threads have no icons, so status markers are off by default.
+   * `rename` is the opt-in fallback: every rename posts a service message.
+   */
+  titleStatus?: "off" | "rename";
 }
 
 export type MediaRelayMode = "none" | "user" | "all";
@@ -66,6 +73,8 @@ export interface PermissionConfig {
 export interface BridgeConfig {
   telegram: {
     token: string;
+    /** `false` stops only the Telegram adapter; Discord keeps running. */
+    enabled?: boolean;
     allowedUsers: UserConfig[];
     /** Optional HTTP/SOCKS proxy for Bot API, e.g. "socks5://127.0.0.1:1080". */
     proxy?: string;
@@ -103,6 +112,8 @@ export interface BridgeConfig {
     theme?: "opencode" | "matrix";
     scheme?: "system" | "light" | "dark";
     lang?: "system" | "ru" | "en";
+    /** Telegram turn status: topic icon (default), topic rename, or nothing. */
+    titleStatus?: "icon" | "rename" | "off";
     /** Versions whose changelog modal was already acknowledged (Electron). */
     seenChangelog?: string[];
   };
@@ -121,8 +132,8 @@ export interface BridgeConfig {
 }
 
 const DEFAULT_CONFIG: BridgeConfig = {
-  telegram: { token: "", allowedUsers: [] },
-  discord: { enabled: false, token: "", allowedGuilds: [], allowedUsers: [], mode: "threads" },
+  telegram: { token: "", enabled: true, allowedUsers: [] },
+  discord: { enabled: false, token: "", allowedGuilds: [], allowedUsers: [], mode: "threads", titleStatus: "off" },
   opencode: {},
   mode: "both",
   showSubagents: true,
@@ -131,6 +142,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   notify: { enabled: true, targets: "admin" },
   budget: { action: "warn" },
   permissions: { mode: "ask" },
+  ui: { theme: "opencode", scheme: "system", lang: "system", titleStatus: "icon", seenChangelog: [] },
   web: { port: 7788 },
   stream: { editIntervalMs: 1800, showReasoning: false, showTools: "compact", format: "rich" },
 };
@@ -220,6 +232,7 @@ export function loadConfig(paths: Paths): BridgeConfig {
   return {
     telegram: {
       token: raw.telegram?.token ?? "",
+      enabled: raw.telegram?.enabled !== false,
       allowedUsers: raw.telegram?.allowedUsers ?? [],
       proxy: raw.telegram?.proxy,
       apiIp: raw.telegram?.apiIp,
@@ -230,6 +243,7 @@ export function loadConfig(paths: Paths): BridgeConfig {
       allowedGuilds: readIdList(raw.discord?.allowedGuilds),
       allowedUsers: readIdList(raw.discord?.allowedUsers),
       mode: "threads",
+      titleStatus: raw.discord?.titleStatus === "rename" ? "rename" : "off",
     },
     opencode: { baseUrl: raw.opencode?.baseUrl, password: raw.opencode?.password },
     mode: raw.mode ?? DEFAULT_CONFIG.mode,
@@ -267,6 +281,7 @@ export function loadConfig(paths: Paths): BridgeConfig {
       theme: raw.ui?.theme ?? "opencode",
       scheme: raw.ui?.scheme ?? "system",
       lang: raw.ui?.lang ?? "system",
+      titleStatus: normalizeTitleStatus(raw.ui?.titleStatus),
       seenChangelog: Array.isArray(raw.ui?.seenChangelog) ? raw.ui.seenChangelog.map(String) : [],
     },
     web: { port: raw.web?.port ?? DEFAULT_CONFIG.web.port },
@@ -274,9 +289,9 @@ export function loadConfig(paths: Paths): BridgeConfig {
   };
 }
 
-/** True once a bot token is present; the bot itself can start. */
+/** True once a bot token is present and the adapter is enabled; the bot itself can start. */
 export function isConfigured(cfg: BridgeConfig): boolean {
-  return Boolean(cfg.telegram.token);
+  return Boolean(cfg.telegram.enabled !== false && cfg.telegram.token);
 }
 
 /** Discord is opt-in: enabled checkbox + token. */
@@ -307,21 +322,36 @@ function readUsd(value: unknown): number | undefined {
 /**
  * The installer never rewrites config.json (it would drop unrelated sections).
  * It leaves installer.json with optional overrides; they are merged once here.
+ * On a fresh config (user deleted config.json) the remembered wizard answers
+ * (mode, folder, topics chat, language) are used as defaults too.
  */
 export function applyInstallerOverrides(paths: Paths, cfg: BridgeConfig, configExisted: boolean): boolean {
   const file = join(dirname(paths.configFile), "installer.json");
   if (!existsSync(file)) return false;
-  let raw: Record<string, any>;
-  const text = readTextFile(file);
-  if (text === undefined) return false;
-  try {
-    raw = JSON.parse(text) as Record<string, any>;
-  } catch {
-    return false;
-  }
-  const overrides = (raw.config ?? undefined) as Record<string, unknown> | undefined;
+  const record = readInstallerState(file);
+  if (!record) return false;
+  const overrides = record.config;
   let changed = false;
-  if (overrides && !(raw.configOnlyIfNew === true && configExisted)) {
+  if (!configExisted) {
+    const remembered = installerDefaults(record);
+    if (remembered.mode && cfg.mode === DEFAULT_CONFIG.mode) {
+      cfg.mode = remembered.mode;
+      changed = true;
+    }
+    if (remembered.defaultDirectory && !cfg.defaultDirectory) {
+      cfg.defaultDirectory = remembered.defaultDirectory;
+      changed = true;
+    }
+    if (remembered.topicsChatId && !cfg.topicsChatId) {
+      cfg.topicsChatId = remembered.topicsChatId;
+      changed = true;
+    }
+    if (remembered.lang) {
+      cfg.ui = { ...(cfg.ui ?? {}), lang: remembered.lang };
+      changed = true;
+    }
+  }
+  if (overrides && !(record.configOnlyIfNew === true && configExisted)) {
     const token = typeof overrides.telegramToken === "string" ? overrides.telegramToken.trim() : "";
     if (token && !/^[*•]+/.test(token)) {
       cfg.telegram.token = token;
@@ -347,12 +377,20 @@ export function applyInstallerOverrides(paths: Paths, cfg: BridgeConfig, configE
     }
     if (changed) saveConfig(paths, cfg);
   }
-  // Keep install kind/directory/autostart for the next wizard run, drop one-shot overrides.
-  delete raw.config;
-  delete raw.configOnlyIfNew;
-  raw.configAppliedAt = new Date().toISOString();
+  // Keep install kind/directory/autostart/language for the next wizard run,
+  // drop one-shot overrides, never store secrets.
+  const kept: InstallerState = { ...record };
+  kept.config = undefined;
+  kept.configOnlyIfNew = undefined;
+  kept.configAppliedAt = new Date().toISOString();
+  // Mirror the effective non-secret choices so the wizard sees them even when
+  // the user changed them in the panel between installs.
+  if (!kept.mode) kept.mode = cfg.mode;
+  if (!kept.defaultDirectory && cfg.defaultDirectory) kept.defaultDirectory = cfg.defaultDirectory;
+  if (!kept.topicsChatId && cfg.topicsChatId) kept.topicsChatId = cfg.topicsChatId;
+  if (!kept.language && (cfg.ui?.lang === "ru" || cfg.ui?.lang === "en")) kept.language = cfg.ui.lang;
   try {
-    atomicWrite(file, JSON.stringify(raw, null, 2) + "\n");
+    writeInstallerState(file, kept);
   } catch {
     /* best-effort */
   }

@@ -1,10 +1,10 @@
-; Inno Setup script for OpenCode Telegram Bridge.
+﻿; Inno Setup script for OpenCode Telegram Bridge.
 ; Build: ISCC.exe installer\ocbridge.iss
 ; Produces: dist\ocbridge-setup-standalone-<version>.exe
 
 #define AppName "OpenCode Telegram Bridge"
 #ifndef AppVersion
-  #define AppVersion "0.7.2"
+  #define AppVersion "0.8.0"
 #endif
 #define AppExe "ocbridge.exe"
 
@@ -29,10 +29,10 @@ WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\desktop\OpenCode Bridge.exe
 SetupIconFile=icon.ico
-InfoAfterFile=..\docs\INSTALL.txt
 MinVersion=10.0
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+UsePreviousLanguage=yes
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
@@ -40,7 +40,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:AutostartGroup}"; Flags: checkedonce
-Name: "desktopicon"; Description: "{cm:TaskDesktopIcon}"; GroupDescription: "Дополнительно:"
+Name: "desktopicon"; Description: "{cm:TaskDesktopIcon}"; GroupDescription: "Р”РѕРїРѕР»РЅРёС‚РµР»СЊРЅРѕ:"
 
 [Files]
 Source: "..\dist\ocbridge.exe"; DestDir: "{app}"; Flags: ignoreversion

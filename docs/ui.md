@@ -7,13 +7,38 @@
 A single page served by the daemon: `http://127.0.0.1:7788`. It listens on loopback
 only; if the port is busy the next one is used (up to +9).
 
-Sections: bot and OpenCode status, token, mode, forum group ID, default folder,
-throttling, tools, media relay, network (proxy/IP), users, recent sessions, log,
-“Start / Stop / Restart” buttons, autostart.
+Sections live behind a left navigation: **Status** (Telegram/OpenCode/Discord state,
+start/stop/restart, autostart, current sessions), **Settings** (theme, language,
+default folder, throttling, tools, formatting, media relay, subagents), **Telegram**
+(enabled toggle, token, mode, forum group ID, topic status, access list, proxy/IP),
+**Discord** (enabled toggle, token, allowed servers/users, thread renames),
+**Updates** and **Log**. Below 900 px the navigation collapses into an icon rail;
+the ☰ button expands it over the content. The selected section is kept in
+`localStorage` (`ocbridge.page`).
+
+Telegram and Discord each have an `enabled` toggle (`telegram.enabled`,
+`discord.enabled`); the adapters start and stop independently, so one transport can
+be turned off without restarting the other.
 
 If `/api/state` fails (daemon restarting, port busy) the page keeps the last data
 and shows a red banner with the failure reason instead of empty dashes. Discord
 shows `connected`, `retrying N · in Xs · error`, or the error text.
+
+### Current sessions
+
+The Status page lists active and recent root sessions (active first, newest next).
+“Hide” removes a row from the panel only — the session keeps running and stays in
+OpenCode; the ids are stored in `state.json` (`ui.hiddenSessions`) and can be
+restored with “Show hidden”. “Refresh” reloads the list; with no sessions the card
+shows an empty state.
+
+### Log panel
+
+`bridge.log` is tailed with a line-count selector (100 / 500 / 2000), a level filter
+(all / info / warn / error), a free-text search, and an auto-scroll pause. “Download
+bridge.log” streams the whole file from `/api/log/download`. There is no “open
+folder” link: the panel is a web page and cannot open Explorer.
+
 
 ## Themes
 

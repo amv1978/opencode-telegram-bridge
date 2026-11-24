@@ -42,7 +42,20 @@ async function handle(app: App, request: Request): Promise<Response> {
     }
 
     if (request.method === "GET" && url.pathname === "/api/sessions") {
-      return json({ sessions: await app.sessions() });
+      const includeHidden = url.searchParams.get("hidden") === "1";
+      return json({ sessions: await app.sessions(includeHidden) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/sessions/hide") {
+      const body = (await request.json()) as { id?: string };
+      app.hideSession(String(body.id ?? ""));
+      return json({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/sessions/show") {
+      const body = (await request.json()) as { id?: string };
+      app.showSession(String(body.id ?? ""));
+      return json({ ok: true });
     }
 
     if (request.method === "GET" && url.pathname === "/api/budget") {
@@ -51,7 +64,26 @@ async function handle(app: App, request: Request): Promise<Response> {
 
     if (request.method === "GET" && url.pathname === "/api/log") {
       const lines = Number(url.searchParams.get("lines") ?? 120);
-      return json({ log: tailLog(app.paths.logFile, Number.isFinite(lines) ? lines : 120) });
+      return json({ log: tailLog(app.paths.logFile, Number.isFinite(lines) ? lines : 120), file: "bridge.log" });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/log/download") {
+      try {
+        const text = readFileSync(app.paths.logFile);
+        return new Response(text, {
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "content-disposition": 'attachment; filename="bridge.log"',
+          },
+        });
+      } catch {
+        return new Response("bridge.log is empty\n", {
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "content-disposition": 'attachment; filename="bridge.log"',
+          },
+        });
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/api/config") {
@@ -125,7 +157,8 @@ async function handle(app: App, request: Request): Promise<Response> {
 function tailLog(file: string, lines: number): string {
   try {
     const text = readFileSync(file, "utf8");
-    return text.split("\n").slice(-Math.min(lines, 1000)).join("\n");
+    // The panel offers 100/500/2000; read the tail without loading an unbounded file.
+    return text.split("\n").slice(-Math.min(Math.max(1, lines), 2000)).join("\n");
   } catch {
     return "";
   }
