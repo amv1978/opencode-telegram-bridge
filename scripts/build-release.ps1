@@ -18,6 +18,13 @@ $stage = Join-Path $dist "bundle"
 $desktop = Join-Path $root "desktop\release\win-unpacked"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
+# 0. Versions -------------------------------------------------------------
+Write-Host "-- version sync"
+& bun scripts/sync-version.mjs
+if ($LASTEXITCODE -ne 0) { throw "version sync failed" }
+& bun scripts/sync-version.mjs --check
+if ($LASTEXITCODE -ne 0) { throw "version mismatch: root package.json is the single source" }
+
 # 1. Daemon ---------------------------------------------------------------
 Write-Host "-- daemon"
 & bun run build
@@ -89,6 +96,7 @@ if (Test-Path $zip) { Remove-Item $zip -Force }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
 $bundleSha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+if (-not $bundleSha) { throw "bundle SHA256 is empty" }
 "$bundleSha  ocbridge-bundle-$Version.zip" | Set-Content "$zip.sha256" -Encoding ascii
 Write-Host "bundle: $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
 

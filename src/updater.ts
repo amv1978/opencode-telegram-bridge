@@ -60,6 +60,12 @@ const DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
 const HEALTH_TIMEOUT_SECONDS = 60;
 const INSTALLED_ITEMS = ["ocbridge.exe", "ffmpeg.exe", "ocbridge-cli.exe", "desktop", "version.json", "CHANGELOG.md", "README.md"];
 
+interface BundleMeta {
+  version: string;
+  sha256: string;
+  downloadedAt: string;
+}
+
 /** Numeric semver comparison; a leading `v` and suffixes are ignored. */
 export function compareVersions(left: string, right: string): number {
   const parse = (value: string) =>
@@ -95,6 +101,8 @@ export class Updater {
       installDir?: string;
       /** Test hook: pretend this version is running. */
       currentVersion?: string;
+      /** Actually bound web UI port (the server may fall back from the config). */
+      port?: () => number;
       onCache?: (cache: UpdateCache) => void;
       /** Called right before the swap helper starts; must persist state synchronously. */
       onBeforeInstall?: (previous: string, next: string) => void;
@@ -197,6 +205,8 @@ export class Updater {
       if (existsSync(target) && (await this.verifyFile(target))) {
         this.file = target;
         this.progress = 100;
+        const sha = await fetchText(this.cache.shaUrl!);
+        this.writeMeta(this.cache.latest ?? this.current, sha);
         log.info("update: already downloaded and verified");
         return this.snapshot();
       }
@@ -216,6 +226,7 @@ export class Updater {
       renameSync(part, target);
       this.file = target;
       this.progress = 100;
+      this.writeMeta(this.cache.latest ?? this.current, actual);
       log.info(`update downloaded: ${target} (${Math.round(received / 1024 / 1024)} MB)`);
     } catch (error) {
       this.error = (error as Error).message;
@@ -242,6 +253,14 @@ export class Updater {
 
     this.installing = true;
     try {
+      const meta = this.readMeta();
+      if (!meta) throw new Error("метаданные bundle не найдены, скачайте обновление заново");
+      if (this.cache.latest && meta.version !== this.cache.latest) {
+        throw new Error(`bundle версии ${meta.version} не совпадает с ожидаемой ${this.cache.latest}`);
+      }
+      const actualSha = createHash("sha256").update(readFileSync(target)).digest("hex");
+      if (actualSha !== meta.sha256) throw new Error("bundle не совпадает с сохранённым SHA256");
+
       const app = this.appDir;
       const next = join(app, "new");
       const prev = join(app, "prev");
@@ -276,7 +295,7 @@ export class Updater {
           app,
           next,
           prev,
-          port: 7788,
+          port: this.port(),
           items: INSTALLED_ITEMS,
           healthSeconds: HEALTH_TIMEOUT_SECONDS,
         }),
@@ -317,7 +336,7 @@ export class Updater {
       const script = join(updateDir(), "rollback.ps1");
       writeFileSync(
         script,
-        rollbackScript({ app, prev, port: 7788, items: INSTALLED_ITEMS, healthSeconds: HEALTH_TIMEOUT_SECONDS }),
+        rollbackScript({ app, prev, port: this.port(), items: INSTALLED_ITEMS, healthSeconds: HEALTH_TIMEOUT_SECONDS }),
         "utf8",
       );
       const child = spawn(
@@ -354,6 +373,31 @@ export class Updater {
       return Boolean(expected) && expected === actual;
     } catch {
       return false;
+    }
+  }
+
+  /** Port the web UI really bound to (the config port may have been busy). */
+  private port(): number {
+    const value = Number(this.options.port?.() ?? 0);
+    return Number.isFinite(value) && value > 0 ? Math.round(value) : 7788;
+  }
+
+  private metaPath(): string {
+    return join(updateDir(), "bundle.meta.json");
+  }
+
+  private writeMeta(version: string, sha256: string): void {
+    const meta: BundleMeta = { version, sha256, downloadedAt: new Date().toISOString() };
+    writeFileSync(this.metaPath(), JSON.stringify(meta, null, 2), "utf8");
+  }
+
+  private readMeta(): BundleMeta | undefined {
+    try {
+      const meta = JSON.parse(readFileSync(this.metaPath(), "utf8")) as Partial<BundleMeta>;
+      if (typeof meta.version !== "string" || typeof meta.sha256 !== "string") return undefined;
+      return { version: meta.version, sha256: meta.sha256, downloadedAt: String(meta.downloadedAt ?? "") };
+    } catch {
+      return undefined;
     }
   }
 
@@ -575,5 +619,8 @@ Get-ChildItem -LiteralPath $Prev -Force | ForEach-Object { Move-Item -LiteralPat
 Remove-Item $Prev -Recurse -Force
 Remove-Item $Failed -Recurse -Force
 Start-App
+if (-not (Wait-Healthy)) {
+  Set-Content -Path (Join-Path $App 'rollback-health.txt') -Value 'rollback started, but /api/state did not answer'
+}
 `;
 }

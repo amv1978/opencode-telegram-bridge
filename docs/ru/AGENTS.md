@@ -15,6 +15,7 @@ OpenCode (те же, что видят Desktop/TUI), ответы стримят
 | `cli/` | .NET 10 CLI `ocbridge-cli.exe` поверх локального JSON API (без NuGet-зависимостей) |
 | `installer/` | Скрипт Inno Setup + сообщения мастера RU/EN |
 | `docs/` | Главы; индекс в `docs/README.md` |
+| `specs/` | Локальные speckit-спеки (gitignored); `specs/_template/` — версионируемый формат |
 | `scripts/` | Ручные проверки (voice, render, dec) |
 
 ## Команды
@@ -50,8 +51,14 @@ CLI: см. `docs/build-and-release.md`. Установщик: `ISCC installer\oc
   `providerID/id` → `unknown model`; кэш на сессию, сброс по `session.model.selected`.
 - Если prompt принят, а `session.execution.started` не пришёл за 30 с — это зависший
   ход: журнал + предупреждение в панели + подсказка `/stop` (doctor).
-- Проверка: `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`,
-  затем ручной проход по Telegram (личный чат + тема + голос + кнопка разрешения).
+- **Никакого кода без спецификации.** Фича или пакет исправлений начинается с
+  `specs/<версия>-<slug>/` из `specs/_template/` (spec: цель + приёмка + вне
+  рамок; plan: подход; tasks: по порядку, с тестами). Спеки локальные
+  (gitignored), версионируется только шаблон.
+- **Каждая фича = spec + тесты + ручная проверка в Telegram И Discord.**
+- **Release gate:** `bunx tsc --noEmit` + `bun test` + проверка установщика
+  (`ISCC installer\ocbridge.iss`), затем ручной проход по Telegram (личный чат +
+  тема + голос + кнопка разрешения) и по треду/каналу Discord.
 
 ## Документация
 

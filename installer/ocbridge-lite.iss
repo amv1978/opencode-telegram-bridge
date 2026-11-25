@@ -1,4 +1,4 @@
-﻿; Inno Setup script for the "lite" OpenCode Telegram Bridge installer.
+; Inno Setup script for the "lite" OpenCode Telegram Bridge installer.
 ; It downloads ocbridge-bundle-<version>.zip from the matching GitHub tag,
 ; verifies SHA256 and extracts the portable layout.
 ; Build: ISCC.exe /DBundleSha=<sha256> installer\ocbridge-lite.iss
@@ -6,7 +6,7 @@
 
 #define AppName "OpenCode Telegram Bridge"
 #ifndef AppVersion
-  #define AppVersion "0.8.0"
+  #define AppVersion "0.8.2"
 #endif
 #define AppExe "ocbridge.exe"
 #define LITE
@@ -43,7 +43,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:AutostartGroup}"; Flags: checkedonce
-Name: "desktopicon"; Description: "{cm:TaskDesktopIcon}"; GroupDescription: "Р”РѕРїРѕР»РЅРёС‚РµР»СЊРЅРѕ:"
+Name: "desktopicon"; Description: "{cm:TaskDesktopIcon}"; GroupDescription: "{cm:DesktopIconGroup}"
 
 [Dirs]
 Name: "{app}"; Permissions: users-modify

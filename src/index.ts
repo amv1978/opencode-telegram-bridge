@@ -46,6 +46,7 @@ async function main(): Promise<void> {
   log.info(`OpenCode Bridge ${pkg.version}`);
 
   const server = startServer(app);
+  app.setWebPort(server.port);
   const uiUrl = `http://127.0.0.1:${server.port}`;
 
   let shuttingDown = false;

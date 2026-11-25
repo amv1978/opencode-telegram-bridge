@@ -1,7 +1,9 @@
 import { GrammyError, type Api } from "grammy";
 import { log } from "../log.ts";
 import { sanitizeModelName, UNKNOWN_MODEL } from "../model.ts";
+import { assignChunk, planChunks, TurnGate } from "../order.ts";
 import { statusHtml, statusMarkdownList, type StatusItem } from "../status.ts";
+import { TypingPulse } from "../typing.ts";
 import { markdownToHtml, splitHtml, splitMarkdown, stripHtml } from "./render.ts";
 
 export interface Target {
@@ -44,9 +46,9 @@ interface State {
   text: string;
   tools: ToolState[];
   subagents: SubagentState[];
-  messageIds: number[];
+  messageIds: Array<number | undefined>;
   timer?: ReturnType<typeof setTimeout>;
-  typing?: ReturnType<typeof setInterval>;
+  typing?: TypingPulse;
   /** Repeating ticker: elapsed time changes even without new events. */
   ticker?: ReturnType<typeof setInterval>;
   finalizeTimer?: ReturnType<typeof setTimeout>;
@@ -62,6 +64,8 @@ interface State {
   /** In-flight flush, so `end()` cannot be skipped by a slow edit. */
   flushPromise?: Promise<void>;
   finished: boolean;
+  /** At least one chunk reached Telegram (no duplicate fallback message). */
+  delivered: boolean;
 }
 
 const PLACEHOLDER = "⏳ Думаю…";
@@ -73,6 +77,10 @@ const MAX_STATUS_SUBAGENTS = 2;
 
 export class Streamer {
   private readonly states = new Map<string, State>();
+  /** Blocks a duplicate placeholder after a turn already ended (late SSE). */
+  private readonly gate = new TurnGate();
+  /** Deltas that arrived while the gate was closed; replayed on the next begin. */
+  private readonly pendingText = new Map<string, string>();
   /** Flipped to false permanently once Telegram rejects a rich message. */
   private rich: boolean;
   /** model display name currently used by a session's live block. */
@@ -105,12 +113,17 @@ export class Streamer {
     this.schedule(state, STATUS_TICK_MS);
   }
 
-  async begin(sessionID: string, target: Target, model?: string): Promise<void> {
+  async begin(sessionID: string, target: Target, model?: string, newTurn = false): Promise<void> {
+    if (newTurn) this.gate.open(sessionID);
     if (this.states.has(sessionID)) return;
+    if (!this.gate.allowsBegin(sessionID)) {
+      log.info(`late event after turn end ignored for ${sessionID.slice(0, 16)}`);
+      return;
+    }
     const state: State = {
       sessionID,
       target,
-      text: "",
+      text: this.pendingText.get(sessionID) ?? "",
       tools: [],
       subagents: [],
       messageIds: [],
@@ -121,16 +134,19 @@ export class Streamer {
       flushing: false,
       blocked: 0,
       finished: false,
+      delivered: false,
     };
+    this.pendingText.delete(sessionID);
     this.models.set(sessionID, state.model);
     this.states.set(sessionID, state);
     const messageId = await this.send(sessionID, state, this.composeMarkdown(state));
-    if (messageId) state.messageIds.push(messageId);
+    if (messageId) {
+      state.messageIds.push(messageId);
+      state.delivered = true;
+    }
     state.lastEditAt = Date.now();
-    state.typing = setInterval(() => {
-      void this.api.sendChatAction(target.chatId, "typing").catch(() => undefined);
-    }, 5000);
-    state.typing.unref?.();
+    state.typing = new TypingPulse(() => this.api.sendChatAction(target.chatId, "typing"), 4500);
+    state.typing.start();
     // Repeating ticker (not a one-shot setTimeout chain): recomputes elapsed
     // strings and forces an edit even when only the number changed. Keeps
     // `🧩 … · 12s` / `🛠 … · 3s` moving after the parent turn ended too.
@@ -147,7 +163,11 @@ export class Streamer {
 
   append(sessionID: string, delta: string): void {
     const state = this.states.get(sessionID);
-    if (!state || !delta) return;
+    if (!state) {
+      if (delta) { const next = `${this.pendingText.get(sessionID) ?? ""}${delta}`; this.pendingText.set(sessionID, next.slice(-200_000)); }
+      return;
+    }
+    if (!delta) return;
     state.text += delta;
     this.schedule(state);
   }
@@ -254,7 +274,6 @@ export class Streamer {
       clearTimeout(state.timer);
       state.timer = undefined;
     }
-    if (state.typing) clearInterval(state.typing);
 
     if (hasActiveSubagents(state)) {
       state.awaiting = true;
@@ -281,6 +300,9 @@ export class Streamer {
       state.timer = undefined;
     }
     if (state.ticker) clearInterval(state.ticker);
+    state.typing?.stop();
+    state.typing = undefined;
+    this.gate.close(sessionID);
 
     const text = footer ?? state.footer;
     let delivered = false;
@@ -296,12 +318,22 @@ export class Streamer {
     }
 
     if (!delivered) {
-      // Last resort: send the answer as a brand-new message.
+      // Last resort: reuse the message that already carries part of the answer,
+      // otherwise a network hiccup would post the same answer twice.
       try {
         const markdown = this.composeMarkdown(state, text);
-        if (this.rich) await this.api.sendRichMessage(state.target.chatId, { markdown }, this.threadOptions(state));
-        else await this.api.sendMessage(state.target.chatId, markdownToHtml(markdown), { parse_mode: "HTML", ...this.threadOptions(state) });
-        log.info(`final delivery recovered as a new message for ${sessionID.slice(0, 16)}`);
+        const existing = [...state.messageIds].reverse().find((id) => id !== undefined);
+        if (existing !== undefined) {
+          if (this.rich) await this.editRich(state, existing, markdown);
+          else await this.editHtml(state, existing, markdownToHtml(markdown));
+          log.info(`final delivery recovered by editing message ${existing} for ${sessionID.slice(0, 16)}`);
+        } else if (this.rich) {
+          await this.api.sendRichMessage(state.target.chatId, { markdown }, this.threadOptions(state));
+          log.info(`final delivery recovered as a new message for ${sessionID.slice(0, 16)}`);
+        } else {
+          await this.api.sendMessage(state.target.chatId, markdownToHtml(markdown), { parse_mode: "HTML", ...this.threadOptions(state) });
+          log.info(`final delivery recovered as a new message for ${sessionID.slice(0, 16)}`);
+        }
       } catch (error) {
         log.error(`final delivery lost for ${sessionID.slice(0, 16)}: ${(error as Error).message}`);
       }
@@ -432,6 +464,7 @@ export class Streamer {
       if (this.rich) {
         try {
           await this.flushRich(state, footer);
+          state.delivered = true;
           state.lastEditAt = Date.now();
           return;
         } catch (error) {
@@ -441,6 +474,7 @@ export class Streamer {
         }
       }
       await this.flushHtml(state, footer);
+      state.delivered = true;
       state.lastEditAt = Date.now();
       void sessionID;
     } finally {
@@ -450,29 +484,31 @@ export class Streamer {
 
   private async flushRich(state: State, footer?: string): Promise<void> {
     const chunks = this.composeChunks(state, footer);
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunk = chunks[index] ?? "";
-      const messageId = state.messageIds[index];
-      if (messageId === undefined) {
-        const sent = await this.sendRich(state, chunk);
-        if (sent) state.messageIds.push(sent);
+    // Strictly ascending plan: chunks are edited in place or appended; a
+    // retried flush reuses recorded ids and never duplicates a chunk.
+    for (const step of planChunks(state.messageIds, chunks.length)) {
+      const chunk = chunks[step.index] ?? "";
+      if (step.action === "edit") {
+        await this.editRich(state, state.messageIds[step.index]!, chunk);
         continue;
       }
-      await this.editRich(state, messageId, chunk);
+      const sent = await this.sendRich(state, chunk);
+      if (!sent) return;
+      assignChunk(state.messageIds, step.index, sent);
     }
   }
 
   private async flushHtml(state: State, footer?: string): Promise<void> {
     const chunks = this.composeChunks(state, footer, true);
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunk = chunks[index] ?? "";
-      const messageId = state.messageIds[index];
-      if (messageId === undefined) {
-        const sent = await this.sendHtml(state, chunk);
-        if (sent) state.messageIds.push(sent);
+    for (const step of planChunks(state.messageIds, chunks.length)) {
+      const chunk = chunks[step.index] ?? "";
+      if (step.action === "edit") {
+        await this.editHtml(state, state.messageIds[step.index]!, chunk);
         continue;
       }
-      await this.editHtml(state, messageId, chunk);
+      const sent = await this.sendHtml(state, chunk);
+      if (!sent) return;
+      assignChunk(state.messageIds, step.index, sent);
     }
   }
 

@@ -1,12 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import {
   applyInstallerOverrides,
   isDiscordConfigured,
   loadConfig,
   resolvePaths,
   saveConfig,
+  transportFingerprint,
   type BridgeConfig,
   type DiscordConfig,
 } from "./config.ts";
@@ -23,6 +24,8 @@ import { changelogBetween } from "./changelog.ts";
 import { BudgetTracker, type BudgetSnapshot } from "./budget.ts";
 import { isPermissionMode } from "./permissions.ts";
 import { StopRegistry } from "./stops.ts";
+import { formatUptime, type BridgeRuntimeInfo } from "./status.ts";
+import { normalizeSubagentMode, isSubagentMode } from "./subagents.ts";
 
 export type BotState = "stopped" | "starting" | "running" | "error";
 
@@ -45,7 +48,7 @@ export interface Snapshot {
     showTools: BridgeConfig["stream"]["showTools"];
     format: "rich" | "html";
     autoTopics: boolean;
-    showSubagents: boolean;
+    showSubagents: "auto" | "inline" | "message" | "off";
     media: { relay: "none" | "user" | "all"; maxPhotoMb: number };
     update: { checkOnStart: boolean; intervalHours: number; autoDownload: boolean };
     notify: { enabled: boolean; targets: "admin" | "all" | string[] };
@@ -110,6 +113,7 @@ export class App {
   private discordRetryAttempt = 0;
   private ocVersion = "";
   private ocUrl = "";
+  private webPort?: number;
   private budget?: BudgetTracker;
   private readonly stops = new StopRegistry();
   private budgetUnsub?: () => void;
@@ -118,6 +122,8 @@ export class App {
   private lastStartNotice = 0;
   private lastFailureNotice = 0;
   private suppressLifecycleNotice = false;
+  /** Incremented by stopBot; a stale start must not resurrect adapters. */
+  private lifecycle = 0;
 
   constructor() {
     initLog(this.paths.logFile);
@@ -129,6 +135,7 @@ export class App {
       packaged: isCompiled(),
       dataDir: dirname(this.paths.configFile),
       installDir: dirname(process.execPath),
+      port: () => this.webPort ?? this.cfg.web.port,
       onCache: (cache) => this.store.setUpdateCache(cache as unknown as Record<string, unknown>),
       onBeforeInstall: (previous) => this.store.setPrevVersion(previous),
       notify: (text) => this.notify(text),
@@ -158,7 +165,7 @@ export class App {
         showTools: this.cfg.stream.showTools,
         format: this.cfg.stream.format ?? "rich",
         autoTopics: this.cfg.autoTopics !== false,
-        showSubagents: this.cfg.showSubagents !== false,
+        showSubagents: normalizeSubagentMode(this.cfg.showSubagents),
         media: {
           relay: this.cfg.media?.relay ?? "all",
           maxPhotoMb: this.cfg.media?.maxPhotoMb ?? 10,
@@ -214,18 +221,34 @@ export class App {
     if (!this.telegramOn() && !isDiscordConfigured(this.cfg)) {
       throw new Error("Нет активных адаптеров: включите Telegram (нужен токен) или Discord");
     }
+    const run = ++this.lifecycle;
     this.state = "starting";
     this.error = "";
     try {
       const endpoint = await discover(this.cfg.opencode);
+      if (run !== this.lifecycle) {
+        await this.cleanupStart();
+        return;
+      }
       this.client = new OcClient(endpoint.baseUrl, endpoint.password);
       this.ocUrl = endpoint.baseUrl;
       this.ocVersion = (await this.client.info()).version;
+      if (run !== this.lifecycle) {
+        await this.cleanupStart();
+        return;
+      }
       this.startBudget();
       this.relay = new MediaRelay({
         store: this.store,
         media: () => this.cfg.media ?? { relay: "all", maxPhotoMb: 10 },
         topicsChatId: () => this.cfg.topicsChatId,
+        sessionDir: async (sessionID) => {
+          try {
+            return (await this.client?.getSession(sessionID))?.location?.directory;
+          } catch {
+            return undefined;
+          }
+        },
         senders: {
           telegram: {
             send: (target, item, limits) => this.bridge?.sendMedia(target, item, limits) ?? Promise.resolve(),
@@ -239,9 +262,17 @@ export class App {
       });
 
       if (this.telegramOn()) await this.startTelegram();
+      if (run !== this.lifecycle) {
+        await this.cleanupStart();
+        return;
+      }
       // Discord may be slow or temporarily unreachable; Telegram must not wait
       // for its login retries (up to ~7 min) before the panel says "running".
       void this.startDiscord();
+      if (run !== this.lifecycle) {
+        await this.cleanupStart();
+        return;
+      }
       this.state = "running";
       this.startedAt = Date.now();
       this.startUpdateLoop();
@@ -251,6 +282,10 @@ export class App {
       const noticeTimer = setTimeout(() => void this.sendStartNotice(), 2500);
       noticeTimer.unref?.();
     } catch (error) {
+      if (run !== this.lifecycle) {
+        await this.cleanupStart();
+        return;
+      }
       this.state = "error";
       this.error = (error as Error).message;
       log.error("start failed:", this.error);
@@ -272,6 +307,19 @@ export class App {
     return this.cfg.telegram.enabled !== false && Boolean(this.cfg.telegram.token);
   }
 
+  /** A start cancelled by Stop must not leave half-started adapters behind. */
+  private async cleanupStart(): Promise<void> {
+    this.stopBudget();
+    await this.bridge?.stop().catch(() => undefined);
+    await this.discord?.stop().catch(() => undefined);
+    this.net?.stop();
+    this.bridge = undefined;
+    this.discord = undefined;
+    this.net = undefined;
+    this.relay = undefined;
+    this.client = undefined;
+  }
+
   /** Starts the Telegram adapter alone (Discord is started separately). */
   private async startTelegram(): Promise<void> {
     if (!this.client || this.bridge || !this.telegramOn()) return;
@@ -288,6 +336,7 @@ export class App {
           log.error(this.error);
         }
       },
+      runtime: () => this.runtimeInfo(),
     });
     this.username = await this.bridge.start();
   }
@@ -345,6 +394,32 @@ export class App {
     return this.budget?.snapshot();
   }
 
+  /** The web server may fall back when the configured port is busy. */
+  setWebPort(port: number): void {
+    if (Number.isFinite(port) && port > 0) this.webPort = Math.round(port);
+  }
+
+  /** Facts for `/status` in both adapters: uptime, adapter and OpenCode state. */
+  private runtimeInfo(): BridgeRuntimeInfo {
+    const discord = this.discord?.status;
+    return {
+      ocVersion: this.ocVersion,
+      ocUrl: this.ocUrl,
+      uptimeMs: this.startedAt ? Date.now() - this.startedAt : 0,
+      telegram: {
+        enabled: this.telegramOn(),
+        state: this.state,
+        network: this.net?.mode,
+        username: this.username,
+      },
+      discord: {
+        enabled: Boolean(this.cfg.discord?.enabled),
+        state: discord?.state ?? this.discordState,
+        username: discord?.username,
+      },
+    };
+  }
+
   /** Budget/warning text for a session: its chats first, admin notifications as a fallback. */
   async notifySession(sessionID: string, text: string): Promise<void> {
     let delivered = false;
@@ -364,10 +439,12 @@ export class App {
   /** Discord is optional: any failure is logged and Telegram keeps running. */
   private async startDiscord(): Promise<void> {
     if (!this.client || !isDiscordConfigured(this.cfg) || this.discord) return;
+    const run = this.lifecycle;
     this.discord = new DiscordBridge(this.cfg, this.client, this.store, {
       relay: this.relay,
       budget: () => this.budgetSnapshot(),
       stops: this.stops,
+      runtime: () => this.runtimeInfo(),
       onStateChange: (state, error) => {
         this.discordState = state;
         this.discordError = error;
@@ -380,10 +457,20 @@ export class App {
     });
     try {
       await this.discord.start();
+      if (run !== this.lifecycle) {
+        await this.discord.stop().catch(() => undefined);
+        this.discord = undefined;
+        return;
+      }
     } catch (error) {
+      if (run !== this.lifecycle) {
+        await this.discord?.stop().catch(() => undefined);
+        this.discord = undefined;
+        return;
+      }
       const message = (error as Error).message;
       log.error("discord start failed (Telegram keeps running):", message);
-      await this.discord.stop().catch(() => undefined);
+      await this.discord?.stop().catch(() => undefined);
       this.discord = undefined;
       // The gateway may be temporarily unreachable: retry in the background
       // instead of leaving Discord dead until a manual restart.
@@ -497,6 +584,7 @@ export class App {
   }
 
   async stopBot(reason: "quit" | "restart" | "error" | "update" = "quit"): Promise<void> {
+    this.lifecycle += 1;
     this.stopBudget();
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
@@ -540,6 +628,7 @@ export class App {
     const wasRunning = this.state === "running";
     const telegramWasEnabled = this.cfg.telegram.enabled !== false;
     const discordWasEnabled = Boolean(this.cfg.discord?.enabled);
+    const transportBefore = transportFingerprint(this.cfg);
     const telegram = (patch.telegram ?? {}) as Record<string, unknown>;
     const token = typeof telegram.token === "string" ? telegram.token.trim() : "";
     if (token) this.cfg.telegram.token = token;
@@ -566,7 +655,9 @@ export class App {
     }
     if (typeof patch.defaultDirectory === "string") this.cfg.defaultDirectory = patch.defaultDirectory.trim() || undefined;
     if (typeof patch.autoTopics === "boolean") this.cfg.autoTopics = patch.autoTopics;
-    if (typeof patch.showSubagents === "boolean") this.cfg.showSubagents = patch.showSubagents;
+    if (typeof patch.showSubagents === "boolean" || isSubagentMode(patch.showSubagents)) {
+      this.cfg.showSubagents = patch.showSubagents;
+    }
     const media = (patch.media ?? {}) as Record<string, unknown>;    if (media.relay === "none" || media.relay === "user" || media.relay === "all") {
       this.cfg.media = { ...(this.cfg.media ?? {}), relay: media.relay };
     }
@@ -641,11 +732,12 @@ export class App {
     const adapterToggled =
       telegramWasEnabled !== (this.cfg.telegram.enabled !== false) ||
       discordWasEnabled !== Boolean(this.cfg.discord?.enabled);
+    const transportChanged = transportBefore !== transportFingerprint(this.cfg);
     if (wasRunning) {
-      // Toggles stop/start just that adapter; anything else may need a full
-      // reconnect (token, mode, networking, throttling).
+      // Toggles stop/start just that adapter; only transport-relevant keys need
+      // a reconnect. Theme/scheme/lang/title changes apply live.
       if (adapterToggled) await this.syncAdapters();
-      else await this.restartBot();
+      else if (transportChanged) await this.restartBot();
     } else if (this.state === "error" && (this.telegramOn() || isDiscordConfigured(this.cfg))) {
       await this.startBot().catch(() => undefined);
     } else if (this.state === "stopped" && adapterToggled && (this.telegramOn() || isDiscordConfigured(this.cfg))) {
@@ -807,9 +899,10 @@ export class App {
   }
 
   setAutostart(enabled: boolean): void {    if (process.platform !== "win32" || !isCompiled()) throw new Error("Автозапуск поддерживается в собранной версии для Windows");
-    const exe = process.execPath;
+    const desktop = join(exeDir(), "desktop", "OpenCode Bridge.exe");
+    const exe = existsSync(desktop) ? desktop : process.execPath;
     const args = enabled
-      ? ["add", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "OpenCodeTelegramBridge", "/t", "REG_SZ", "/d", `"${exe}" --no-browser`, "/f"]
+      ? ["add", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "OpenCodeTelegramBridge", "/t", "REG_SZ", "/d", `"${exe}" --hidden`, "/f"]
       : ["delete", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "/v", "OpenCodeTelegramBridge", "/f"];
     const result = spawnSync("reg", args, { windowsHide: true });
     if (result.status !== 0 && enabled) throw new Error("Не удалось включить автозапуск");
@@ -847,15 +940,6 @@ export function openBrowser(url: string): void {
   if (process.platform === "win32") spawnSync("cmd", ["/c", "start", "", url], { windowsHide: true });
   else if (process.platform === "darwin") spawnSync("open", [url]);
   else spawnSync("xdg-open", [url]);
-}
-
-function formatUptime(ms: number): string {  const seconds = Math.max(0, Math.round(ms / 1000));
-  if (seconds < 60) return `${seconds}с`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}м`;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  return rest ? `${hours}ч ${rest}м` : `${hours}ч`;
 }
 
 /** Accepts an array (API) or a comma/space separated string (manual config edits). */

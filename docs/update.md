@@ -41,9 +41,12 @@ builds.
 3. A detached PowerShell helper waits for the bridge to exit, moves the current
    layout to `{app}\prev` (only one previous version), moves `new` into `{app}`
    and starts the desktop shell (or `ocbridge.exe --no-browser`).
-4. Health check: `GET http://127.0.0.1:7788/api/state` every second for up to
-   60 seconds. On failure the helper stops the new build, restores `prev` and
-   starts it again. The broken layout is removed.
+4. Health check: `GET http://127.0.0.1:<bound-web-port>/api/state` every second for
+   up to 60 seconds. The port is the one the web server actually bound (it may
+   differ from the configured port when that port was busy). On failure the
+   helper stops the new build, restores `prev` and starts it again. The rollback
+   run performs the same health check and writes `rollback-health.txt` on failure.
+   The broken layout is removed.
 5. A normal start notification is posted after a successful restart.
 
 `ocbridge-cli update --rollback` (or the tray item «Откатиться на X») swaps

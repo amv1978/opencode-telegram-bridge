@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { loadConfig, resolvePaths, saveConfig, type Paths } from "../src/config.ts";
+import { loadConfig, resolvePaths, saveConfig, transportFingerprint, type Paths } from "../src/config.ts";
 import { Store } from "../src/state/store.ts";
 
 function tempPaths(): Paths {
@@ -109,5 +109,24 @@ describe("resolvePaths", () => {
       if (previous === undefined) delete process.env.OCBRIDGE_CONFIG;
       else process.env.OCBRIDGE_CONFIG = previous;
     }
+  });
+});
+
+describe("transport fingerprint", () => {
+  test("cosmetic UI changes do not require an adapter restart", () => {
+    const cfg = loadConfig(tempPaths());
+    const before = transportFingerprint(cfg);
+    cfg.ui = { ...cfg.ui, theme: "matrix", scheme: "dark", lang: "en" };
+    expect(transportFingerprint(cfg)).toBe(before);
+  });
+
+  test("token and mode changes do require a restart", () => {
+    const cfg = loadConfig(tempPaths());
+    const before = transportFingerprint(cfg);
+    cfg.telegram.token = "new-token";
+    expect(transportFingerprint(cfg)).not.toBe(before);
+    cfg.telegram.token = "";
+    cfg.mode = "topics";
+    expect(transportFingerprint(cfg)).not.toBe(before);
   });
 });

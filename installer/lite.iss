@@ -4,7 +4,10 @@
 ; Build: ISCC.exe /DBundleSha=<sha256> installer\ocbridge-lite.iss
 
 #ifndef BundleSha
-  #define BundleSha ""
+  #error BundleSha is required: pass /DBundleSha=<sha256>
+#endif
+#if BundleSha == ""
+  #error BundleSha must not be empty
 #endif
 
 [Code]

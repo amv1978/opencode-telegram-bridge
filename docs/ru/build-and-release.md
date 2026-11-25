@@ -56,7 +56,7 @@ npm run pack                  # electron-builder --win --dir
 `scripts/build-release.ps1` готовит `dist\bundle\` и упаковывает:
 
 ```
-ocbridge-bundle-0.6.2.zip
+ocbridge-bundle-0.8.2.zip
   ocbridge.exe
   ffmpeg.exe
   ocbridge-cli.exe
@@ -84,9 +84,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 
 ```powershell
 $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-& $iscc "/DAppVersion=0.6.2" installer\ocbridge.iss
-$sha = (Get-FileHash dist\ocbridge-bundle-0.6.2.zip -Algorithm SHA256).Hash.ToLower()
-& $iscc "/DAppVersion=0.6.2" "/DBundleSha=$sha" installer\ocbridge-lite.iss
+& $iscc "/DAppVersion=0.8.2" installer\ocbridge.iss
+$sha = (Get-FileHash dist\ocbridge-bundle-0.8.2.zip -Algorithm SHA256).Hash.ToLower()
+& $iscc "/DAppVersion=0.8.2" "/DBundleSha=$sha" installer\ocbridge-lite.iss
 ```
 
 Lite-установщик показывает страницу загрузки с прогрессом, проверяет SHA256
@@ -114,43 +114,42 @@ Lite-установщик показывает страницу загрузки
 ## 6. Контрольные суммы и артефакты
 
 ```powershell
-Get-ChildItem dist\ocbridge-*0.6.2* | Select-Object Name,Length
+Get-ChildItem dist\ocbridge-*0.8.2* | Select-Object Name,Length
 ```
 
 В релиз загружаются три бинарника и три суммы:
 
 ```
-ocbridge-setup-standalone-0.6.2.exe
-ocbridge-setup-standalone-0.6.2.exe.sha256
-ocbridge-setup-lite-0.6.2.exe
-ocbridge-setup-lite-0.6.2.exe.sha256
-ocbridge-bundle-0.6.2.zip
-ocbridge-bundle-0.6.2.zip.sha256
+ocbridge-setup-standalone-0.8.2.exe
+ocbridge-setup-standalone-0.8.2.exe.sha256
+ocbridge-setup-lite-0.8.2.exe
+ocbridge-setup-lite-0.8.2.exe.sha256
+ocbridge-bundle-0.8.2.zip
+ocbridge-bundle-0.8.2.zip.sha256
 ```
 
 Формат `sha256sum`: hex в нижнем регистре, два пробела, имя файла.
 
-## 7. Версии: пять мест
+## 7. Версии: один источник
 
 | Файл | Поле |
 |---|---|
-| `package.json` | `"version"` |
-| `desktop/package.json` | `"version"` |
-| `installer/ocbridge.iss` | `#define AppVersion "0.6.2"` |
-| `installer/ocbridge-lite.iss` | `#define AppVersion "0.6.2"` |
-| `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` |
+| `package.json` | `"version"` — **единственный источник** |
+| `desktop/package.json` | `"version"` (синхронизируется) |
+| `installer/ocbridge.iss` | `#define AppVersion` (синхронизируется) |
+| `installer/ocbridge-lite.iss` | `#define AppVersion` (синхронизируется) |
+| `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` (синхронизируется) |
+| `cli/Program.cs` | `Program.Version` (синхронизируется) |
 
-Дополнительно: `cli/Program.cs`, константа `Program.Version` — её печатает
-`ocbridge-cli version`; держите равной версии csproj. Версия API берётся из
-`package.json` автоматически.
-
-После смены версии пересоберите **все** артефакты — иначе старый exe внутри
-нового bundle/установщика всё ещё сообщает прошлую версию.
+`scripts\build-release.ps1` запускает `bun scripts/sync-version.mjs`: версия из
+корневого `package.json` копируется во все файлы, затем `--check`; оставшееся
+расхождение валит сборку. `bun test` тоже проверяет синхронность. Версия API и
+`version.json` берутся из `package.json` автоматически.
 
 ## Чек-лист релиза
 
-1. Поднять версию в пяти местах (+ `Program.cs`).
-2. `bunx tsc --noEmit` и `bun run src/doctor.ts`.
+1. Поднять версию только в `package.json`; запустить `bun scripts/sync-version.mjs`.
+2. `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`.
 3. `powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1`.
 4. Проверить layout bundle (`version.json` со списком файлов,
    `desktop\OpenCode Bridge.exe`).
@@ -158,7 +157,7 @@ ocbridge-bundle-0.6.2.zip.sha256
    голос.
 6. Убедиться, что в git нет `config.json`, `state.json`, `installer.json`,
    `*.log`, `dist/`, `*.exe`.
-7. Поставить тег `v0.6.2` и загрузить все шесть файлов.
+7. Поставить тег `v<версия>` и загрузить все шесть файлов.
 8. Удалить устаревшие релизы.
 
 ## Подпись кода

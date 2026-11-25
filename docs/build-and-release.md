@@ -56,7 +56,7 @@ Target `dir` only — no separate portable Electron exe is built.
 `scripts/build-release.ps1` stages `dist\bundle\` and zips it:
 
 ```
-ocbridge-bundle-0.6.2.zip
+ocbridge-bundle-0.8.2.zip
   ocbridge.exe
   ffmpeg.exe
   ocbridge-cli.exe
@@ -84,9 +84,9 @@ Two Inno Setup scripts share `messages.iss` and `wizard.iss`:
 
 ```powershell
 $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-& $iscc "/DAppVersion=0.6.2" installer\ocbridge.iss
-$sha = (Get-FileHash dist\ocbridge-bundle-0.6.2.zip -Algorithm SHA256).Hash.ToLower()
-& $iscc "/DAppVersion=0.6.2" "/DBundleSha=$sha" installer\ocbridge-lite.iss
+& $iscc "/DAppVersion=0.8.2" installer\ocbridge.iss
+$sha = (Get-FileHash dist\ocbridge-bundle-0.8.2.zip -Algorithm SHA256).Hash.ToLower()
+& $iscc "/DAppVersion=0.8.2" "/DBundleSha=$sha" installer\ocbridge-lite.iss
 ```
 
 The lite installer shows a download page with % progress, verifies SHA256
@@ -112,50 +112,49 @@ Both installers:
 ## 6. Checksums and artifacts
 
 ```powershell
-Get-ChildItem dist\ocbridge-*0.6.2* | Select-Object Name,Length
+Get-ChildItem dist\ocbridge-*0.8.2* | Select-Object Name,Length
 ```
 
 The release uploads three binaries and three sums:
 
 ```
-ocbridge-setup-standalone-0.6.2.exe
-ocbridge-setup-standalone-0.6.2.exe.sha256
-ocbridge-setup-lite-0.6.2.exe
-ocbridge-setup-lite-0.6.2.exe.sha256
-ocbridge-bundle-0.6.2.zip
-ocbridge-bundle-0.6.2.zip.sha256
+ocbridge-setup-standalone-0.8.2.exe
+ocbridge-setup-standalone-0.8.2.exe.sha256
+ocbridge-setup-lite-0.8.2.exe
+ocbridge-setup-lite-0.8.2.exe.sha256
+ocbridge-bundle-0.8.2.zip
+ocbridge-bundle-0.8.2.zip.sha256
 ```
 
 `sha256sum` format: lowercase hex, two spaces, file name.
 
-## 7. Versions: five places
+## 7. Versions: one source
 
 | File | Field |
 |---|---|
-| `package.json` | `"version"` |
-| `desktop/package.json` | `"version"` |
-| `installer/ocbridge.iss` | `#define AppVersion "0.6.2"` |
-| `installer/ocbridge-lite.iss` | `#define AppVersion "0.6.2"` |
-| `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` |
+| `package.json` | `"version"` — **the only source** |
+| `desktop/package.json` | `"version"` (synced) |
+| `installer/ocbridge.iss` | `#define AppVersion` (synced) |
+| `installer/ocbridge-lite.iss` | `#define AppVersion` (synced) |
+| `cli/cli.csproj` | `Version`, `FileVersion`, `AssemblyVersion`, `InformationalVersion` (synced) |
+| `cli/Program.cs` | `Program.Version` (synced) |
 
-Additionally: `cli/Program.cs`, the `Program.Version` constant — it is printed by
-`ocbridge-cli version`; keep it equal to the csproj version. The API version is
-taken from `package.json` automatically.
-
-After a version change rebuild **all** artifacts — otherwise the old exe inside
-the new bundle/installer still reports the previous version.
+`scripts\build-release.ps1` runs `bun scripts/sync-version.mjs`, which copies the
+root version everywhere, and then `--check`; any remaining mismatch fails the
+build. `bun test` also asserts that the repository is in sync. The API version
+and `version.json` come from `package.json` automatically.
 
 ## Release checklist
 
-1. Bump the version in five places (+ `Program.cs`).
-2. `bunx tsc --noEmit` and `bun run src/doctor.ts`.
+1. Bump `package.json` only; run `bun scripts/sync-version.mjs`.
+2. `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`.
 3. `powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1`.
 4. Verify the bundle layout (`version.json` file list, `desktop\OpenCode Bridge.exe`).
 5. Install the standalone and the lite setup on a clean machine: window, tray,
    `/start`, theme, voice.
 6. Check that git has no `config.json`, `state.json`, `installer.json`, `*.log`,
    `dist/`, `*.exe`.
-7. Tag `v0.6.2` and upload all six assets.
+7. Tag `v<version>` and upload all six assets.
 8. Delete older releases if they are superseded.
 
 ## Code signing

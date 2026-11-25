@@ -70,6 +70,10 @@ import {
   type FormValues,
 } from "../forms.ts";
 import pkg from "../../package.json";
+import { runEvent } from "../events.ts";
+import { mirrorKey, MirrorLedger } from "../order.ts";
+import { BackgroundSubagents, normalizeSubagentMode, subagentPlacement, type SubagentPlacement } from "../subagents.ts";
+import { statusReport, statusReportMarkdown, type BridgeRuntimeInfo } from "../status.ts";
 
 const EVENT_TYPES = [
   "session.text.started",
@@ -141,6 +145,7 @@ export interface DiscordOptions {
   relay?: MediaRelay;
   budget?: () => BudgetSnapshot | undefined;
   stops?: StopRegistry;
+  runtime?: () => BridgeRuntimeInfo;
 }
 
 /**
@@ -159,16 +164,23 @@ export class DiscordBridge {
   private formTimer?: ReturnType<typeof setInterval>;
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent agent, so `execution.*` updates the parent block. */
-  private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
+  private readonly childSessions = new Map<string, { parentID: string; agent: string; placement: SubagentPlacement }>();
   /** Last agent-files scan per session, so tool.success + turn end don't double-fetch. */
   private readonly agentFilesAt = new Map<string, number>();
   /** `/observe` cards for foreign (Desktop/TUI) sessions. */
   private readonly observer: ObservationCards;
+  /** Dedicated cards for children whose parent answer already finished. */
+  private readonly background: BackgroundSubagents<string>;
   /** Cumulative session cost at observation start, for the final card. */
   private readonly observeCost = new Map<string, number>();
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempt = 0;
   private eventChain: Promise<void> = Promise.resolve();
+  private readonly mirrorLedger = new MirrorLedger();
+  private readonly mirroredAt = new Map<string, number>();
+  private readonly lastMirror = new Map<string, { text: string; at: number }>();
+  /** Prompts this bridge sent itself, so history never mirrors them back. */
+  private readonly selfPrompts = new Map<string, { text: string; at: number }[]>();
   private unsubscribe: (() => void) | undefined;
   private state: DiscordState = "stopped";
   private error = "";
@@ -200,6 +212,27 @@ export class DiscordBridge {
           const message = await channel.messages.fetch(messageId);
           await message.edit({ content: text, allowedMentions: { parse: [] } });
         },
+      },
+    });
+    this.background = new BackgroundSubagents<string>({
+      tickMs: 2500,
+      send: async (channelId, text) => {
+        const channel = this.client ? await resolveSendable(this.client, channelId) : undefined;
+        if (!channel) return undefined;
+        const message = await channel.send({ content: text, allowedMentions: { parse: [] } });
+        return message.id;
+      },
+      edit: async (channelId, messageId, text) => {
+        const channel = this.client ? await resolveSendable(this.client, channelId) : undefined;
+        if (!channel) return;
+        const message = await channel.messages.fetch(messageId);
+        await message.edit({ content: text, allowedMentions: { parse: [] } });
+      },
+      remove: async (channelId, messageId) => {
+        const channel = this.client ? await resolveSendable(this.client, channelId) : undefined;
+        if (!channel) return;
+        const message = await channel.messages.fetch(messageId);
+        await message.delete();
       },
     });
   }
@@ -278,18 +311,7 @@ export class DiscordBridge {
       (event) => {
         // Strictly serial: a mirrored user message must reach Discord before the answer.
         this.eventChain = this.eventChain
-          .then(() =>
-            Promise.race([
-              this.onEvent(event),
-              new Promise<void>((resolve) => {
-                const timer = setTimeout(() => {
-                  log.warn("discord event handler timeout");
-                  resolve();
-                }, 20_000);
-                timer.unref?.();
-              }),
-            ]),
-          )
+          .then(() => runEvent((signal) => this.onEvent(event, signal)))
           .catch((error) => log.error("discord event handler:", error));
       },
       (state) => log.info(`discord event stream ${state}`),
@@ -312,6 +334,7 @@ export class DiscordBridge {
     this.titles.clear();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    this.background.stop();
     await this.observer.shutdown();
     await this.streamer?.shutdown().catch(() => undefined);
     this.streamer = undefined;
@@ -407,6 +430,7 @@ export class DiscordBridge {
     if (!message.inGuild() || message.author.bot || message.system) return;
     if (!this.allowedGuild(message.guildId)) return;
     if (!this.allowedUser(message.author.id)) return;
+    if (message.reference?.messageId) this.background.keep(message.reference.messageId);
 
     const text = message.content.trim();
     const attachments = [...message.attachments.values()];
@@ -511,9 +535,10 @@ export class DiscordBridge {
       platform: "discord",
       channelId: destination,
     });
-    await this.streamer?.begin(sessionID, destination, await modelLabel(this.oc, sessionID));
+    await this.streamer?.begin(sessionID, destination, await modelLabel(this.oc, sessionID), true);
     log.info(`discord prompt → ${sessionID.slice(0, 16)}: ${promptText.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
+      this.rememberSelfPrompt(sessionID, promptText);
       await this.oc.prompt(sessionID, promptText, { source: "discord" }, files.length ? files : undefined);
     } catch (error) {
       await this.streamer?.end(sessionID, `⚠️ ${(error as Error).message.slice(0, 200)}`);
@@ -735,20 +760,45 @@ export class DiscordBridge {
       return;
     }
     const session = await this.oc.getSession(sessionID);
-    const busy = Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0) ? "работает" : "свободна";
+    const runtime = this.runtimeInfo();
+    const sessions = await this.oc
+      .listSessions({ limit: 100, archived: "false", parentID: null })
+      .then((list) => list.length)
+      .catch(() => 0);
+    const report = statusReport({
+      version: pkg.version,
+      uptimeMs: runtime.uptimeMs,
+      adapters: { telegram: runtime.telegram, discord: runtime.discord },
+      opencode: { version: runtime.ocVersion, url: runtime.ocUrl },
+      session: {
+        title: session.title,
+        id: session.id,
+        directory: session.location?.directory,
+        model: await modelLabel(this.oc, sessionID),
+        agent: session.agent,
+        busy: Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0),
+        tokens: session.tokens,
+        cost: session.cost,
+      },
+      sessions,
+    });
     await interaction.editReply({
-      content: [
-        `**${session.title}**`,
-        `id: \`${session.id}\``,
-        `📁 \`${session.location?.directory ?? "?"}\``,
-        `🤖 ${await modelLabel(this.oc, sessionID)}`,
-        `🧩 ${session.agent ?? "?"}`,
-        `⏱ ${busy}`,
-        `💰 $${(session.cost ?? 0).toFixed(4)}`,
-        `🏷 ${pkg.version}`,
-      ].join("\n"),
+      content: statusReportMarkdown(report),
       allowedMentions: { parse: [] },
     });
+  }
+
+  /** Live daemon facts for `/status`; the App owns uptime and adapter state. */
+  private runtimeInfo(): BridgeRuntimeInfo {
+    return (
+      this.options.runtime?.() ?? {
+        ocVersion: "?",
+        ocUrl: this.oc.baseUrl,
+        uptimeMs: 0,
+        telegram: { enabled: Boolean(this.cfg.telegram.token), state: "off" },
+        discord: { enabled: Boolean(this.cfg.discord?.enabled), state: this.state },
+      }
+    );
   }
 
   private async cmdModel(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -982,7 +1032,8 @@ export class DiscordBridge {
 
   // ------------------------------------------------------------------ events
 
-  private async onEvent(event: OcEvent): Promise<void> {
+  private async onEvent(event: OcEvent, signal: AbortSignal = new AbortController().signal): Promise<void> {
+    if (signal.aborted) return;
     if (event.type === "session.created") {
       const data = event.data ?? {};
       const session = data.session as { id?: string } | undefined;
@@ -1009,21 +1060,37 @@ export class DiscordBridge {
         const meta = await this.sessionMeta(sessionID);
         if (meta.parentID) {
           const agent = meta.agent || "subagent";
-          this.childSessions.set(sessionID, { parentID: meta.parentID, agent });
-          if (this.cfg.showSubagents !== false && this.streamer?.has(meta.parentID)) {
-            this.streamer.subagentStarted(meta.parentID, agent);
+          const placement = subagentPlacement(this.cfg.showSubagents, this.streamer?.has(meta.parentID) ?? false);
+          this.childSessions.set(sessionID, { parentID: meta.parentID, agent, placement });
+          if (placement === "inline") {
+            this.streamer?.subagentStarted(meta.parentID, agent);
             log.info(`discord subagent ${agent} started under ${meta.parentID.slice(0, 16)}`);
+          } else if (placement === "message") {
+            const parentChannel = this.targetFor(meta.parentID);
+            if (parentChannel) {
+              void this.background.start(
+                meta.parentID,
+                parentChannel,
+                sessionID,
+                agent,
+                meta.title?.trim() || agent,
+              );
+              log.info(`discord background subagent ${agent} started under ${meta.parentID.slice(0, 16)}`);
+            }
           }
           break;
         }
         if (!(await this.maybeObserve(sessionID))) {
-          await this.ensureStream(sessionID);
+          await this.mirrorLatestExternal(sessionID);
+          if (signal.aborted) return;
+          await this.ensureStream(sessionID, true);
           this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
           await this.markTitle(sessionID, "start");
         }
         break;
-      }      case "session.text.started":
-        await this.ensureStream(sessionID);
+      }
+      case "session.text.started":
+        await this.ensureStream(sessionID, true);
         break;
       case "session.text.delta": {
         if (!this.streamer?.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID);
@@ -1057,8 +1124,11 @@ export class DiscordBridge {
         const child = this.childSessions.get(sessionID);
         if (child) {
           this.childSessions.delete(sessionID);
-          if (this.cfg.showSubagents !== false) {
-            this.streamer?.subagentFinished(child.parentID, child.agent, event.type === "session.execution.succeeded");
+          const ok = event.type === "session.execution.succeeded";
+          if (child.placement === "inline") {
+            this.streamer?.subagentFinished(child.parentID, child.agent, ok);
+          } else if (child.placement === "message") {
+            await this.background.finish(sessionID, ok);
           }
           log.info(`discord subagent ${child.agent} finished ${sessionID.slice(0, 16)}`);
           break;
@@ -1086,6 +1156,7 @@ export class DiscordBridge {
         const [reasonLine, statsLine] = footer.split("\n");
         const formatted =
           reasonLine && statsLine ? `${reasonLine}\n${italicLine(statsLine)}` : italicLine(footer) || footer;
+        if (signal.aborted) break;
         await this.streamer.end(sessionID, formatted || undefined);
         await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
@@ -1136,7 +1207,7 @@ export class DiscordBridge {
     }
   }
 
-  private async ensureStream(sessionID: string): Promise<void> {
+  private async ensureStream(sessionID: string, newTurn = false): Promise<void> {
     if (this.streamer?.has(sessionID) || this.observer.has(sessionID)) return;
     // Same guard as Telegram: late events from a finished turn must not create
     // an orphan placeholder that never receives the final answer.
@@ -1146,22 +1217,95 @@ export class DiscordBridge {
     if (!busy) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
-    await this.streamer?.begin(sessionID, target, await modelLabel(this.oc, sessionID));
+    await this.streamer?.begin(sessionID, target, await modelLabel(this.oc, sessionID), newTurn);
     log.info(`discord attached to running session ${sessionID.slice(0, 16)}`);
   }
 
   private async mirrorUserMessage(sessionID: string, item: unknown): Promise<void> {
-    const envelope = item as { type?: string; payload?: { text?: string; metadata?: Record<string, unknown> } };
+    const envelope = item as {
+      type?: string;
+      id?: string;
+      payload?: { text?: string; metadata?: Record<string, unknown>; files?: unknown[] };
+    };
     if (!envelope || envelope.type !== "user") return;
     if (envelope.payload?.metadata?.source === "discord") return;
     if (await this.isSubagent(sessionID)) return;
     const text = (envelope.payload?.text ?? "").trim();
-    if (!text) return;
+    const media = mediaFromPayload(envelope);
+    if (!text && !media.length) return;
+    if (text && this.isSelfPrompt(sessionID, text)) {
+      log.info(`discord mirror of own prompt skipped → ${sessionID.slice(0, 16)}`);
+      return;
+    }
     const target = this.targetFor(sessionID);
     if (!target) return;
-    await this.send(target, quoteBlock("👤 **Вы** · OpenCode", text));
-    await this.options.relay?.relayBeforeTurn(sessionID, mediaFromPayload(envelope), "agent");
+    const previous = this.lastMirror.get(sessionID);
+    if (text && previous && previous.text === text && Date.now() - previous.at < 20_000) {
+      log.info(`discord mirror duplicate skipped → ${sessionID.slice(0, 16)}`);
+      return;
+    }
+    if (!this.mirrorLedger.claim(sessionID, item)) {
+      log.info(`discord mirror replay skipped (id=${mirrorKey(item) ?? "?"}) → ${sessionID.slice(0, 16)}`);
+      return;
+    }
+    if (text) {
+      await this.send(target, quoteBlock("👤 **Вы** · OpenCode", text));
+      this.lastMirror.set(sessionID, { text, at: Date.now() });
+    }
+    this.mirroredAt.set(sessionID, Date.now());
+    await this.options.relay?.relayBeforeTurn(sessionID, media, "agent", undefined, undefined, 15_000);
     log.info(`discord mirror user → ${sessionID.slice(0, 16)}`);
+  }
+
+  /** Prompt submitted by this bot; the history fallback must not mirror it. */
+  private rememberSelfPrompt(sessionID: string, text: string): void {
+    const value = text.trim();
+    if (!value) return;
+    const entries = (this.selfPrompts.get(sessionID) ?? []).filter((entry) => Date.now() - entry.at < 2 * 60 * 1000);
+    entries.push({ text: value, at: Date.now() });
+    this.selfPrompts.set(sessionID, entries.slice(-10));
+  }
+
+  private isSelfPrompt(sessionID: string, text: string): boolean {
+    const value = text.trim();
+    if (!value) return false;
+    const entries = this.selfPrompts.get(sessionID) ?? [];
+    return entries.some((entry) => entry.text === value && Date.now() - entry.at < 2 * 60 * 1000);
+  }
+
+  /**
+   * Safety net for a missed/reordered `session.inbox.enqueued`: mirror the
+   * newest user message from history before the answer stream begins.
+   */
+  private async mirrorLatestExternal(sessionID: string): Promise<void> {
+    const mirrored = this.mirroredAt.get(sessionID) ?? 0;
+    if (Date.now() - mirrored < 20_000) return;
+    try {
+      const messages = await this.oc.messages(sessionID, { limit: 6, order: "desc" });
+      const last = messages.find((message) => message.type === "user");
+      if (!last) return;
+      const raw = last as unknown as Record<string, any>;
+      if (raw.metadata?.source === "discord") return;
+      const created = Number(last.time?.created ?? 0);
+      if (created && Date.now() - created > 120_000) return;
+      const parts = Array.isArray(raw.content) ? (raw.content as Array<Record<string, any>>) : [];
+      const fromParts = parts
+        .filter((part) => part?.type === "text" && typeof part.text === "string")
+        .map((part) => String(part.text))
+        .join("\n");
+      const text = String(last.text || fromParts || "").trim();
+      const files = parts
+        .filter((part) => part?.type === "file")
+        .map((part) => ({ uri: part.uri ?? part.url ?? part.path, name: part.name ?? part.filename, mime: part.mime }));
+      if (!text && !files.length) return;
+      await this.mirrorUserMessage(sessionID, {
+        type: "user",
+        id: last.id,
+        payload: { text, metadata: (raw.metadata as Record<string, unknown>) ?? {}, files },
+      });
+    } catch (error) {
+      log.warn("discord mirror history fallback failed:", (error as Error).message);
+    }
   }
 
   private async askPermission(event: OcEvent): Promise<void> {
@@ -1882,7 +2026,7 @@ export class DiscordBridge {
    * quote `> 🧩 <agent>: …` (first ~300 chars) unless `showSubagents` is off.
    */
   private async subagentReport(sessionID: string, data: Record<string, unknown>): Promise<void> {
-    if (this.cfg.showSubagents === false) return;
+    if (normalizeSubagentMode(this.cfg.showSubagents) === "off") return;
     const raw = syntheticText(data);
     if (!raw) return;
     const cleaned = raw

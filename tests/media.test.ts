@@ -2,10 +2,28 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listTargets, mediaFromPayload, MediaRelay, promptFilesFromMedia, agentFilesFromMessages } from "../src/media/relay.ts";
+import { isAllowedLocalPath, listTargets, mediaFromPayload, MediaRelay, promptFilesFromMedia, agentFilesFromMessages } from "../src/media/relay.ts";
 import { Store } from "../src/state/store.ts";
 
 const store = () => new Store(join(mkdtempSync(join(tmpdir(), "ocbridge-media-")), "state.json"));
+
+describe("local media allow-list", () => {
+  test("accepts the session directory and temp, rejects everything else", () => {
+    const root = mkdtempSync(join(tmpdir(), "ocbridge-session-"));
+    const inside = join(root, "chart.png");
+    expect(isAllowedLocalPath(inside, [root, tmpdir()])).toBe(true);
+    expect(isAllowedLocalPath(join(tmpdir(), "ocbridge-x", "file.bin"), [root, tmpdir()])).toBe(true);
+    expect(isAllowedLocalPath(join(root, "..", "outside.txt"), [root])).toBe(false);
+    expect(isAllowedLocalPath("C:\\Windows\\win.ini", [root])).toBe(false);
+    expect(isAllowedLocalPath(inside, [undefined])).toBe(false);
+  });
+
+  test("case differences do not bypass the Windows check", () => {
+    if (process.platform !== "win32") return;
+    const root = mkdtempSync(join(tmpdir(), "ocbridge-session-"));
+    expect(isAllowedLocalPath(join(root.toUpperCase(), "a.png"), [root])).toBe(true);
+  });
+});
 
 describe("promptFilesFromMedia", () => {
   test("converts buffers to data URIs and keeps existing URIs", () => {

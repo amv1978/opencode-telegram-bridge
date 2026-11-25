@@ -99,4 +99,24 @@ describe("BudgetTracker", () => {
     const { tracker: budget } = tracker({ cfg: {}, cost: () => 0, saved: { day, spentUsd: 3.25 } });
     expect(budget.snapshot().spentUsd).toBe(3.25);
   });
+
+  test("warnings and interrupts fire once per turn, not every tick", async () => {
+    let cost = 0;
+    const started = tracker({
+      cfg: { perTurnUsd: 1, action: "stop" },
+      cost: () => cost,
+    });
+    await started.tracker.startTurn("ses_a");
+    cost = 0.85;
+    await started.tracker.tick();
+    await started.tracker.tick();
+    await started.tracker.tick();
+    expect(started.notices.filter((text) => text.includes("80%")).length).toBe(1);
+    cost = 1.2;
+    await started.tracker.tick();
+    await started.tracker.tick();
+    await started.tracker.finishTurn("ses_a");
+    expect(started.notices.filter((text) => text.includes("превышен")).length).toBe(1);
+    expect(started.interrupted).toBe(1);
+  });
 });

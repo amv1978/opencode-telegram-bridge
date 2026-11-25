@@ -20,12 +20,13 @@ shell, a .NET 10 CLI and an Inno Setup installer.
 | [build-and-release.md](build-and-release.md) | Build, versions, installer, signing |
 | [update.md](update.md) | GitHub auto-update: checks, download, SHA256, install |
 | [troubleshooting.md](troubleshooting.md) | 409, Telegram blocking, deleted topic, timeouts |
+| [process/speckit.md](process/speckit.md) | Spec-driven changes: spec → plan → tasks → tests → manual check |
 
 Russian mirrors: [docs/ru/](ru/README.md).
 
 ## Quick links
 
-- Install: `dist\ocbridge-setup-standalone-0.8.0.exe` or build from source
+- Install: `dist\ocbridge-setup-standalone-0.8.2.exe` or build from source
   (see [build-and-release.md](build-and-release.md)).
 - Control panel: `http://127.0.0.1:7788` (localhost only).
 - Data: `%APPDATA%\opencode-telegram-bridge\` — `bridge.log` lives there too.

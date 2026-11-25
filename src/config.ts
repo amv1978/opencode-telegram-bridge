@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { atomicWrite, hasPersistedFile, readJsonFile } from "./atomic.ts";
 import type { PermissionMode } from "./permissions.ts";
 import { isPermissionMode } from "./permissions.ts";
+import { normalizeSubagentMode } from "./subagents.ts";
 import { installerDefaults, readInstallerState, writeInstallerState, type InstallerState } from "./installer.ts";
 import { normalizeTitleStatus } from "./titles.ts";
 
@@ -68,9 +69,7 @@ export interface BudgetConfig {
 /** Default permission mode for newly created sessions; `/mode` changes one session. */
 export interface PermissionConfig {
   mode?: PermissionMode;
-}
-
-export interface BridgeConfig {
+}export interface BridgeConfig {
   telegram: {
     token: string;
     /** `false` stops only the Telegram adapter; Discord keeps running. */
@@ -90,8 +89,8 @@ export interface BridgeConfig {
   };
   /** "topics" = forum supergroup, one topic per session; "private" = one chat + /switch; "both". */
   mode: "topics" | "private" | "both";
-  /** Show subagent activity lines and final reports in chat (default true). */
-  showSubagents?: boolean;
+  /** Subagent visibility: auto (inline or message), inline, message, or off. */
+  showSubagents?: boolean | "auto" | "inline" | "message" | "off";
   /** Media relay between bound chats (default all). */
   media?: MediaConfig;
   /** GitHub auto-update settings. */
@@ -136,7 +135,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   discord: { enabled: false, token: "", allowedGuilds: [], allowedUsers: [], mode: "threads", titleStatus: "off" },
   opencode: {},
   mode: "both",
-  showSubagents: true,
+  showSubagents: "auto",
   media: { relay: "all", maxPhotoMb: 10 },
   update: { checkOnStart: true, intervalHours: 6, autoDownload: false },
   notify: { enabled: true, targets: "admin" },
@@ -146,6 +145,36 @@ const DEFAULT_CONFIG: BridgeConfig = {
   web: { port: 7788 },
   stream: { editIntervalMs: 1800, showReasoning: false, showTools: "compact", format: "rich" },
 };
+
+/**
+ * Config subset that requires an adapter restart. Cosmetic changes (theme,
+ * scheme, language, title style) are applied live and must not reconnect bots.
+ */
+export function transportFingerprint(cfg: BridgeConfig): string {
+  return JSON.stringify({
+    telegram: {
+      token: cfg.telegram.token,
+      enabled: cfg.telegram.enabled !== false,
+      proxy: cfg.telegram.proxy ?? "",
+      apiIp: cfg.telegram.apiIp ?? "",
+    },
+    discord: {
+      token: cfg.discord?.token ?? "",
+      enabled: Boolean(cfg.discord?.enabled),
+      allowedGuilds: cfg.discord?.allowedGuilds ?? [],
+      allowedUsers: cfg.discord?.allowedUsers ?? [],
+      mode: cfg.discord?.mode ?? "threads",
+    },
+    mode: cfg.mode,
+    topicsChatId: cfg.topicsChatId ?? 0,
+    autoTopics: cfg.autoTopics !== false,
+    stream: {
+      editIntervalMs: cfg.stream.editIntervalMs,
+      showTools: cfg.stream.showTools,
+      format: cfg.stream.format ?? "rich",
+    },
+  });
+}
 
 export interface Paths {
   configFile: string;
@@ -247,7 +276,7 @@ export function loadConfig(paths: Paths): BridgeConfig {
     },
     opencode: { baseUrl: raw.opencode?.baseUrl, password: raw.opencode?.password },
     mode: raw.mode ?? DEFAULT_CONFIG.mode,
-    showSubagents: raw.showSubagents ?? true,
+    showSubagents: normalizeSubagentMode(raw.showSubagents ?? "auto"),
     media: {
       relay: raw.media?.relay === "none" || raw.media?.relay === "user" ? raw.media.relay : "all",
       maxPhotoMb: clampNumber(raw.media?.maxPhotoMb, 1, 10, 10),

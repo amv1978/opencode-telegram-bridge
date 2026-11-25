@@ -122,13 +122,16 @@ current one through `PATCH /api/session/{id}` (auto allows everything, plan deni
   opens, then the original title is restored. A session rename during the turn
   keeps the marker and becomes the new original title. `ui.titleStatus` applies
   only to Telegram.
-- **Subagents**: a child session (`parentID`) does not open a separate thread; it
-  adds a line to the parent block — `🧩 explore · 12s`, then `✓`/`✗`
+- **Subagents**: a child session (`parentID`) does not open a separate thread. With
+  an active parent block it adds an inline line — `🧩 explore · 12s`, then `✓`/`✗`
   (`🧩 general · 1m 03s ✓`). At most 2 lines, repeats collapse (`×2`), finished ones
-  hide after ~10 s (same 2.5 s edit limit). The child report
-  (`session.synthetic`) is posted to the parent thread as a quote
-  `> 🧩 <agent>: …` (first ~300 characters). Everything is disabled by
-  `showSubagents: false`.
+  hide after ~10 s (same 2.5 s edit limit). If the parent answer already finished,
+  a dedicated message is sent instead: `🧩 <agent> · <title> · 0m 12s`, edited
+  every ~2.5 s and ending as `✅`/`✗`; it is deleted after 10 minutes unless you
+  reply to it. At most 3 individual cards; extra children share one edited message
+  with up to 3 lines. The child report (`session.synthetic`) is posted as a quote
+  `> 🧩 <agent>: …` (first ~300 characters). `showSubagents` accepts `auto`
+  (default), `inline`, `message`, `off`; booleans map to `auto`/`off`.
 - **Streaming**: one placeholder message, edits no more often than every 2.5 s
   (Discord limit); before chunking the text passes through `toDiscordMarkdown`:
   narrow tables — an aligned code block, wide ones — a list, `####`–`######` —
@@ -179,8 +182,9 @@ current one through `PATCH /api/session/{id}` (auto allows everything, plan deni
   there is never a double `> >`. The text then goes into the prompt.
 - **Mirror**: prompts from TUI/Desktop (`session.inbox.enqueued` without
   `metadata.source === "discord"`) are posted in the thread as a quote with `👤`.
-- **Subagents** are shown as `🧩` lines in the parent block and as a quoted report;
-  there is no separate thread for a child session.
+- **Subagents** are shown as `🧩` lines in the parent block, as background cards
+  when the parent answer already finished, and as a quoted report; there is no
+  separate thread for a child session.
 
 ## 6. Discord limitations
 

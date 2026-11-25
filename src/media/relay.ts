@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, isAbsolute, relative, resolve } from "node:path";
 import type { MediaConfig } from "../config.ts";
 import { log } from "../log.ts";
 import type { OcClient } from "../opencode/client.ts";
@@ -40,6 +41,8 @@ export interface MediaRelayOptions {
   store: Store;
   media: () => MediaConfig;
   topicsChatId: () => number | undefined;
+  /** Session working directory: the allow-list root for agent local paths. */
+  sessionDir?: (sessionID: string) => Promise<string | undefined> | string | undefined;
   senders: MediaSenders;
 }
 
@@ -102,6 +105,26 @@ const DEDUPE_TTL_MS = 10 * 60 * 1000;
 const RETRY_DELAYS_MS = [2000, 5000];
 const ATTEMPT_TIMEOUT_MS = 8000;
 const RELAY_DEADLINE_MS = 30_000;
+/** Local files above this size are linked instead of read into memory. */
+const MAX_LOCAL_BYTES = 50 * MB;
+
+/**
+ * Agent-supplied local paths are only read from the session directory or the
+ * OS temp directory. Case-insensitive on Windows; symlinks are not resolved.
+ */
+export function isAllowedLocalPath(file: string, roots: Array<string | undefined>): boolean {
+  const normalize = (value: string) => {
+    const resolved = resolve(value);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  const target = normalize(file);
+  for (const root of roots) {
+    if (!root) continue;
+    const rel = relative(normalize(root), target);
+    if (!rel || (!rel.startsWith("..") && !isAbsolute(rel))) return true;
+  }
+  return false;
+}
 
 /**
  * Relays media between every chat a session is bound to (Telegram topic/chat
@@ -181,7 +204,7 @@ export class MediaRelay {
     let index = 0;
     for (const raw of items) {
       index += 1;
-      const item = await this.prepare(raw);
+      const item = await this.prepare(raw, sessionID);
       if (!item) {
         log.info(`media relay skipped: no bytes for ${raw.name}`);
         continue;
@@ -263,7 +286,7 @@ export class MediaRelay {
   }
 
   /** Resolves bytes for buffers, data URLs, http(s) URLs and local paths. */
-  private async prepare(raw: MediaItem): Promise<MediaItem | undefined> {
+  private async prepare(raw: MediaItem, sessionID: string): Promise<MediaItem | undefined> {
     if (raw.buffer?.length) return raw;
     const uri = raw.uri?.trim();
     if (!uri) return undefined;
@@ -290,8 +313,19 @@ export class MediaRelay {
     }
 
     const path = localPath(uri);
+    const sessionRoot = await this.options.sessionDir?.(sessionID);
+    const roots = [sessionRoot, tmpdir()];
+    if (!isAllowedLocalPath(path, roots)) {
+      log.warn(`media relay rejected local path outside session/temp: ${path}`);
+      return undefined;
+    }
     try {
       if (existsSync(path)) {
+        const size = statSync(path).size;
+        if (size > MAX_LOCAL_BYTES) {
+          log.warn(`media relay: local file too large (${Math.round(size / MB)} MB): ${path}`);
+          return { ...raw, uri: path };
+        }
         const buffer = readFileSync(path);
         return { buffer, mime: raw.mime || mimeFor(path), uri, name: raw.name || basename(path) };
       }

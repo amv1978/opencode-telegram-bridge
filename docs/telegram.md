@@ -51,7 +51,7 @@ deleted, the binding is cleared and the final answer goes to the chat root.
 | `/topic <name>` | Create a forum topic and a session |
 | `/detach` | Detach the chat or topic from the session |
 | `/chatid` | Chat ID, type, forum flag; an admin saves the group |
-| `/status` | Title, id, folder, model, agent, busy state, cost, bridge version |
+| `/status` | One text report: version, uptime, adapters, OpenCode, session, tokens, cost, session count |
 | `/model [provider/id]` | Show or change the model |
 | `/agent [id]` | List agents or change the agent |
 | `/mode [ask\|auto\|plan]` | Show or change the session permission mode |
@@ -127,13 +127,18 @@ While a turn runs, a live block is shown above the answer:
   `session.tool.success` → `✓`, `session.tool.failed` → `✗`. The last 2 lines are
   shown; finished ones disappear after ~10 s; repeats collapse (`edit bot.ts ×3`).
   With `showTools = "off"` the tool block is hidden.
-- Subagents: a child session (`parentID`) does not open a separate stream but adds
-  a line to the parent's live block — `🧩 explore · 12s`, then `✓`/`✗`
+- Subagents: a child session (`parentID`) does not open a separate stream. With an
+  active parent block it adds an inline line — `🧩 explore · 12s`, then `✓`/`✗`
   (`🧩 general · 1m 03s ✓`). The last 2 lines are shown, identical agents collapse
   (`×2`), finished ones hide after ~10 s, and at the end of the parent turn they go
-  with the block. A `session.synthetic` child report is posted to the chat as a
-  quote `> 🧩 <agent>: …` (first ~300 characters). Disabled by
-  `showSubagents: false`.
+  with the block. If the parent answer already finished, a dedicated message is
+  sent instead: `🧩 <agent> · <title> · 0m 12s`, edited every ~2 s and ending as
+  `✅`/`✗`; it is deleted after 10 minutes unless you reply to it. At most 3
+  individual cards; extra children share one edited message with up to 3 lines.
+  A `session.synthetic` child report is posted as a quote `> 🧩 <agent>: …`
+  (first ~300 characters). `showSubagents` accepts `auto` (default: inline when
+  the block is alive, message otherwise), `inline`, `message` and `off`;
+  `true`/`false` still work as `auto`/`off`.
 - When the turn ends the block disappears and one or two lines remain under the
   answer after a blank line. A successful turn keeps only the stats line:
 
@@ -271,7 +276,9 @@ code blocks are closed and reopened at part boundaries.
 ## Bot API limitations
 
 - There are no read receipts or recipient-side “typing” status;
-  `sendChatAction("typing")` only shows “typing…” while a turn runs.
+  `sendChatAction("typing")` only shows “typing…” while a turn runs. The bridge
+  repeats it every ~4.5 s (Discord: `sendTyping()` every ~8 s) and stops when the
+  turn, including its subagents, finishes.
 - The bot cannot start a private chat: the user must press `/start`.
 - The bot cannot send messages as a human or read chat history.
 - In a group the bot receives messages either as an administrator or with privacy

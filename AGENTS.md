@@ -15,6 +15,7 @@ permission requests arrive as inline buttons.
 | `cli/` | .NET 10 CLI `ocbridge-cli.exe` over the local JSON API (no NuGet deps) |
 | `installer/` | Inno Setup script + RU/EN wizard messages |
 | `docs/` | Chapters; index in `docs/README.md` |
+| `specs/` | Local speckit specs (gitignored); `specs/_template/` is the versioned format |
 | `scripts/` | Manual dev checks (voice, render, dec) |
 
 ## Commands
@@ -47,8 +48,14 @@ CLI: see `docs/build-and-release.md`. Installer: `ISCC installer\ocbridge.iss`.
   `providerID/id` → `unknown model`; cache per session, drop on `session.model.selected`.
 - A prompt accepted without `session.execution.started` within 30 s is a stuck turn:
   log + panel warning + `/stop` hint (doctor).
-- Verification: `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`, then a manual
-  Telegram pass (private chat + topic + voice + permission button).
+- **No code without a spec.** Every feature or bug-fix batch starts as
+  `specs/<version>-<slug>/` from `specs/_template/` (spec: goal + acceptance +
+  out of scope; plan: approach; tasks: ordered, tests included). Specs are local
+  (gitignored); only the template is committed.
+- **Every feature = spec + tests + a manual check in Telegram AND Discord.**
+- **Release gate:** `bunx tsc --noEmit` + `bun test` + installer check
+  (`ISCC installer\ocbridge.iss`), then a manual Telegram pass (private chat +
+  topic + voice + permission button) and a Discord thread/channel pass.
 
 ## Docs
 

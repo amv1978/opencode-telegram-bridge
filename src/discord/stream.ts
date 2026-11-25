@@ -1,7 +1,9 @@
 import type { Client, Message, MessageCreateOptions } from "discord.js";
 import { log } from "../log.ts";
 import { sanitizeModelName, UNKNOWN_MODEL } from "../model.ts";
+import { assignChunk, planChunks, TurnGate } from "../order.ts";
 import { statusMarkdown, type StatusItem } from "../status.ts";
+import { TypingPulse } from "../typing.ts";
 import { DISCORD_CHUNK, chunkText, formatDuration, toDiscordMarkdown } from "./render.ts";
 
 const PLACEHOLDER = "⏳ Думаю…";
@@ -34,6 +36,7 @@ interface SubagentState {
 export interface SendableChannel {
   id: string;
   send(options: MessageCreateOptions): Promise<Message>;
+  sendTyping?: () => Promise<void>;
   messages: { fetch(id: string): Promise<Message> };
 }
 
@@ -64,6 +67,7 @@ interface State {
   rendered: Array<string | undefined>;
   timer?: ReturnType<typeof setTimeout>;
   statusTimer?: ReturnType<typeof setInterval>;
+  typing?: TypingPulse;
   finalizeTimer?: ReturnType<typeof setTimeout>;
   /** Parent turn ended but children are still running: keep the block alive. */
   awaiting: boolean;
@@ -79,6 +83,8 @@ interface State {
   /** In-flight flush, so `end()` cannot be skipped by a slow edit. */
   flushPromise?: Promise<void>;
   finished: boolean;
+  /** At least one chunk reached Discord (no duplicate fallback message). */
+  delivered: boolean;
 }
 
 /**
@@ -90,6 +96,10 @@ interface State {
 export class DiscordStreamer {
   private readonly states = new Map<string, State>();
   private readonly models = new Map<string, string>();
+  /** Blocks a duplicate placeholder after a turn already ended (late SSE). */
+  private readonly gate = new TurnGate();
+  /** Deltas that arrived while the gate was closed; replayed on the next begin. */
+  private readonly pendingText = new Map<string, string>();
 
   constructor(
     private readonly client: Client,
@@ -110,8 +120,13 @@ export class DiscordStreamer {
     return sanitizeModelName(this.models.get(sessionID) ?? UNKNOWN_MODEL);
   }
 
-  async begin(sessionID: string, channelId: string, model?: string): Promise<void> {
+  async begin(sessionID: string, channelId: string, model?: string, newTurn = false): Promise<void> {
+    if (newTurn) this.gate.open(sessionID);
     if (this.states.has(sessionID)) return;
+    if (!this.gate.allowsBegin(sessionID)) {
+      log.info(`discord late event after turn end ignored for ${sessionID.slice(0, 16)}`);
+      return;
+    }
     const channel = await this.resolve(channelId);
     if (!channel) {
       log.warn(`discord: channel ${channelId} not found, stream not started`);
@@ -120,7 +135,7 @@ export class DiscordStreamer {
     const state: State = {
       sessionID,
       channelId,
-      text: "",
+      text: this.pendingText.get(sessionID) ?? "",
       tools: [],
       subagents: [],
       messageIds: [],
@@ -133,12 +148,19 @@ export class DiscordStreamer {
       flushing: false,
       blocked: 0,
       finished: false,
+      delivered: false,
     };
     this.models.set(sessionID, state.model);
     this.states.set(sessionID, state);
+    this.pendingText.delete(sessionID);
     const message = await channel.send({ content: PLACEHOLDER, allowedMentions: { parse: [] } });
     state.messageIds.push(message.id);
     state.rendered.push(PLACEHOLDER);
+    state.delivered = true;
+    if (channel.sendTyping) {
+      state.typing = new TypingPulse(() => channel.sendTyping!(), 8000);
+      state.typing.start();
+    }
     state.lastEditAt = Date.now();
     // Repeating ticker (not a one-shot setTimeout chain): elapsed labels keep
     // moving without new events, including while children run after the parent
@@ -172,7 +194,11 @@ export class DiscordStreamer {
 
   append(sessionID: string, delta: string): void {
     const state = this.states.get(sessionID);
-    if (!state || !delta) return;
+    if (!state) {
+      if (delta) { const next = `${this.pendingText.get(sessionID) ?? ""}${delta}`; this.pendingText.set(sessionID, next.slice(-200_000)); }
+      return;
+    }
+    if (!delta) return;
     state.text += delta;
     this.schedule(state);
   }
@@ -305,7 +331,9 @@ export class DiscordStreamer {
       state.timer = undefined;
     }
     if (state.statusTimer) clearInterval(state.statusTimer);
-    this.states.delete(sessionID);
+    state.typing?.stop();
+    state.typing = undefined;
+    this.gate.close(sessionID);
 
     const text = footer ?? state.footer;
     let delivered = false;
@@ -323,9 +351,15 @@ export class DiscordStreamer {
     if (!delivered) {
       try {
         const channel = await this.resolve(state.channelId);
-        const chunks = chunkText(this.compose(state, text));
-        if (channel) {
-          for (const chunk of chunks) {
+        const finalText = this.compose(state, footer ?? state.footer);
+        const existing = [...state.messageIds].reverse().find((id) => Boolean(id));
+        if (channel && existing) {
+          // Reuse the message that already carries part of the answer.
+          const message = await channel.messages.fetch(existing);
+          await message.edit({ content: finalText, allowedMentions: { parse: [] } });
+          log.info(`discord final delivery recovered by editing ${existing} for ${sessionID.slice(0, 16)}`);
+        } else if (channel) {
+          for (const chunk of chunkText(finalText)) {
             await channel.send({ content: chunk, allowedMentions: { parse: [] } });
           }
           log.info(`discord final delivery recovered as a new message for ${sessionID.slice(0, 16)}`);
@@ -334,6 +368,9 @@ export class DiscordStreamer {
         log.error(`discord final delivery lost for ${sessionID.slice(0, 16)}: ${(error as Error).message}`);
       }
     }
+    // Delete only after the final flush: an early delete let a late tick find
+    // no state and drop the answer.
+    if (this.states.get(sessionID) === state) this.states.delete(sessionID);
   }
 
   /** Keeps the finished child line visible for the TTL, then finalizes. */
@@ -455,14 +492,14 @@ export class DiscordStreamer {
         return;
       }
       const chunks = this.composeChunks(state, footer);
-      for (let index = 0; index < chunks.length; index += 1) {
-        const chunk = chunks[index] ?? "";
+      for (const step of planChunks(state.messageIds, chunks.length)) {
+        const chunk = chunks[step.index] ?? "";
         if (!chunk) continue;
-        const messageId = state.messageIds[index];
-        if (!messageId) {
+        const messageId = state.messageIds[step.index];
+        if (messageId === undefined) {
           const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
-          state.messageIds[index] = message.id;
-          state.rendered[index] = chunk;
+          assignChunk(state.messageIds, step.index, message.id);
+          state.rendered[step.index] = chunk;
           continue;
         }
         // Always edit: elapsed strings change every tick, so a same-content
@@ -470,16 +507,16 @@ export class DiscordStreamer {
         try {
           const message = await channel.messages.fetch(messageId);
           await message.edit({ content: chunk, allowedMentions: { parse: [] } });
-          state.rendered[index] = chunk;
+          state.rendered[step.index] = chunk;
         } catch (error) {
           const code = (error as { code?: number }).code;
           if (code === 10008 || code === 10003) {
             // Message or channel was deleted mid-stream: send this chunk afresh.
-            state.messageIds[index] = undefined;
-            state.rendered[index] = undefined;
+            state.messageIds[step.index] = undefined;
+            state.rendered[step.index] = undefined;
             const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
-            state.messageIds[index] = message.id;
-            state.rendered[index] = chunk;
+            assignChunk(state.messageIds, step.index, message.id);
+            state.rendered[step.index] = chunk;
             continue;
           }
           if (isRateLimited(error)) {
@@ -489,6 +526,7 @@ export class DiscordStreamer {
           throw error;
         }
       }
+      state.delivered = true;
       state.lastEditAt = Date.now();
     } finally {
       state.flushing = false;

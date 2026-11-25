@@ -7,6 +7,10 @@ import { catalogFor, resolveModelLabel, sanitizeModelName, UNKNOWN_MODEL } from 
 import type { Store } from "../state/store.ts";
 import { entitiesToMarkdown } from "./entities.ts";
 import { Streamer, type Target } from "./stream.ts";
+import { runEvent } from "../events.ts";
+import { mirrorKey, MirrorLedger } from "../order.ts";
+import { BackgroundSubagents, normalizeSubagentMode, subagentPlacement, type SubagentPlacement } from "../subagents.ts";
+import { statusReport, statusReportHtml, type BridgeRuntimeInfo } from "../status.ts";
 import {
   activeFields,
   buildAnswer,
@@ -124,17 +128,27 @@ export class Bridge {
   private formTimer?: ReturnType<typeof setInterval>;
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent binding, so `execution.*` updates the parent block. */
-  private readonly childSessions = new Map<string, { parentID: string; agent: string }>();
+  private readonly childSessions = new Map<string, { parentID: string; agent: string; placement: SubagentPlacement }>();
   /** Prompts the API accepted but OpenCode has not started yet (doctor). */
   private readonly admitted = new Map<string, { at: number; target?: Target; warned: boolean }>();
   private doctorTimer?: ReturnType<typeof setInterval>;
   private readonly recentMirrors = new Map<string, { text: string; at: number }[]>();
+  /** Item-id guard: a replayed SSE event never mirrors the same prompt twice. */
+  private readonly mirrorLedger = new MirrorLedger();
+  /** Last successful mirror per session, so the history fallback does not repeat it. */
+  private readonly mirroredAt = new Map<string, number>();
+  /** Text+time guard across event/history paths with different item ids. */
+  private readonly lastMirror = new Map<string, { text: string; at: number }>();
+  /** Prompts this bridge sent itself, so history never mirrors them back. */
+  private readonly selfPrompts = new Map<string, { text: string; at: number }[]>();
   private readonly appliedTitles = new Map<string, string>();
   private readonly fetchImpl: typeof fetch;
   /** Last agent-files scan per session, so tool.success + turn end don't double-fetch. */
   private readonly agentFilesAt = new Map<string, number>();
   /** `/observe` cards for foreign (Desktop/TUI) sessions. */
   private readonly observer: ObservationCards;
+  /** Dedicated cards for children whose parent answer already finished. */
+  private readonly background: BackgroundSubagents<Target>;
   /** Cumulative session cost at observation start, for the final card. */
   private readonly observeCost = new Map<string, number>();
   private eventChain: Promise<void> = Promise.resolve();
@@ -151,6 +165,7 @@ export class Bridge {
       onPollingError?: (message: string) => void;
       budget?: () => BudgetSnapshot | undefined;
       stops?: StopRegistry;
+      runtime?: () => BridgeRuntimeInfo;
     } = {},
   ) {
     this.bot = new Bot(cfg.telegram.token, options.fetch ? { client: { fetch: options.fetch } } : {});
@@ -179,6 +194,23 @@ export class Bridge {
         log.warn(`topic for ${sessionID.slice(0, 16)} was deleted; binding cleared`);
       },
     });
+    this.background = new BackgroundSubagents<Target>({
+      tickMs: 2000,
+      send: async (target, text) => {
+        const message = await this.bot.api.sendMessage(
+          target.chatId,
+          text,
+          target.threadId ? { message_thread_id: target.threadId } : {},
+        );
+        return String(message.message_id);
+      },
+      edit: async (target, messageId, text) => {
+        await this.bot.api.editMessageText(target.chatId, Number(messageId), text);
+      },
+      remove: async (target, messageId) => {
+        await this.bot.api.deleteMessage(target.chatId, Number(messageId));
+      },
+    });
     this.register();
   }
 
@@ -191,18 +223,7 @@ export class Bridge {
       (event) => {
         // Strictly serial: a mirrored user message must reach Telegram before the answer.
         this.eventChain = this.eventChain
-          .then(() =>
-            Promise.race([
-              this.onEvent(event),
-              new Promise<void>((resolve) => {
-                const timer = setTimeout(() => {
-                  log.warn("event handler timeout");
-                  resolve();
-                }, 20_000);
-                timer.unref?.();
-              }),
-            ]),
-          )
+          .then(() => runEvent((signal) => this.onEvent(event, signal)))
           .catch((error) => log.error("event handler:", error));
       },
       (state) => log.info(`event stream ${state}`),
@@ -236,6 +257,7 @@ export class Bridge {
     for (const state of this.titles.values()) if (state.timer) clearTimeout(state.timer);
     this.titles.clear();
     this.unsubscribe?.();
+    this.background.stop();
     await this.observer.shutdown();
     await this.streamer.shutdown();
     await this.bot.stop();
@@ -749,19 +771,41 @@ export class Bridge {
       return;
     }
     const session = await this.oc.getSession(sessionID);
-    const busy = Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0) ? "работает" : "свободна";
-    await ctx.reply(
-      [
-        `<b>${escape(session.title)}</b>`,
-        `id: <code>${session.id}</code>`,
-        `📁 <code>${escape(session.location?.directory ?? "?")}</code>`,
-        `🤖 ${escape(await this.modelLabel(sessionID))}`,
-        `🧩 ${escape(session.agent ?? "?")}`,
-        `⏱ ${busy}`,
-        `💰 $${(session.cost ?? 0).toFixed(4)}`,
-        `🏷 ${escape(pkg.version)}`,
-      ].join("\n"),
-      { parse_mode: "HTML" },
+    const runtime = this.runtimeInfo();
+    const sessions = await this.oc
+      .listSessions({ limit: 100, archived: "false", parentID: null })
+      .then((list) => list.length)
+      .catch(() => 0);
+    const report = statusReport({
+      version: pkg.version,
+      uptimeMs: runtime.uptimeMs,
+      adapters: { telegram: runtime.telegram, discord: runtime.discord },
+      opencode: { version: runtime.ocVersion, url: runtime.ocUrl },
+      session: {
+        title: session.title,
+        id: session.id,
+        directory: session.location?.directory,
+        model: await this.modelLabel(sessionID),
+        agent: session.agent,
+        busy: Number(session.time?.busy ?? 0) > Number(session.time?.idle ?? 0),
+        tokens: session.tokens,
+        cost: session.cost,
+      },
+      sessions,
+    });
+    await ctx.reply(statusReportHtml(report), { parse_mode: "HTML" });
+  }
+
+  /** Live daemon facts for `/status`; the App owns uptime and adapter state. */
+  private runtimeInfo(): BridgeRuntimeInfo {
+    return (
+      this.options.runtime?.() ?? {
+        ocVersion: "?",
+        ocUrl: this.oc.baseUrl,
+        uptimeMs: 0,
+        telegram: { enabled: this.cfg.telegram.enabled !== false, state: "running" },
+        discord: { enabled: Boolean(this.cfg.discord?.enabled), state: "off" },
+      }
     );
   }
 
@@ -827,7 +871,14 @@ export class Bridge {
     }
   }
 
+  /** Replying to a background subagent card keeps it (cancels the 10 min delete). */
+  private keepRepliedCard(ctx: Context): void {
+    const replied = (ctx.message as { reply_to_message?: { message_id?: number } } | undefined)?.reply_to_message?.message_id;
+    if (replied) this.background.keep(String(replied));
+  }
+
   private async onText(ctx: Context & { message: { text: string; message_thread_id?: number } }): Promise<void> {
+    this.keepRepliedCard(ctx);
     const text = entitiesToMarkdown(ctx.message.text, (ctx.message as { entities?: any[] }).entities ?? []).trim();
     if (!text || text.startsWith("/")) return;
     if (this.isEcho(ctx.chat?.id, text)) {
@@ -878,9 +929,10 @@ export class Bridge {
           chatId,
           threadId: topicID,
         });
-        await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
+        await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID), true);
         log.info(`prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80).replace(/\s+/g, " ")}`);
         try {
+          this.rememberSelfPrompt(sessionID, text);
           await this.oc.prompt(sessionID, text, { source: "telegram" }, files);
           this.markAdmitted(sessionID, target);
         } catch (error) {
@@ -910,9 +962,10 @@ export class Bridge {
       chatId: target.chatId,
       threadId: target.threadId,
     });
-    await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
+    await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID), true);
     log.info(`prompt → ${sessionID.slice(0, 16)}: ${text.slice(0, 80).replace(/\s+/g, " ")}`);
     try {
+      this.rememberSelfPrompt(sessionID, text);
       await this.oc.prompt(sessionID, text, { source: "telegram" }, files);
       this.markAdmitted(sessionID, target);
     } catch (error) {
@@ -956,7 +1009,11 @@ export class Bridge {
     if (!chatId) return;
     const name = message?.forum_topic_created?.name?.trim() || "Тема";
     try {
-      const session = await this.oc.createSession({ title: name, directory: this.cfg.defaultDirectory });
+      const session = await this.oc.createSession({
+        title: name,
+        directory: this.cfg.defaultDirectory,
+        permissions: rulesForMode(this.cfg.permissions?.mode ?? "ask"),
+      });
       this.store.bindThread(threadId, session.id);
       this.store.upsert({ id: session.id, title: session.title, chatId, threadId });
       const markdown = `> 🆕 Сессия создана\n>\n> ${name}`;
@@ -996,6 +1053,7 @@ export class Bridge {
   }
 
   private async onMedia(ctx: Context): Promise<void> {
+    this.keepRepliedCard(ctx);
     const message = ctx.message;
     if (!message || message.text) return;
     const chat = ctx.chat;
@@ -1183,7 +1241,8 @@ export class Bridge {
 
   // ------------------------------------------------------------------ events
 
-  private async onEvent(event: OcEvent): Promise<void> {
+  private async onEvent(event: OcEvent, signal: AbortSignal = new AbortController().signal): Promise<void> {
+    if (signal.aborted) return;
     if (event.type === "form.created") {
       // Payload is `{form}` only: no sessionID at the top level.
       await this.askForm(event.data.form as FormInfo);
@@ -1213,10 +1272,23 @@ export class Bridge {
           const meta = await this.sessionMeta(sessionID);
           if (meta.parentID) {
             const agent = meta.agent || "subagent";
-            this.childSessions.set(sessionID, { parentID: meta.parentID, agent });
-            if (this.cfg.showSubagents !== false && this.streamer.has(meta.parentID)) {
+            const placement = subagentPlacement(this.cfg.showSubagents, this.streamer.has(meta.parentID));
+            this.childSessions.set(sessionID, { parentID: meta.parentID, agent, placement });
+            if (placement === "inline") {
               this.streamer.subagentStarted(meta.parentID, agent);
               log.info(`subagent ${agent} started under ${meta.parentID.slice(0, 16)}`);
+            } else if (placement === "message") {
+              const target = this.targetFor(meta.parentID);
+              if (target) {
+                void this.background.start(
+                  meta.parentID,
+                  target,
+                  sessionID,
+                  agent,
+                  meta.title?.trim() || agent,
+                );
+                log.info(`background subagent ${agent} started under ${meta.parentID.slice(0, 16)}`);
+              }
             }
             break;
           }
@@ -1227,7 +1299,12 @@ export class Bridge {
           this.streamer.setModel(sessionID, await this.modelLabel(sessionID, true));
           await this.markTitle(sessionID, "start");
         }
-        if (!(await this.maybeObserve(sessionID))) await this.ensureStream(sessionID);
+        // Guarantee the mirrored prompt (text + media) is on screen before the
+        // placeholder/answer, even if `session.inbox.enqueued` was missed or
+        // arrived after `execution.started` (volatile SSE).
+        await this.mirrorLatestExternal(sessionID);
+        if (signal.aborted) return;
+        if (!(await this.maybeObserve(sessionID))) await this.ensureStream(sessionID, true);
         break;
       case "session.text.delta": {
         if (!this.streamer.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID);
@@ -1261,8 +1338,11 @@ export class Bridge {
         const child = this.childSessions.get(sessionID);
         if (child) {
           this.childSessions.delete(sessionID);
-          if (this.cfg.showSubagents !== false) {
-            this.streamer.subagentFinished(child.parentID, child.agent, event.type === "session.execution.succeeded");
+          const ok = event.type === "session.execution.succeeded";
+          if (child.placement === "inline") {
+            this.streamer.subagentFinished(child.parentID, child.agent, ok);
+          } else if (child.placement === "message") {
+            await this.background.finish(sessionID, ok);
           }
           log.info(`subagent ${child.agent} finished ${sessionID.slice(0, 16)}`);
           break;
@@ -1289,6 +1369,7 @@ export class Bridge {
           tps: stats.tps,
           contextTokens: stats.contextTokens,
         });
+        if (signal.aborted) break;
         await this.streamer.end(sessionID, footer);
         await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
@@ -1344,7 +1425,7 @@ export class Bridge {
     }
   }
 
-  private async ensureStream(sessionID: string): Promise<void> {
+  private async ensureStream(sessionID: string, newTurn = false): Promise<void> {
     if (this.streamer.has(sessionID) || this.observer.has(sessionID)) return;
     // One fetch covers both checks: child sessions never get a block, and a
     // late event from a finished turn must not create an orphan placeholder
@@ -1355,7 +1436,7 @@ export class Bridge {
     if (!busy) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
-    await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID));
+    await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID), newTurn);
     log.info(`attached to running session ${sessionID.slice(0, 16)}`);
   }
 
@@ -1377,7 +1458,7 @@ export class Bridge {
    * Posts the first ~300 chars as a muted quote unless `showSubagents` is off.
    */
   private async subagentReport(sessionID: string, data: Record<string, unknown>): Promise<void> {
-    if (this.cfg.showSubagents === false) return;
+    if (normalizeSubagentMode(this.cfg.showSubagents) === "off") return;
     const raw = syntheticText(data);
     if (!raw) return;
     const cleaned = raw
@@ -1430,35 +1511,113 @@ export class Bridge {
     this.recentMirrors.set(key, entries.slice(-20));
   }
 
+  /** Prompt submitted by this bot; the history fallback must not mirror it. */
+  private rememberSelfPrompt(sessionID: string, text: string): void {
+    const value = text.trim();
+    if (!value) return;
+    const entries = (this.selfPrompts.get(sessionID) ?? []).filter((entry) => Date.now() - entry.at < 2 * 60 * 1000);
+    entries.push({ text: value, at: Date.now() });
+    this.selfPrompts.set(sessionID, entries.slice(-10));
+  }
+
+  private isSelfPrompt(sessionID: string, text: string): boolean {
+    const value = text.trim();
+    if (!value) return false;
+    const entries = this.selfPrompts.get(sessionID) ?? [];
+    return entries.some((entry) => entry.text === value && Date.now() - entry.at < 2 * 60 * 1000);
+  }
+
   /** Mirrors prompts sent from the desktop/TUI into the bound Telegram chat. */
   private async mirrorUserMessage(sessionID: string, item: unknown): Promise<void> {
-    const envelope = item as { type?: string; payload?: { text?: string; metadata?: Record<string, unknown> } };
+    const envelope = item as {
+      type?: string;
+      id?: string;
+      payload?: { text?: string; metadata?: Record<string, unknown>; files?: unknown[] };
+    };
     if (!envelope || envelope.type !== "user") return;
     if (envelope.payload?.metadata?.source === "telegram") return;
     if (await this.isSubagent(sessionID)) return;
     const text = (envelope.payload?.text ?? "").trim();
-    if (!text) return;
+    const media = mediaFromPayload(envelope);
+    if (!text && !media.length) return;
+    if (text && this.isSelfPrompt(sessionID, text)) {
+      log.info(`mirror of own prompt skipped → ${sessionID.slice(0, 16)}`);
+      return;
+    }
     const target = this.targetFor(sessionID);
     if (!target) return;
-    const options = target.threadId ? { message_thread_id: target.threadId } : {};
-    const quoted = text
-      .split("\n")
-      .map((line) => `> ${line}`)
-      .join("\n");
-    const markdown = `> 👤 **Вы** · OpenCode\n>\n${quoted}`;
-    try {
-      await this.bot.api.sendRichMessage(target.chatId, { markdown }, options);
-    } catch (error) {
-      if (target.threadId && /message thread not found/i.test((error as Error).message)) {
-        this.store.unbindThread(target.threadId);
-        log.warn(`topic ${target.threadId} was deleted, binding cleared`);
-        return;
-      }
-      await this.bot.api.sendMessage(target.chatId, `👤 Вы (OpenCode):\n${text}`, options).catch(() => undefined);
+    // History fallback and the SSE event may carry different item ids; a
+    // repeated text within 20 s is the same prompt, not a new one.
+    const previous = this.lastMirror.get(sessionID);
+    if (text && previous && previous.text === text && Date.now() - previous.at < 20_000) {
+      log.info(`mirror duplicate skipped → ${sessionID.slice(0, 16)}`);
+      return;
     }
-    this.rememberMirror(target.chatId, text);
-    await this.options.relay?.relayBeforeTurn(sessionID, mediaFromPayload(envelope), "agent");
+    if (!this.mirrorLedger.claim(sessionID, item)) {
+      log.info(`mirror replay skipped (id=${mirrorKey(item) ?? "?"}) → ${sessionID.slice(0, 16)}`);
+      return;
+    }
+    const options = target.threadId ? { message_thread_id: target.threadId } : {};
+    if (text) {
+      const quoted = text
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n");
+      const markdown = `> 👤 **Вы** · OpenCode\n>\n${quoted}`;
+      try {
+        await this.bot.api.sendRichMessage(target.chatId, { markdown }, options);
+      } catch (error) {
+        if (target.threadId && /message thread not found/i.test((error as Error).message)) {
+          this.store.unbindThread(target.threadId);
+          log.warn(`topic ${target.threadId} was deleted, binding cleared`);
+          return;
+        }
+        await this.bot.api.sendMessage(target.chatId, `👤 Вы (OpenCode):\n${text}`, options).catch(() => undefined);
+      }
+      this.rememberMirror(target.chatId, text);
+      this.lastMirror.set(sessionID, { text, at: Date.now() });
+    }
+    this.mirroredAt.set(sessionID, Date.now());
+    // Media must finish (first attempt + retries) before the answer starts, so
+    // the mirrored attachments are always above the answer.
+    await this.options.relay?.relayBeforeTurn(sessionID, media, "agent", undefined, undefined, 15_000);
     log.info(`mirror user → ${sessionID.slice(0, 16)}`);
+  }
+
+  /**
+   * Safety net for a missed/reordered `session.inbox.enqueued`: mirrors the
+   * newest user message from history before the answer stream begins. Telegram
+   * prompts carry `metadata.source = "telegram"` and are never mirrored back.
+   */
+  private async mirrorLatestExternal(sessionID: string): Promise<void> {
+    const mirrored = this.mirroredAt.get(sessionID) ?? 0;
+    if (Date.now() - mirrored < 20_000) return;
+    try {
+      const messages = await this.oc.messages(sessionID, { limit: 6, order: "desc" });
+      const last = messages.find((message) => message.type === "user");
+      if (!last) return;
+      const raw = last as unknown as Record<string, any>;
+      if (raw.metadata?.source === "telegram") return;
+      const created = Number(last.time?.created ?? 0);
+      if (created && Date.now() - created > 120_000) return;
+      const parts = Array.isArray(raw.content) ? (raw.content as Array<Record<string, any>>) : [];
+      const fromParts = parts
+        .filter((part) => part?.type === "text" && typeof part.text === "string")
+        .map((part) => String(part.text))
+        .join("\n");
+      const text = String(last.text || fromParts || "").trim();
+      const files = parts
+        .filter((part) => part?.type === "file")
+        .map((part) => ({ uri: part.uri ?? part.url ?? part.path, name: part.name ?? part.filename, mime: part.mime }));
+      if (!text && !files.length) return;
+      await this.mirrorUserMessage(sessionID, {
+        type: "user",
+        id: last.id,
+        payload: { text, metadata: (raw.metadata as Record<string, unknown>) ?? {}, files },
+      });
+    } catch (error) {
+      log.warn("mirror history fallback failed:", (error as Error).message);
+    }
   }
 
   /**
@@ -2135,6 +2294,7 @@ export class Bridge {
       const session = await this.oc.createSession({
         title: (ctx.message as { text?: string } | undefined)?.text?.slice(0, 60) || "Telegram session",
         directory: this.cfg.defaultDirectory,
+        permissions: rulesForMode(this.cfg.permissions?.mode ?? "ask"),
       });
       this.store.bindThread(threadId, session.id);
       this.store.upsert({ id: session.id, title: session.title, chatId, threadId });
@@ -2150,6 +2310,7 @@ export class Bridge {
     const session = await this.oc.createSession({
       title: (ctx.message as { text?: string } | undefined)?.text?.slice(0, 60) || "Telegram session",
       directory: this.cfg.defaultDirectory,
+      permissions: rulesForMode(this.cfg.permissions?.mode ?? "ask"),
     });
     this.store.bindChat(chatId, session.id);
     this.store.upsert({ id: session.id, title: session.title, chatId });

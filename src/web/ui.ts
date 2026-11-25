@@ -237,9 +237,14 @@ export const PAGE = /* html */ `<!doctype html>
             </div>
             <div>
               <label class="check" style="margin-top:22px">
-                <input type="checkbox" id="showSubagents" />
                 <span data-i18n="cfg.showSubagents">Показывать субагентов</span>
               </label>
+              <select id="showSubagents">
+                <option value="auto">auto — inline / message</option>
+                <option value="inline">inline only</option>
+                <option value="message">message only</option>
+                <option value="off">off</option>
+              </select>
             </div>
           </div>
           <div class="row">
@@ -872,7 +877,7 @@ function fill(s) {
     $("lang").value = (s.config.ui && s.config.ui.lang) || localStorage.getItem("ocbridge.lang") || "system";
     applyI18n();
     $("autoTopics").checked = s.config.autoTopics;
-    $("showSubagents").checked = s.config.showSubagents;
+    $("showSubagents").value = s.config.showSubagents || "auto";
     $("mediaRelay").value = s.config.media.relay;
     $("mediaPhotoMb").value = s.config.media.maxPhotoMb;
     if (s.config.update) {
@@ -981,7 +986,7 @@ function currentPayload() {
     topicsChatId: $("topicsChatId").value,
     defaultDirectory: $("defaultDirectory").value,
     autoTopics: $("autoTopics").checked,
-    showSubagents: $("showSubagents").checked,
+    showSubagents: $("showSubagents").value,
     media: { relay: $("mediaRelay").value, maxPhotoMb: Number($("mediaPhotoMb").value) },
     update: {
       checkOnStart: $("updateCheck").checked,

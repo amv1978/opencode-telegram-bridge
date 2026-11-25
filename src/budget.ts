@@ -85,6 +85,7 @@ export class BudgetTracker {
   private day: string;
   private spentUsd = 0;
   private dailyWarned = false;
+  private dailyStopped = false;
   private readonly turns = new Map<string, ActiveTurn>();
 
   constructor(private readonly options: BudgetTrackerOptions) {
@@ -157,24 +158,21 @@ export class BudgetTracker {
     let stopLimit = 0;
 
     const turnLevel = budgetLevel(spent, cfg.perTurnUsd);
-    if (turnLevel !== "ok" && (final || !turn.stopped)) {
-      if (turnLevel === "warn" && !turn.warned) {
-        turn.warned = true;
-        notices.push(
-          `⚠️ Бюджет хода: ${formatUsd(spent)} из ${formatUsd(cfg.perTurnUsd ?? 0)} (80%).`,
-        );
-      }
-      if (turnLevel === "over") {
-        if (action === "stop") {
-          stop = true;
-          stopSpent = spent;
-          stopLimit = cfg.perTurnUsd ?? 0;
-          turn.stopped = true;
-          notices.push(`⛔️ Бюджет хода превышен: ${formatUsd(spent)} из ${formatUsd(cfg.perTurnUsd ?? 0)}. Ход остановлен.`);
-        } else if (!turn.stopped) {
-          turn.stopped = true;
-          notices.push(`⛔️ Бюджет хода превышен: ${formatUsd(spent)} из ${formatUsd(cfg.perTurnUsd ?? 0)}.`);
-        }
+    if (turnLevel === "warn" && !turn.warned) {
+      turn.warned = true;
+      notices.push(
+        `⚠️ Бюджет хода: ${formatUsd(spent)} из ${formatUsd(cfg.perTurnUsd ?? 0)} (80%).`,
+      );
+    }
+    if (turnLevel === "over" && !turn.stopped) {
+      turn.stopped = true;
+      if (action === "stop") {
+        stop = true;
+        stopSpent = spent;
+        stopLimit = cfg.perTurnUsd ?? 0;
+        notices.push(`⛔️ Бюджет хода превышен: ${formatUsd(spent)} из ${formatUsd(cfg.perTurnUsd ?? 0)}. Ход остановлен.`);
+      } else {
+        notices.push(`⛔️ Бюджет хода превышен: ${formatUsd(spent)} из ${formatUsd(cfg.perTurnUsd ?? 0)}.`);
       }
     }
 
@@ -183,7 +181,8 @@ export class BudgetTracker {
       this.dailyWarned = true;
       notices.push(`⚠️ Дневной бюджет: ${formatUsd(this.spentUsd + (final ? 0 : spent))} из ${formatUsd(cfg.dailyUsd ?? 0)} (80%).`);
     }
-    if (dayLevel === "over") {
+    if (dayLevel === "over" && !this.dailyStopped) {
+      this.dailyStopped = true;
       if (action === "stop") {
         stop = true;
         if (!stopLimit) {
@@ -191,8 +190,7 @@ export class BudgetTracker {
           stopLimit = cfg.dailyUsd ?? 0;
         }
         notices.push(`⛔️ Дневной бюджет исчерпан: ${formatUsd(this.spentUsd)} из ${formatUsd(cfg.dailyUsd ?? 0)}. Ход остановлен.`);
-      } else if (!this.dailyWarned) {
-        this.dailyWarned = true;
+      } else {
         notices.push(`⛔️ Дневной бюджет исчерпан: ${formatUsd(this.spentUsd)} из ${formatUsd(cfg.dailyUsd ?? 0)}.`);
       }
     }
@@ -212,6 +210,7 @@ export class BudgetTracker {
     this.day = day;
     this.spentUsd = 0;
     this.dailyWarned = false;
+    this.dailyStopped = false;
     this.options.save?.({ day, spentUsd: 0 });
   }
 

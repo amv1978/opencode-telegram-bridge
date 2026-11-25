@@ -26,3 +26,8 @@ state.json.migrated
 # OS junk
 Thumbs.db
 .DS_Store
+
+# Speckit specs stay local; only the template is versioned
+specs/*
+!specs/_template/
+!specs/_template/**
