@@ -2,10 +2,37 @@ import { readFileSync } from "node:fs";
 import pkg from "../../package.json";
 import { App } from "../app.ts";
 import { log } from "../log.ts";
+import type { UpdateSnapshot } from "../updater.ts";
 import { PAGE } from "./ui.ts";
 
 const json = (data: unknown, status = 200): Response =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8" } });
+
+/** Updater failures get a real status code: the panel and CLI must not see "ok". */
+export function updateStatus(update: UpdateSnapshot): number {
+  if (!update.error) return 200;
+  switch (update.errorCode) {
+    case "rate-limit":
+      return 429;
+    case "network":
+    case "http":
+      return 502;
+    case "state":
+      return 409;
+    case "asset":
+      return 404;
+    case "dev":
+      return 400;
+    case "canceled":
+      return 200;
+    default:
+      return 500;
+  }
+}
+
+function updateResponse(update: UpdateSnapshot): Response {
+  return json({ update, error: update.error || undefined }, updateStatus(update));
+}
 
 export function startServer(app: App): { port: number; stop(): void } {
   let server: ReturnType<typeof Bun.serve> | undefined;
@@ -108,19 +135,23 @@ async function handle(app: App, request: Request): Promise<Response> {
     }
 
     if (request.method === "POST" && url.pathname === "/api/update/check") {
-      return json({ update: await app.checkUpdate() });
+      return updateResponse(await app.checkUpdate());
     }
 
     if (request.method === "POST" && url.pathname === "/api/update/download") {
-      return json({ update: await app.downloadUpdate() });
+      return updateResponse(await app.downloadUpdate());
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/update/cancel") {
+      return updateResponse(await app.cancelUpdate());
     }
 
     if (request.method === "POST" && url.pathname === "/api/update/install") {
-      return json({ update: await app.installUpdate() });
+      return updateResponse(await app.installUpdate());
     }
 
     if (request.method === "POST" && url.pathname === "/api/update/rollback") {
-      return json({ update: await app.rollbackUpdate() });
+      return updateResponse(await app.rollbackUpdate());
     }
 
     if (request.method === "GET" && url.pathname === "/api/changelog") {

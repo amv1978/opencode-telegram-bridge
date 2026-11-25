@@ -19,7 +19,8 @@ import { Bridge } from "./telegram/bot.ts";
 import { setupTelegramNetwork, type TelegramNet } from "./telegram/net.ts";
 import { DiscordBridge } from "./discord/adapter.ts";
 import { MediaRelay } from "./media/relay.ts";
-import { Updater, type UpdateCache } from "./updater.ts";
+import { Updater, createUpdateFetch, type UpdateCache } from "./updater.ts";
+import { autoAction, type UpdateProblem } from "./update/policy.ts";
 import { changelogBetween } from "./changelog.ts";
 import { BudgetTracker, type BudgetSnapshot } from "./budget.ts";
 import { isPermissionMode } from "./permissions.ts";
@@ -125,6 +126,9 @@ export class App {
   private suppressLifecycleNotice = false;
   /** Incremented by stopBot; a stale start must not resurrect adapters. */
   private lifecycle = 0;
+  /** Sessions with `execution.started` and no end event yet (pauses downloads). */
+  private readonly activeTurns = new Map<string, number>();
+  private lastUpdateErrorNotice = 0;
 
   constructor() {
     initLog(this.paths.logFile);
@@ -137,9 +141,12 @@ export class App {
       dataDir: dirname(this.paths.configFile),
       installDir: dirname(process.execPath),
       port: () => this.webPort ?? this.cfg.web.port,
+      fetch: () => this.updateFetch(),
+      busy: () => this.turnActive(),
       onCache: (cache) => this.store.setUpdateCache(cache as unknown as Record<string, unknown>),
       onBeforeInstall: (previous) => this.store.setPrevVersion(previous),
       notify: (text) => this.notify(text),
+      onError: (problem) => void this.notifyUpdateProblem(problem),
     });
     this.updater.restore(this.store.updateCache() as UpdateCache | undefined, this.store.getPrevVersion());
   }
@@ -174,7 +181,7 @@ export class App {
         update: {
           checkOnStart: this.cfg.update?.checkOnStart !== false,
           intervalHours: this.cfg.update?.intervalHours ?? 6,
-          autoDownload: this.cfg.update?.autoDownload === true,
+          autoDownload: this.cfg.update?.autoDownload !== false,
         },
         notify: {
           enabled: this.cfg.notify?.enabled !== false,
@@ -207,7 +214,7 @@ export class App {
         allowedUsers: this.cfg.discord?.allowedUsers ?? [],
         titleStatus: this.cfg.discord?.titleStatus === "rename" ? "rename" : "off",
       },
-      webPort: this.cfg.web.port,
+      webPort: this.webPort ?? this.cfg.web.port,
       autostart: isAutostartEnabled(),
       autostartSupported: process.platform === "win32" && isCompiled(),
       configPath: this.paths.configFile,
@@ -369,6 +376,8 @@ export class App {
       (event) => {
         const sessionID = String(event.data?.sessionID ?? "");
         if (!sessionID || !this.budget) return;
+        if (event.type === "session.execution.started") this.activeTurns.set(sessionID, Date.now());
+        else this.activeTurns.delete(sessionID);
         this.budgetChain = this.budgetChain
           .then(() =>
             event.type === "session.execution.started"
@@ -399,6 +408,30 @@ export class App {
   /** The web server may fall back when the configured port is busy. */
   setWebPort(port: number): void {
     if (Number.isFinite(port) && port > 0) this.webPort = Math.round(port);
+  }
+
+  /** True while any session has a turn in flight; stale entries expire in 10 min. */
+  turnActive(): boolean {
+    const now = Date.now();
+    for (const [sessionID, at] of this.activeTurns) {
+      if (now - at > 10 * 60_000) this.activeTurns.delete(sessionID);
+    }
+    return this.activeTurns.size > 0;
+  }
+
+  /** GitHub goes through the pinned/proxy transport Telegram already uses. */
+  private updateFetch(): typeof globalThis.fetch {
+    if (this.net?.fetch) return this.net.fetch;
+    return createUpdateFetch(this.cfg.telegram.proxy);
+  }
+
+  /** One chat notice per 10 minutes, same target as lifecycle messages. */
+  private async notifyUpdateProblem(problem: UpdateProblem): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastUpdateErrorNotice < 10 * 60_000) return;
+    this.lastUpdateErrorNotice = now;
+    const text = `⚠️ обновление: ${problem.message}${problem.hint ? `\n${problem.hint}` : ""}`;
+    await this.notify(text);
   }
 
   /** Facts for `/status` in both adapters: uptime, adapter and OpenCode state. */
@@ -867,15 +900,34 @@ export class App {
 
   async checkUpdate(auto = false): Promise<ReturnType<Updater["snapshot"]>> {
     const snapshot = await this.updater.check();
-    if (auto && snapshot.available && this.cfg.update?.autoDownload === true && !snapshot.downloading) {
-      log.info(`update ${snapshot.latest}: auto-download enabled`);
-      void this.updater.download();
+    const autoDownload = this.cfg.update?.autoDownload !== false;
+    if (snapshot.available && !snapshot.verified && !snapshot.error && autoDownload) {
+      const action = autoAction(
+        {
+          available: snapshot.available,
+          autoDownload,
+          downloading: snapshot.downloading,
+          verified: snapshot.verified,
+          errorCode: snapshot.errorCode,
+        },
+        this.turnActive(),
+      );
+      if (action === "download" || action === "wait-busy") {
+        log.info(`update ${snapshot.latest}: background download${action === "wait-busy" ? " (paused until the turn ends)" : ""}`);
+        void this.updater.download();
+      }
     }
     return snapshot;
   }
 
+  /** Starts the background download and returns at once; the panel polls progress. */
   async downloadUpdate(): Promise<ReturnType<Updater["snapshot"]>> {
-    return this.updater.download();
+    if (!this.updater.snapshot().downloading) void this.updater.download();
+    return this.updater.snapshot();
+  }
+
+  async cancelUpdate(): Promise<ReturnType<Updater["snapshot"]>> {
+    return this.updater.cancel();
   }
 
   async installUpdate(): Promise<ReturnType<Updater["snapshot"]>> {

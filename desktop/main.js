@@ -3,8 +3,12 @@ const { spawn } = require("node:child_process");
 const path = require("node:path");
 const fs = require("node:fs");
 
-const PORT = Number(process.env.OCBRIDGE_PORT || 7788);
-const BASE = `http://127.0.0.1:${PORT}`;
+const DEFAULT_PORT = 7788;
+const PORT_FILE_NAME = "port.json";
+const DEFAULT_RELEASE_PAGE = "https://github.com/amv1978/opencode-telegram-bridge/releases/latest";
+let bridgePort = Number(process.env.OCBRIDGE_PORT || 0) || DEFAULT_PORT;
+let BASE = `http://127.0.0.1:${bridgePort}`;
+let baseResolved = false;
 
 let win = null;
 let tray = null;
@@ -44,11 +48,77 @@ const ICONS = {
 
 // ------------------------------------------------------------------- helpers
 
+function dataDir() {
+  const base = process.env.APPDATA || path.join(require("node:os").homedir(), "AppData", "Roaming");
+  return path.join(base, "opencode-telegram-bridge");
+}
+
+function portFile() {
+  return path.join(dataDir(), PORT_FILE_NAME);
+}
+
+/** Published by the bridge right after its web server binds (port may be 7788+N). */
+function readPortInfo() {
+  try {
+    const info = JSON.parse(fs.readFileSync(portFile(), "utf8"));
+    const port = Number(info?.port);
+    if (Number.isInteger(port) && port > 0 && port <= 65535) return { ...info, port };
+  } catch {
+    /* no file yet */
+  }
+  return null;
+}
+
+/** The bridge is alive if /api/state answers; a stale port.json is ignored. */
+async function probe(port) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/state`, { signal: AbortSignal.timeout(1200) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Order: published port.json → OCBRIDGE_PORT → 7788 and the next 9 ports (the
+ * bridge increments when the configured port is busy).
+ */
+async function resolveBase() {
+  const info = readPortInfo();
+  const candidates = [];
+  const push = (value) => {
+    const port = Number(value);
+    if (Number.isInteger(port) && port > 0 && port <= 65535 && !candidates.includes(port)) candidates.push(port);
+  };
+  if (info) push(info.port);
+  push(process.env.OCBRIDGE_PORT);
+  push(DEFAULT_PORT);
+  for (let offset = 1; offset < 10; offset += 1) push(DEFAULT_PORT + offset);
+  for (const port of candidates) {
+    if (await probe(port)) {
+      bridgePort = port;
+      BASE = `http://127.0.0.1:${port}`;
+      baseResolved = true;
+      return true;
+    }
+  }
+  baseResolved = false;
+  return false;
+}
+
+/** Port to pass to `--port` when spawning; the bridge reports what it really got. */
+function preferredPort() {
+  const info = readPortInfo();
+  const env = Number(process.env.OCBRIDGE_PORT || 0);
+  return (Number.isInteger(env) && env > 0 ? env : 0) || info?.port || DEFAULT_PORT;
+}
+
 async function api(pathname, options) {
+  if (!baseResolved) await resolveBase();
   const response = await fetch(BASE + pathname, {
     ...options,
     headers: { "content-type": "application/json", ...(options?.headers || {}) },
-    signal: AbortSignal.timeout(4000),
+    signal: AbortSignal.timeout(30000),
   });
   const text = await response.text();
   let json = {};
@@ -64,12 +134,8 @@ async function api(pathname, options) {
 async function waitForApi(ms = 30000) {
   const started = Date.now();
   while (Date.now() - started < ms) {
-    try {
-      await api("/api/state");
-      return true;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 400));
-    }
+    if (await resolveBase()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 400));
   }
   return false;
 }
@@ -84,20 +150,26 @@ function bridgePath() {
 }
 
 async function ensureBridge() {
-  try {
-    await api("/api/state");
-    return;
-  } catch {
-    /* not running */
-  }
+  if (await resolveBase()) return;
   const exe = bridgePath();
   if (!fs.existsSync(exe)) {
     dialog.showErrorBox("OpenCode Bridge", `Не найден ocbridge.exe:\n${exe}`);
     return;
   }
-  bridge = spawn(exe, ["--no-browser"], { cwd: path.dirname(exe), windowsHide: true, stdio: "ignore" });
+  const port = preferredPort();
+  bridge = spawn(exe, ["--no-browser", "--port", String(port)], {
+    cwd: path.dirname(exe),
+    windowsHide: true,
+    stdio: "ignore",
+  });
   spawnedByUs = true;
-  await waitForApi();
+  // The bridge may bind `port + N`; port.json is the authoritative answer.
+  if (!(await waitForApi())) {
+    dialog.showErrorBox(
+      "OpenCode Bridge",
+      `Мост не ответил на ${BASE} за 30 с.\nПроверьте журнал: ${path.join(dataDir(), "bridge.log")}`,
+    );
+  }
 }
 
 // -------------------------------------------------------------------- window
@@ -180,6 +252,14 @@ const TEXTS = {
     reconnect: "Переподключить OpenCode",
     checkUpdate: "Проверить обновления",
     installUpdate: "Установить",
+    downloadInstall: "Скачать и установить",
+    cancelDownload: "Отменить загрузку",
+    retry: "Повторить",
+    releasePage: "Открыть страницу релиза",
+    latest: "Установлена последняя версия.",
+    updateWord: "обновление",
+    updatePaused: "пауза",
+    updateError: "ошибка обновления",
     rollback: "Откатиться на",
     whatsNew: "Что нового",
     settings: "Настройки",
@@ -202,6 +282,14 @@ const TEXTS = {
     reconnect: "Reconnect OpenCode",
     checkUpdate: "Check for updates",
     installUpdate: "Install",
+    downloadInstall: "Download & Install",
+    cancelDownload: "Cancel download",
+    retry: "Retry",
+    releasePage: "Open release page",
+    latest: "You have the latest version.",
+    updateWord: "update",
+    updatePaused: "paused",
+    updateError: "update error",
     rollback: "Roll back to",
     whatsNew: "What's new",
     settings: "Settings",
@@ -365,6 +453,81 @@ function maybeShowChangelog(state) {
   void openChangelog(from, current, current);
 }
 
+function releaseUrl(state) {
+  const asset = state?.update?.assetUrl;
+  return asset ? String(asset).replace(/\/download\/.*$/, "") : DEFAULT_RELEASE_PAGE;
+}
+
+/** Install succeeded → restart at once, no confirmation dialog. */
+async function installUpdateNow() {
+  try {
+    const result = await api("/api/update/install", { method: "POST" });
+    const update = result.update || {};
+    if (update.error) {
+      showError(update.error);
+      return;
+    }
+    quitting = true;
+    quitForUpdate();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+/** One tray action: download in the background, then install as soon as verified. */
+async function downloadThenInstall() {
+  try {
+    await api("/api/update/download", { method: "POST" });
+    const started = Date.now();
+    while (Date.now() - started < 30 * 60 * 1000) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const state = await refresh();
+      const update = state?.update || {};
+      if (update.error) {
+        showError(update.error);
+        return;
+      }
+      if (update.verified) {
+        await installUpdateNow();
+        return;
+      }
+      if (!update.downloading && Number(update.progress || 0) < 100) return;
+    }
+    showError("Загрузка не завершилась за 30 минут.");
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function checkForUpdates() {
+  try {
+    const result = await api("/api/update/check", { method: "POST" });
+    const update = result.update || {};
+    if (update.error) {
+      showError(update.error);
+      return;
+    }
+    if (!update.available) {
+      await dialog.showMessageBox({ type: "info", message: t("checkUpdate"), detail: t("latest") });
+      return;
+    }
+    // Found: the bridge starts the background download itself; the tray shows %.
+  } catch (error) {
+    showError(error);
+  } finally {
+    await refresh();
+  }
+}
+
+async function cancelUpdateDownload() {
+  try {
+    await api("/api/update/cancel", { method: "POST" });
+  } catch (error) {
+    showError(error);
+  }
+  await refresh();
+}
+
 function buildMenu(state) {
   const running = state?.state === "running";
   const status = statusOf(state);
@@ -399,53 +562,29 @@ function buildMenu(state) {
     },
     {
       label: t("checkUpdate"),
-      click: async () => {
-        try {
-          const result = await api("/api/update/check", { method: "POST" });
-          await refresh();
-          if (result.update?.available) {
-            const answer = await dialog.showMessageBox({
-              type: "question",
-              message: `Доступна версия ${result.update.latest}`,
-              detail: "Скачать и установить сейчас? Настройки сохранятся.",
-              buttons: [t("installUpdate"), "Позже"],
-              defaultId: 0,
-              cancelId: 1,
-            });
-            if (answer.response === 0) {
-              await api("/api/update/install", { method: "POST" });
-              quitForUpdate();
-            }
-          } else {
-            await dialog.showMessageBox({ type: "info", message: t("checkUpdate"), detail: "Установлена последняя версия." });
-          }
-        } catch (error) {
-          showError(error);
-        }
-      },
+      click: () => void checkForUpdates(),
     },
-    ...(state?.update?.available
+    ...(state?.update?.available || state?.update?.downloading
       ? [
           {
-            label: `${t("installUpdate")} ${state.update.latest}`,
-            click: async () => {
-              try {
-                const answer = await dialog.showMessageBox({
-                  type: "question",
-                  message: `Установить ${state.update.latest}?`,
-                  buttons: [t("installUpdate"), "Отмена"],
-                  defaultId: 0,
-                  cancelId: 1,
-                });
-                if (answer.response === 0) {
-                  await api("/api/update/install", { method: "POST" });
-                  quitForUpdate();
-                }
-              } catch (error) {
-                showError(error);
-              }
+            label: state.update.downloading
+              ? `${t("updateWord")} ${state.update.latest || ""} — ${state.update.progress || 0}%${state.update.paused ? ` · ${t("updatePaused")}` : ""}`
+              : `${state.update.verified ? t("installUpdate") : t("downloadInstall")} ${state.update.latest || ""}`.trim(),
+            enabled: !state.update.downloading && !state.update.installing,
+            click: () => {
+              if (state.update.verified) void installUpdateNow();
+              else void downloadThenInstall();
             },
           },
+          ...(state.update.downloading
+            ? [{ label: t("cancelDownload"), click: () => void cancelUpdateDownload() }]
+            : []),
+          ...(state.update.error
+            ? [
+                { label: `${t("retry")} ${state.update.latest || ""}`.trim(), click: () => void downloadThenInstall() },
+                { label: t("releasePage"), click: () => shell.openExternal(releaseUrl(state)) },
+              ]
+            : []),
         ]
       : []),
     ...(state?.update?.prevVersion
@@ -514,7 +653,16 @@ async function refresh() {
   }
   const status = statusOf(state);
   tray?.setImage(status.icon);
-  tray?.setToolTip(`OpenCode Bridge ${app.getVersion()} — ${status.text}`);
+  const update = state?.update || {};
+  let suffix = "";
+  if (update.downloading) {
+    suffix = ` · ${t("updateWord")} ${update.progress || 0}%${update.paused ? ` · ${t("updatePaused")}` : ""}`;
+  } else if (update.error) {
+    suffix = ` · ${t("updateError")}`;
+  } else if (update.verified && update.available) {
+    suffix = ` · ${t("installUpdate")} ${update.latest || ""}`.trimEnd();
+  }
+  tray?.setToolTip(`OpenCode Bridge ${state?.version || app.getVersion()} — ${status.text}${suffix}`);
   if (state) tray?.setContextMenu(buildMenu(state));
   lastState = state;
   if (state) maybeShowChangelog(state);

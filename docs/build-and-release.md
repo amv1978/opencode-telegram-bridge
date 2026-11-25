@@ -51,6 +51,12 @@ npm run pack                  # electron-builder --win --dir
 Result: `desktop\release\win-unpacked\` (~357 MB) with `OpenCode Bridge.exe`.
 Target `dir` only — no separate portable Electron exe is built.
 
+The shell finds the bridge through
+`%APPDATA%\opencode-telegram-bridge\port.json` (written by the daemon after the
+web server binds), then `OCBRIDGE_PORT`, then 7788..7797; it spawns
+`ocbridge.exe --no-browser --port <n>` and can no longer silently talk to a dead
+port. API calls use a 30 s timeout.
+
 ## 4. Portable bundle
 
 `scripts/build-release.ps1` stages `dist\bundle\` and zips it:

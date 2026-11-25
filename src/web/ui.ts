@@ -364,10 +364,15 @@ export const PAGE = /* html */ `<!doctype html>
         <div id="updateBanner" class="card" hidden style="border-color:color-mix(in srgb, var(--acc) 35%, transparent)">
           <div class="row" style="margin-top:0">
             <span id="updateText" style="flex:1"></span>
-            <button id="updateDownload" class="primary" type="button" data-i18n="update.download">Скачать</button>
-            <button id="updateInstall" type="button" data-i18n="update.install">Установить</button>
+            <button id="updateAction" class="primary" type="button" data-i18n="update.action.download">Скачать и установить</button>
+            <button id="updateCancel" type="button" data-i18n="update.cancel" hidden>Отмена</button>
           </div>
+          <div id="updateError" class="hint" hidden style="color:var(--err);margin-top:8px"></div>
+          <div id="updateHint" class="hint" hidden style="margin-top:4px"></div>
           <progress id="updateProgress" max="100" value="0" style="width:100%;margin-top:10px" hidden></progress>
+          <div id="updateReleaseRow" hidden style="margin-top:8px">
+            <a id="updateRelease" href="https://github.com/amv1978/opencode-telegram-bridge/releases/latest" target="_blank" rel="noreferrer" style="color:var(--acc)" data-i18n="update.release">Страница релиза</a>
+          </div>
         </div>
         <form id="formUpdates" onsubmit="return false">
           <div class="grid">
@@ -526,6 +531,18 @@ const I18N = {
     "update.download": "Скачать",
     "update.install": "Установить",
     "update.available": "Доступна версия",
+    "update.action.download": "Скачать и установить",
+    "update.action.downloading": "Скачивание…",
+    "update.action.install": "Установить",
+    "update.action.installing": "Установка…",
+    "update.action.retry": "Повторить",
+    "update.cancel": "Отмена",
+    "update.release": "Страница релиза",
+    "update.checking": "Проверяю…",
+    "update.latest": "Установлена последняя версия.",
+    "update.found": "Доступна версия",
+    "update.paused": "пауза до конца хода",
+    "update.verified": "Скачано и проверено",
     "tg.title": "Telegram",
     "dc.title": "Discord",
     "cfg.discord.enabled": "Включить Discord",
@@ -655,6 +672,18 @@ const I18N = {
     "update.download": "Download",
     "update.install": "Install",
     "update.available": "Version available",
+    "update.action.download": "Download & Install",
+    "update.action.downloading": "Downloading…",
+    "update.action.install": "Install",
+    "update.action.installing": "Installing…",
+    "update.action.retry": "Retry",
+    "update.cancel": "Cancel",
+    "update.release": "Release page",
+    "update.checking": "Checking…",
+    "update.latest": "You have the latest version.",
+    "update.found": "Version available",
+    "update.paused": "paused until the turn ends",
+    "update.verified": "Downloaded and verified",
     "tg.title": "Telegram",
     "dc.title": "Discord",
     "cfg.discord.enabled": "Enable Discord",
@@ -911,16 +940,7 @@ function fill(s) {
   $("onboarding").hidden = s.configured;
 
   $("updateVersion").textContent = "v" + (s.version || "");
-  const u = s.update || {};
-  const banner = $("updateBanner");
-  banner.hidden = !u.available && !u.downloading;
-  if (!banner.hidden) {
-    $("updateText").textContent = t("update.available") + " " + (u.latest || "") + (u.notes ? " — " + String(u.notes).split("\\n")[0].slice(0, 120) : "");
-    $("updateDownload").disabled = Boolean(u.downloading);
-    $("updateInstall").disabled = !(u.progress >= 100);
-    $("updateProgress").hidden = !u.downloading;
-    $("updateProgress").value = u.progress || 0;
-  }
+  renderUpdate(s.update || {});
 
   $("users").innerHTML = s.config.allowedUsers.length
     ? s.config.allowedUsers.map((u) => "<div><code>" + u.id + "</code> " + escapeHtml(u.name || "") + " · " + escapeHtml(u.role || "user") + "</div>").join("")
@@ -931,6 +951,39 @@ function fill(s) {
   $("sessionsShowHidden").hidden = !hidden.length;
   $("sessionsHidden").hidden = !hidden.length;
   $("sessionsHidden").textContent = hidden.length ? t("sessions.hiddenCount") + hidden.length : "";
+}
+
+function renderUpdate(u) {
+  const banner = $("updateBanner");
+  banner.hidden = !(u.available || u.downloading || u.installing || u.error || u.verified);
+  if (banner.hidden) return;
+  const action = $("updateAction");
+  const progress = $("updateProgress");
+  const errorBox = $("updateError");
+  const hintBox = $("updateHint");
+  const releaseRow = $("updateReleaseRow");
+  let text = t("update.found") + " " + (u.latest || "");
+  if (u.current && u.latest && u.current !== u.latest) text += " (v" + u.current + ")";
+  if (u.downloading) text += " · " + (u.progress || 0) + "%" + (u.paused ? " · " + t("update.paused") : "");
+  else if (u.verified) text += " · " + t("update.verified");
+  $("updateText").textContent = text;
+
+  errorBox.hidden = !u.error;
+  errorBox.textContent = u.error || "";
+  hintBox.hidden = !u.hint || Boolean(u.error);
+  hintBox.textContent = u.hint || "";
+  releaseRow.hidden = !u.error;
+  $("updateRelease").href = u.assetUrl ? String(u.assetUrl).replace(/\/download\/.*$/, "") : "https://github.com/amv1978/opencode-telegram-bridge/releases/latest";
+
+  progress.hidden = !u.downloading;
+  progress.value = u.progress || 0;
+  $("updateCancel").hidden = !u.downloading;
+  action.disabled = Boolean(u.downloading || u.installing);
+  if (u.installing) action.textContent = t("update.action.installing");
+  else if (u.downloading) action.textContent = t("update.action.downloading") + " " + (u.progress || 0) + "%";
+  else if (u.error) action.textContent = t("update.action.retry");
+  else if (u.verified) action.textContent = t("update.action.install");
+  else action.textContent = t("update.action.download");
 }
 
 function escapeHtml(value) {
@@ -1035,19 +1088,57 @@ async function saveForm(event) {
 });
 
 $("updateCheckBtn").addEventListener("click", async () => {
-  try { await api("/api/update/check", { method: "POST" }); toast(t("toast.saved"), "ok"); }
-  catch (e) { toast(e.message, "err"); }
-  refresh();
+  try {
+    const res = await api("/api/update/check", { method: "POST" });
+    const u = res.update || {};
+    if (u.error) toast(u.error, "err");
+    else if (u.available) toast(t("update.found") + " " + (u.latest || ""), "ok");
+    else toast(t("update.latest"), "ok");
+  } catch (e) { toast(e.message, "err"); }
+  await refresh();
 });
-$("updateDownload").addEventListener("click", async () => {
-  try { await api("/api/update/download", { method: "POST" }); toast(t("toast.started"), "ok"); }
-  catch (e) { toast(e.message, "err"); }
-  refresh();
+
+async function installUpdate() {
+  try {
+    const res = await api("/api/update/install", { method: "POST" });
+    const u = res.update || {};
+    if (u.error) { toast(u.error, "err"); return; }
+    toast(t("update.action.installing"), "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/** After starting a background download: refresh until verified, failed or gone. */
+async function pollUpdate() {
+  for (let i = 0; i < 600; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    try {
+      const s = await api("/api/state");
+      const u = s.update || {};
+      fill(s);
+      if (u.error) { toast(u.error, "err"); return; }
+      if (u.verified) { await installUpdate(); return; }
+      if (!u.downloading && (u.progress || 0) < 100) return;
+    } catch (e) {
+      return; // bridge is restarting
+    }
+  }
+}
+
+$("updateAction").addEventListener("click", async () => {
+  const u = (lastState && lastState.update) || {};
+  if (u.verified) { await installUpdate(); await refresh(); return; }
+  try {
+    await api("/api/update/download", { method: "POST" });
+    toast(t("update.action.downloading"), "ok");
+    await refresh();
+    await pollUpdate();
+  } catch (e) { toast(e.message, "err"); await refresh(); }
 });
-$("updateInstall").addEventListener("click", async () => {
-  try { await api("/api/update/install", { method: "POST" }); toast(t("toast.started"), "ok"); }
+
+$("updateCancel").addEventListener("click", async () => {
+  try { await api("/api/update/cancel", { method: "POST" }); toast(t("update.cancel"), "ok"); }
   catch (e) { toast(e.message, "err"); }
-  refresh();
+  await refresh();
 });
 
 $("btnStart").addEventListener("click", async () => {

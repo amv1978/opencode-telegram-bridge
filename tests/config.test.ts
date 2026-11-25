@@ -17,6 +17,7 @@ describe("config merge", () => {
     expect(first.web.port).toBe(7788);
     expect(first.permissions?.mode).toBe("ask");
     expect(first.budget?.action).toBe("warn");
+    expect(first.update?.autoDownload).toBe(true);
 
     writeFileSync(paths.configFile, JSON.stringify({ mode: "topics", budget: { perTurnUsd: "1.505", action: "stop" } }), "utf8");
     const merged = loadConfig(paths);
@@ -24,6 +25,13 @@ describe("config merge", () => {
     expect(merged.budget?.perTurnUsd).toBe(1.51);
     expect(merged.budget?.action).toBe("stop");
     expect(merged.telegram.allowedUsers).toEqual([]);
+    expect(merged.update?.autoDownload).toBe(true);
+  });
+
+  test("explicit autoDownload: false is respected", () => {
+    const paths = tempPaths();
+    writeFileSync(paths.configFile, JSON.stringify({ update: { autoDownload: false } }), "utf8");
+    expect(loadConfig(paths).update?.autoDownload).toBe(false);
   });
 
   test("clamps invalid values and ignores bad permission modes", () => {

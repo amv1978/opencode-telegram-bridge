@@ -51,6 +51,11 @@ npm run pack                  # electron-builder --win --dir
 Результат: `desktop\release\win-unpacked\` (~357 МБ) с `OpenCode Bridge.exe`.
 Только target `dir` — отдельный portable Electron exe не собирается.
 
+Оболочка находит мост через `%APPDATA%\opencode-telegram-bridge\port.json`
+(пишется демоном после занятия порта веб-сервером), затем `OCBRIDGE_PORT`, затем
+7788..7797; запускает `ocbridge.exe --no-browser --port <n>` и больше не может
+молча обратиться к мёртвому порту. Таймаут API-вызовов — 30 с.
+
 ## 4. Portable bundle
 
 `scripts/build-release.ps1` готовит `dist\bundle\` и упаковывает:

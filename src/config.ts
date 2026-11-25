@@ -139,7 +139,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   mode: "both",
   showSubagents: "auto",
   media: { relay: "all", maxPhotoMb: 10 },
-  update: { checkOnStart: true, intervalHours: 6, autoDownload: false },
+  update: { checkOnStart: true, intervalHours: 6, autoDownload: true },
   notify: { enabled: true, targets: "admin" },
   budget: { action: "warn" },
   permissions: { mode: "ask" },
@@ -286,7 +286,7 @@ export function loadConfig(paths: Paths): BridgeConfig {
     update: {
       checkOnStart: raw.update?.checkOnStart !== false,
       intervalHours: clampNumber(raw.update?.intervalHours, 1, 168, 6),
-      autoDownload: raw.update?.autoDownload === true,
+      autoDownload: raw.update?.autoDownload !== false,
     },
     notify: {
       enabled: raw.notify?.enabled !== false,
