@@ -52,7 +52,7 @@
 | `session.tool.called` | Строка инструментов (последние 2, режим `showTools`) |
 | `session.execution.succeeded/failed/interrupted` | Завершает ход, пишет футер |
 | `permission.asked` | Отправляет сообщение с кнопками |
-| `session.renamed` | Переименовывает тему форума |
+| `session.renamed` | Название в `state.json` + переименование темы/треда (с дедупликацией) |
 | `session.created` | Кэширует `parentID`/`agent`/`title` новой сессии |
 | `session.model.selected` | Обновляет имя модели в живом блоке |
 | `session.synthetic` | Отчёт субагента (`<subagent>`) в чат родителя |
@@ -61,6 +61,13 @@
 | `form.cancelled` | Помечает форму в чате как отменённую |
 
 `session.idle` не приходит вообще — конец хода определяется только `session.execution.*`.
+
+**Id хода.** `session.text.started/delta/ended` (и, в зависимости от сборки,
+`session.execution.started`) содержат `assistantMessageID`. Стрим ключуется парой
+`(sessionID, turnId)`, где `turnId` — этот id, поэтому новый ход всегда получает
+новое сообщение; следующий шаг того же хода (другой id ассистентского сообщения)
+остаётся в том же сообщении, а первый id лишь переименовывает временный ход,
+открытый по `execution.started` (см. `src/turns.ts`).
 
 **Формы.** `Form.Info` — это `{ id: "frm_…", sessionID, title, metadata, fields[] }`;
 `metadata.kind` — `question`, `mcp-elicitation` или `websearch.provider`. Типы полей:

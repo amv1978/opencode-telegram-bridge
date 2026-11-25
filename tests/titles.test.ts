@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { canRename, normalizeTitleStatus, pickTopicIcon, renameWait, titleWithMarker } from "../src/titles.ts";
+import { canRename, normalizeTitleStatus, pickTopicIcon, renameWait, sameTitleName, syncTitleName, titleWithMarker } from "../src/titles.ts";
 
 describe("title markers", () => {
   test("prefix by phase and restore the original", () => {
@@ -17,8 +17,7 @@ describe("title markers", () => {
   });
 });
 
-describe("rename window", () => {
-  const now = 1_000_000;
+describe("rename window", () => {  const now = 1_000_000;
 
   test("allows the first rename and blocks inside the window", () => {
     expect(canRename(0, now)).toBe(true);
@@ -34,8 +33,25 @@ describe("rename window", () => {
   });
 });
 
-describe("title status mode", () => {
-  test("defaults to the quiet icon mode, never to renames", () => {
+describe("session rename sync", () => {
+  test("icon mode keeps the clean name, rename mode keeps the marker", () => {
+    expect(syncTitleName("Fix login", "icon", "start")).toBe("Fix login");
+    expect(syncTitleName("Fix login", "off", "done")).toBe("Fix login");
+    expect(syncTitleName("Fix login", "rename", "start")).toBe("⏳ Fix login");
+    expect(syncTitleName("Fix login", "rename", "done", 100)).toBe("✅ Fix login");
+  });
+
+  test("an unchanged name is skipped, a changed one is applied", () => {
+    const name = syncTitleName("Fix login", "icon", "idle");
+    expect(sameTitleName(name, "Fix login")).toBe(true);
+    expect(sameTitleName("  Fix   login ", name)).toBe(true);
+    expect(sameTitleName(undefined, "Fix login")).toBe(false);
+    expect(sameTitleName("Old title", name)).toBe(false);
+    expect(sameTitleName("⏳ Fix login", name)).toBe(false);
+  });
+});
+
+describe("title status mode", () => {  test("defaults to the quiet icon mode, never to renames", () => {
     expect(normalizeTitleStatus(undefined)).toBe("icon");
     expect(normalizeTitleStatus("bogus")).toBe("icon");
     expect(normalizeTitleStatus("icon")).toBe("icon");

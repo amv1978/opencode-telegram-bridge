@@ -113,6 +113,8 @@ export interface PermissionConfig {
     lang?: "system" | "ru" | "en";
     /** Telegram turn status: topic icon (default), topic rename, or nothing. */
     titleStatus?: "icon" | "rename" | "off";
+    /** Turn ids in logs and in the stats line (`#t…`); default off. */
+    diagnostics?: boolean;
     /** Versions whose changelog modal was already acknowledged (Electron). */
     seenChangelog?: string[];
   };
@@ -141,7 +143,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   notify: { enabled: true, targets: "admin" },
   budget: { action: "warn" },
   permissions: { mode: "ask" },
-  ui: { theme: "opencode", scheme: "system", lang: "system", titleStatus: "icon", seenChangelog: [] },
+  ui: { theme: "opencode", scheme: "system", lang: "system", titleStatus: "icon", diagnostics: false, seenChangelog: [] },
   web: { port: 7788 },
   stream: { editIntervalMs: 1800, showReasoning: false, showTools: "compact", format: "rich" },
 };
@@ -311,6 +313,7 @@ export function loadConfig(paths: Paths): BridgeConfig {
       scheme: raw.ui?.scheme ?? "system",
       lang: raw.ui?.lang ?? "system",
       titleStatus: normalizeTitleStatus(raw.ui?.titleStatus),
+      diagnostics: raw.ui?.diagnostics === true,
       seenChangelog: Array.isArray(raw.ui?.seenChangelog) ? raw.ui.seenChangelog.map(String) : [],
     },
     web: { port: raw.web?.port ?? DEFAULT_CONFIG.web.port },

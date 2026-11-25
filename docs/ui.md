@@ -9,12 +9,18 @@ only; if the port is busy the next one is used (up to +9).
 
 Sections live behind a left navigation: **Status** (Telegram/OpenCode/Discord state,
 start/stop/restart, autostart, current sessions), **Settings** (theme, language,
-default folder, throttling, tools, formatting, media relay, subagents), **Telegram**
+default folder, throttling, tools, formatting, media relay, subagents,
+diagnostics), **Telegram**
 (enabled toggle, token, mode, forum group ID, topic status, access list, proxy/IP),
 **Discord** (enabled toggle, token, allowed servers/users, thread renames),
 **Updates** and **Log**. Below 900 px the navigation collapses into an icon rail;
 the ☰ button expands it over the content. The selected section is kept in
 `localStorage` (`ocbridge.page`).
+
+**Diagnostics** (`ui.diagnostics`, off by default) adds the short turn id to the
+stats line (`#t4f2a91`) and logs `turn start`/`turn end` with the turn and message
+id, plus a warning if one message were ever reused by two turns. It changes nothing
+else: the relay and utilization paths stay as they are when it is off.
 
 Telegram and Discord each have an `enabled` toggle (`telegram.enabled`,
 `discord.enabled`); the adapters start and stop independently, so one transport can

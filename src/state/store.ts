@@ -213,8 +213,8 @@ export class Store {
   }
 
   setDiscordTitle(sessionID: string, title: string): void {
-    const record = this.data.discordSessions[sessionID];
-    if (record) record.title = title;
+    const record = this.data.discordSessions[sessionID] ?? (this.data.discordSessions[sessionID] = {});
+    record.title = title;
     this.save();
   }
 

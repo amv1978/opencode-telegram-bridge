@@ -5,6 +5,7 @@ import { assignChunk, planChunks, TurnGate } from "../order.ts";
 import { statusHtml, statusMarkdownList, type StatusItem } from "../status.ts";
 import { TypingPulse } from "../typing.ts";
 import { markdownToHtml, splitHtml, splitMarkdown, stripHtml } from "./render.ts";
+import { TURN_TTL_MS, TurnRegistry, turnKey, type TurnRef } from "../turns.ts";
 
 export interface Target {
   chatId: number;
@@ -18,6 +19,8 @@ export interface StreamerOptions {
   format: "rich" | "html";
   /** Called when Telegram reports that the bound topic no longer exists. */
   onThreadGone?: (sessionID: string) => void;
+  /** `ui.diagnostics`: turn ids in logs and in the stats line (default off). */
+  diagnostics?: () => boolean;
 }
 
 type ToolResult = "running" | "ok" | "fail";
@@ -42,6 +45,8 @@ interface SubagentState {
 
 interface State {
   sessionID: string;
+  /** Assistant message id of this turn; a message is never shared by turns. */
+  turnId: string;
   target: Target;
   text: string;
   tools: ToolState[];
@@ -74,13 +79,23 @@ const TOOL_TTL_MS = 10_000;
 const STATUS_TICK_MS = 1200;
 const MAX_STATUS_TOOLS = 2;
 const MAX_STATUS_SUBAGENTS = 2;
+/** A turn id is not reused for this long after its stream was finalized. */
+const CLOSED_TTL_MS = 15_000;
 
 export class Streamer {
+  /** `sessionID#turnId` → the stream of exactly one turn. */
   private readonly states = new Map<string, State>();
+  /** Turn bookkeeping: execution.started opens, execution.* ends. */
+  private readonly turns = new TurnRegistry();
   /** Blocks a duplicate placeholder after a turn already ended (late SSE). */
   private readonly gate = new TurnGate();
-  /** Deltas that arrived while the gate was closed; replayed on the next begin. */
-  private readonly pendingText = new Map<string, string>();
+  /** Deltas that arrived before the stream existed; replayed once by `begin`. */
+  private readonly pendingText = new Map<string, { text: string; at: number }>();
+  /** Finalized turn keys, so a late delta never reopens a finished message. */
+  private readonly closed = new Map<string, number>();
+  /** `sessionID:messageId` → turn id; a message must never serve two turns. */
+  private readonly messageTurns = new Map<string, string>();
+  private sweepTimer?: ReturnType<typeof setInterval>;
   /** Flipped to false permanently once Telegram rejects a rich message. */
   private rich: boolean;
   /** model display name currently used by a session's live block. */
@@ -90,12 +105,38 @@ export class Streamer {
     this.rich = options.format !== "html";
   }
 
+  private diagnostics(): boolean {
+    try {
+      return this.options.diagnostics?.() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Any block of this session is on screen (a parent awaiting subagents too). */
+  hasBlock(sessionID: string): boolean {
+    return this.latest(sessionID) !== undefined;
+  }
+
+  /** The *current* turn of the session still has a live block. */
   has(sessionID: string): boolean {
-    return this.states.has(sessionID);
+    const turn = this.turns.current(sessionID);
+    return Boolean(turn && this.states.has(turnKey(sessionID, turn.turnId)));
+  }
+
+  /** Turn id of the current stream (diagnostics and footers). */
+  turnOf(sessionID: string): string | undefined {
+    return this.turns.current(sessionID)?.turnId ?? this.latest(sessionID)?.turnId;
+  }
+
+  /** Chat message the answer of a turn was written into. */
+  messageIdOf(sessionID: string, turnId?: string): number | undefined {
+    const state = turnId ? this.states.get(turnKey(sessionID, turnId)) : this.current(sessionID);
+    return [...(state?.messageIds ?? [])].reverse().find((id) => id !== undefined);
   }
 
   elapsedMs(sessionID: string): number | undefined {
-    const state = this.states.get(sessionID);
+    const state = this.current(sessionID) ?? this.latest(sessionID);
     return state ? Date.now() - state.startedAt : undefined;
   }
 
@@ -103,27 +144,38 @@ export class Streamer {
     return sanitizeModelName(this.models.get(sessionID) ?? UNKNOWN_MODEL);
   }
 
-  /** `session.model.selected`: update the live block without restarting it. */
+  /** `session.model.selected`: update every live block without restarting it. */
   setModel(sessionID: string, model: string): void {
     const label = sanitizeModelName(model);
     this.models.set(sessionID, label);
-    const state = this.states.get(sessionID);
-    if (!state || state.model === label) return;
-    state.model = label;
-    this.schedule(state, STATUS_TICK_MS);
+    for (const state of this.states.values()) {
+      if (state.sessionID !== sessionID || state.model === label) continue;
+      state.model = label;
+      this.schedule(state, STATUS_TICK_MS);
+    }
   }
 
-  async begin(sessionID: string, target: Target, model?: string, newTurn = false): Promise<void> {
-    if (newTurn) this.gate.open(sessionID);
-    if (this.states.has(sessionID)) return;
-    if (!this.gate.allowsBegin(sessionID)) {
-      log.info(`late event after turn end ignored for ${sessionID.slice(0, 16)}`);
-      return;
+  async begin(sessionID: string, target: Target, model?: string, newTurn = false, hint?: string): Promise<string | undefined> {
+    const turn = this.beginTurn(sessionID, newTurn, hint);
+    const key = turnKey(sessionID, turn.turnId);
+    const existing = this.states.get(key);
+    if (existing) return existing.turnId;
+    const closedAt = this.closed.get(key);
+    if (closedAt !== undefined && Date.now() - closedAt <= CLOSED_TTL_MS) {
+      log.info(`late event after turn end ignored for ${sessionID.slice(0, 16)} (${turn.turnId})`);
+      return undefined;
     }
+    if (!newTurn && !turn.fresh && !this.gate.allowsBegin(sessionID)) {
+      log.info(`late event after turn end ignored for ${sessionID.slice(0, 16)}`);
+      return undefined;
+    }
+    const pending = this.pendingText.get(key);
+    this.pendingText.delete(key);
     const state: State = {
       sessionID,
+      turnId: turn.turnId,
       target,
-      text: this.pendingText.get(sessionID) ?? "",
+      text: pending?.text ?? "",
       tools: [],
       subagents: [],
       messageIds: [],
@@ -136,13 +188,17 @@ export class Streamer {
       finished: false,
       delivered: false,
     };
-    this.pendingText.delete(sessionID);
     this.models.set(sessionID, state.model);
-    this.states.set(sessionID, state);
+    this.states.set(key, state);
+    this.ensureSweep();
     const messageId = await this.send(sessionID, state, this.composeMarkdown(state));
     if (messageId) {
       state.messageIds.push(messageId);
       state.delivered = true;
+      this.noteMessage(sessionID, state.turnId, messageId);
+    }
+    if (this.diagnostics()) {
+      log.info(`turn start ${sessionID.slice(0, 16)} turn=${state.turnId} msg=${messageId ?? "none"}`);
     }
     state.lastEditAt = Date.now();
     state.typing = new TypingPulse(() => this.api.sendChatAction(target.chatId, "typing"), 4500);
@@ -154,17 +210,102 @@ export class Streamer {
       if (state.finished && !state.awaiting) return;
       if (state.flushing) return;
       if (Date.now() - state.lastEditAt < Math.max(STATUS_TICK_MS, this.options.editIntervalMs || STATUS_TICK_MS)) return;
-      void this.flush(state.sessionID, state).catch((error) =>
-        log.warn("status tick flush failed:", (error as Error).message),
-      );
+      void this.flush(state).catch((error) => log.warn("status tick flush failed:", (error as Error).message));
     }, STATUS_TICK_MS);
     state.ticker.unref?.();
+    return state.turnId;
   }
 
-  append(sessionID: string, delta: string): void {
-    const state = this.states.get(sessionID);
+  /** Resolves the turn for a `begin`; replays of `execution.started` never duplicate. */
+  private beginTurn(sessionID: string, newTurn: boolean, hint?: string): TurnRef {
+    if (!newTurn) {
+      const turn = this.turns.bind(sessionID, hint);
+      if (turn.adoptedFrom) this.rekey(sessionID, turn.adoptedFrom, turn.turnId);
+      return turn;
+    }
+    const current = this.turns.current(sessionID);
+    const live = current ? this.states.get(turnKey(sessionID, current.turnId)) : undefined;
+    // A replayed `execution.started` without a message id must not open a second
+    // message for a turn that is still streaming.
+    if (current && !hint && live && !live.finished) {
+      return { turnId: current.turnId, fresh: false, provisional: current.provisional };
+    }
+    return this.turns.started(sessionID, hint);
+  }
+
+  /**
+   * Moves a provisional stream to the real assistant message id. Before this
+   * the two ids addressed two different `begin()` calls (or none).
+   */
+  private rekey(sessionID: string, from: string, to: string): void {
+    const fromKey = turnKey(sessionID, from);
+    const toKey = turnKey(sessionID, to);
+    const state = this.states.get(fromKey);
+    if (state && !this.states.has(toKey)) {
+      this.states.delete(fromKey);
+      state.turnId = to;
+      this.states.set(toKey, state);
+    }
+    const pending = this.pendingText.get(fromKey);
+    if (pending) {
+      this.pendingText.delete(fromKey);
+      if (!this.pendingText.has(toKey)) this.pendingText.set(toKey, pending);
+    }
+    const closedAt = this.closed.get(fromKey);
+    if (closedAt !== undefined) {
+      this.closed.delete(fromKey);
+      this.closed.set(toKey, closedAt);
+    }
+  }
+
+  /** Binds an event to its turn and returns that turn's stream, if any. */
+  private resolveTurn(sessionID: string, hint?: string): { turnId: string; key: string; state?: State } {
+    const turn = this.turns.bind(sessionID, hint);
+    if (turn.adoptedFrom) this.rekey(sessionID, turn.adoptedFrom, turn.turnId);
+    const key = turnKey(sessionID, turn.turnId);
+    return { turnId: turn.turnId, key, state: this.states.get(key) };
+  }
+
+  private current(sessionID: string): State | undefined {
+    const turn = this.turns.current(sessionID);
+    return turn ? this.states.get(turnKey(sessionID, turn.turnId)) : undefined;
+  }
+
+  /** Map key of a stream; always derived from the state, so rekeys stay valid. */
+  private keyOf(state: State): string {
+    return turnKey(state.sessionID, state.turnId);
+  }
+
+  /** Newest stream of a session, even if its turn already ended. */
+  private latest(sessionID: string): State | undefined {
+    let found: State | undefined;
+    for (const state of this.states.values()) {
+      if (state.sessionID !== sessionID) continue;
+      if (!found || state.startedAt >= found.startedAt) found = state;
+    }
+    return found;
+  }
+
+  /** A message id must belong to one turn; a second owner is a real bug. */
+  private noteMessage(sessionID: string, turnId: string, messageId: number): void {
+    const key = `${sessionID}:${messageId}`;
+    const previous = this.messageTurns.get(key);
+    if (previous && previous !== turnId) {
+      log.warn(
+        `message ${messageId} reused across turns ${previous} → ${turnId} for ${sessionID.slice(0, 16)}`,
+      );
+    }
+    this.messageTurns.set(key, turnId);
+  }
+
+  append(sessionID: string, delta: string, hint?: string): void {
+    const { key, state } = this.resolveTurn(sessionID, hint);
     if (!state) {
-      if (delta) { const next = `${this.pendingText.get(sessionID) ?? ""}${delta}`; this.pendingText.set(sessionID, next.slice(-200_000)); }
+      if (!delta) return;
+      if (this.closed.has(key)) return; // late delta of a finished turn
+      const pending = this.pendingText.get(key);
+      const text = `${pending?.text ?? ""}${delta}`;
+      this.pendingText.set(key, { text: text.slice(-200_000), at: Date.now() });
       return;
     }
     if (!delta) return;
@@ -172,28 +313,29 @@ export class Streamer {
     this.schedule(state);
   }
 
-  setText(sessionID: string, text: string): void {
-    const state = this.states.get(sessionID);
+  setText(sessionID: string, text: string, hint?: string): void {
+    const { key, state } = this.resolveTurn(sessionID, hint);
     if (!state || !text) return;
     state.text = text;
     this.schedule(state);
   }
 
   /** `session.tool.failed` for a permission/policy refusal. */
-  blockedTool(sessionID: string): void {
-    const state = this.states.get(sessionID);
+  blockedTool(sessionID: string, hint?: string): void {
+    const state = this.resolveTurn(sessionID, hint).state ?? this.latest(sessionID);
     if (!state) return;
     state.blocked += 1;
   }
 
   blockedOf(sessionID: string): number {
-    return this.states.get(sessionID)?.blocked ?? 0;
+    return this.current(sessionID)?.blocked ?? this.latest(sessionID)?.blocked ?? 0;
   }
 
   /** `session.tool.called`: remember the tool for the live status block. */
-  toolCalled(sessionID: string, callID: string, name: string, input: unknown): void {
-    const state = this.states.get(sessionID);
-    if (!state || this.options.showTools === "off") return;
+  toolCalled(sessionID: string, callID: string, name: string, input: unknown, hint?: string): void {
+    if (this.options.showTools === "off") return;
+    const { key, state } = this.resolveTurn(sessionID, hint);
+    if (!state) return;
     const presentation = toolPresentation(name, input);
     const existing = state.tools.find((tool) => tool.label === presentation.label);
     if (existing) {
@@ -217,8 +359,8 @@ export class Streamer {
   }
 
   /** `session.tool.success` / `session.tool.failed`. */
-  toolFinished(sessionID: string, callID: string, ok: boolean): void {
-    const state = this.states.get(sessionID);
+  toolFinished(sessionID: string, callID: string, ok: boolean, hint?: string): void {
+    const { key, state } = this.resolveTurn(sessionID, hint);
     if (!state) return;
     const tool = callID ? state.tools.find((entry) => entry.callID === callID) : undefined;
     if (!tool || tool.state !== "running") return;
@@ -229,7 +371,7 @@ export class Streamer {
 
   /** Child session started: shows `🧩 <agent> · 12s` in the parent's live block. */
   subagentStarted(sessionID: string, label: string): void {
-    const state = this.states.get(sessionID);
+    const state = this.latest(sessionID);
     if (!state) return;
     if (state.finalizeTimer) {
       clearTimeout(state.finalizeTimer);
@@ -252,7 +394,7 @@ export class Streamer {
 
   /** Child session finished: `✓` / `✗`, then the line fades out after ~10 s. */
   subagentFinished(sessionID: string, label: string, ok: boolean): void {
-    const state = this.states.get(sessionID);
+    const state = this.latest(sessionID);
     if (!state) return;
     const entry = state.subagents.find((item) => item.label === (label || "subagent") && item.state === "running");
     if (!entry) return;
@@ -265,10 +407,15 @@ export class Streamer {
   /**
    * Parent turn ended. If children are still running the block stays alive
    * (footer included) until the last child finishes and its line fades.
+   * The *turn* itself ends immediately: the next prompt opens a new message,
+   * never editing this one.
    */
-  async end(sessionID: string, footer?: string): Promise<void> {
-    const state = this.states.get(sessionID);
-    if (!state) return;
+  async end(sessionID: string, footer?: string, turnId?: string): Promise<string | undefined> {
+    const id = turnId ?? this.turns.current(sessionID)?.turnId;
+    const key = id ? turnKey(sessionID, id) : undefined;
+    const state = key ? this.states.get(key) : undefined;
+    this.turns.end(sessionID, id);
+    if (!state || !key) return id;
     state.finished = true;
     if (state.timer) {
       clearTimeout(state.timer);
@@ -279,18 +426,20 @@ export class Streamer {
       state.awaiting = true;
       state.footer = footer;
       log.info(`turn ended with active subagents ${sessionID.slice(0, 16)}; keeping live block`);
-      await this.flush(sessionID, state, footer).catch((error) =>
+      await this.flush(state, footer).catch((error) =>
         log.warn("subagent tail flush failed:", (error as Error).message),
       );
-      return;
+      return state.turnId;
     }
 
-    await this.finalize(sessionID, state, footer);
+    await this.finalize(state, footer);
+    return state.turnId;
   }
 
   /** Delivers the final message once and removes the state. */
-  private async finalize(sessionID: string, state: State, footer?: string): Promise<void> {
-    if (this.states.get(sessionID) !== state) return;
+  private async finalize(state: State, footer?: string): Promise<void> {
+    const key = this.keyOf(state);
+    if (this.states.get(key) !== state) return;
     if (state.finalizeTimer) {
       clearTimeout(state.finalizeTimer);
       state.finalizeTimer = undefined;
@@ -302,13 +451,14 @@ export class Streamer {
     if (state.ticker) clearInterval(state.ticker);
     state.typing?.stop();
     state.typing = undefined;
-    this.gate.close(sessionID);
+    this.gate.close(state.sessionID);
+    this.turns.end(state.sessionID, state.turnId);
 
     const text = footer ?? state.footer;
     let delivered = false;
     for (let attempt = 0; attempt < 3 && !delivered; attempt += 1) {
       try {
-        await this.flush(sessionID, state, text);
+        await this.flush(state, text);
         delivered = true;
       } catch (error) {
         const wait = attempt === 0 ? 2000 : attempt === 1 ? 5000 : 10000;
@@ -326,19 +476,56 @@ export class Streamer {
         if (existing !== undefined) {
           if (this.rich) await this.editRich(state, existing, markdown);
           else await this.editHtml(state, existing, markdownToHtml(markdown));
-          log.info(`final delivery recovered by editing message ${existing} for ${sessionID.slice(0, 16)}`);
+          log.info(`final delivery recovered by editing message ${existing} for ${state.sessionID.slice(0, 16)}`);
         } else if (this.rich) {
           await this.api.sendRichMessage(state.target.chatId, { markdown }, this.threadOptions(state));
-          log.info(`final delivery recovered as a new message for ${sessionID.slice(0, 16)}`);
+          log.info(`final delivery recovered as a new message for ${state.sessionID.slice(0, 16)}`);
         } else {
           await this.api.sendMessage(state.target.chatId, markdownToHtml(markdown), { parse_mode: "HTML", ...this.threadOptions(state) });
-          log.info(`final delivery recovered as a new message for ${sessionID.slice(0, 16)}`);
+          log.info(`final delivery recovered as a new message for ${state.sessionID.slice(0, 16)}`);
         }
       } catch (error) {
-        log.error(`final delivery lost for ${sessionID.slice(0, 16)}: ${(error as Error).message}`);
+        log.error(`final delivery lost for ${state.sessionID.slice(0, 16)}: ${(error as Error).message}`);
       }
     }
-    this.states.delete(sessionID);
+    this.closed.set(key, Date.now());
+    this.pendingText.delete(key);
+    if (this.states.get(key) === state) this.states.delete(key);
+    if (this.diagnostics()) {
+      const ids = state.messageIds.filter((id): id is number => id !== undefined).join(",");
+      log.info(`turn end ${state.sessionID.slice(0, 16)} turn=${state.turnId} msg=${ids || "none"}`);
+    }
+  }
+
+  /** Drops streams whose turn end never arrived, so the maps cannot grow. */
+  private ensureSweep(): void {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setInterval(() => this.sweep(), 60_000);
+    this.sweepTimer.unref?.();
+  }
+
+  private sweep(): void {
+    const now = Date.now();
+    for (const [key, state] of [...this.states]) {
+      if (now - state.startedAt <= TURN_TTL_MS) continue;
+      log.warn(`stale stream ${state.sessionID.slice(0, 16)} turn=${state.turnId} removed after 1 h`);
+      if (state.timer) clearTimeout(state.timer);
+      if (state.finalizeTimer) clearTimeout(state.finalizeTimer);
+      if (state.ticker) clearInterval(state.ticker);
+      state.typing?.stop();
+      this.states.delete(key);
+      this.closed.set(key, now);
+      this.pendingText.delete(key);
+      this.turns.end(state.sessionID, state.turnId);
+    }
+    for (const [key, entry] of [...this.pendingText]) {
+      if (now - entry.at > TURN_TTL_MS) this.pendingText.delete(key);
+    }
+    for (const [key, at] of [...this.closed]) {
+      if (now - at > CLOSED_TTL_MS) this.closed.delete(key);
+    }
+    this.turns.pruneAll(now);
+    if (this.messageTurns.size > 1000) this.messageTurns.clear();
   }
 
   /** Keeps the finished child line visible for the TTL, then finalizes. */
@@ -347,7 +534,7 @@ export class Streamer {
     state.finalizeTimer = setTimeout(() => {
       state.finalizeTimer = undefined;
       if (hasActiveSubagents(state)) return;
-      void this.finalize(state.sessionID, state).catch((error) =>
+      void this.finalize(state).catch((error) =>
         log.warn("subagent finalize failed:", (error as Error).message),
       );
     }, TOOL_TTL_MS);
@@ -360,7 +547,7 @@ export class Streamer {
     const wait = Math.max(0, interval - (Date.now() - state.lastEditAt));
     state.timer = setTimeout(() => {
       state.timer = undefined;
-      void this.flush(state.sessionID, state).catch((error) => log.warn("stream flush failed:", (error as Error).message));
+      void this.flush(state).catch((error) => log.warn("stream flush failed:", (error as Error).message));
     }, wait);
     state.timer.unref?.();
   }
@@ -443,13 +630,13 @@ export class Streamer {
     return html ? statusHtml(snapshot) : statusMarkdownList(snapshot);
   }
 
-  private async flush(sessionID: string, state: State, footer?: string): Promise<void> {
+  private async flush(state: State, footer?: string): Promise<void> {
     // A slow Telegram edit must not swallow the final message: wait for the
     // in-flight flush, then run ours (the `end()` footer would otherwise be
     // dropped while the placeholder stayed on screen forever).
     while (state.flushPromise) await state.flushPromise.catch(() => undefined);
-    if (this.states.get(sessionID) !== state) return;
-    const run = this.performFlush(sessionID, state, footer);
+    if (this.states.get(this.keyOf(state)) !== state) return;
+    const run = this.performFlush(state, footer);
     state.flushPromise = run;
     try {
       await run;
@@ -458,7 +645,7 @@ export class Streamer {
     }
   }
 
-  private async performFlush(sessionID: string, state: State, footer?: string): Promise<void> {
+  private async performFlush(state: State, footer?: string): Promise<void> {
     state.flushing = true;
     try {
       if (this.rich) {
@@ -476,7 +663,6 @@ export class Streamer {
       await this.flushHtml(state, footer);
       state.delivered = true;
       state.lastEditAt = Date.now();
-      void sessionID;
     } finally {
       state.flushing = false;
     }
@@ -495,6 +681,7 @@ export class Streamer {
       const sent = await this.sendRich(state, chunk);
       if (!sent) return;
       assignChunk(state.messageIds, step.index, sent);
+      this.noteMessage(state.sessionID, state.turnId, sent);
     }
   }
 
@@ -509,6 +696,7 @@ export class Streamer {
       const sent = await this.sendHtml(state, chunk);
       if (!sent) return;
       assignChunk(state.messageIds, step.index, sent);
+      this.noteMessage(state.sessionID, state.turnId, sent);
     }
   }
 
@@ -607,7 +795,11 @@ export class Streamer {
   }
 
   async shutdown(): Promise<void> {
-    await Promise.all([...this.states.keys()].map((id) => this.end(id)));
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    this.sweepTimer = undefined;
+    await Promise.all(
+      [...this.states.values()].map((state) => this.end(state.sessionID, undefined, state.turnId)),
+    );
   }
 }
 

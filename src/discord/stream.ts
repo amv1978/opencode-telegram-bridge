@@ -5,6 +5,7 @@ import { assignChunk, planChunks, TurnGate } from "../order.ts";
 import { statusMarkdown, type StatusItem } from "../status.ts";
 import { TypingPulse } from "../typing.ts";
 import { DISCORD_CHUNK, chunkText, formatDuration, toDiscordMarkdown } from "./render.ts";
+import { TURN_TTL_MS, TurnRegistry, turnKey, type TurnRef } from "../turns.ts";
 
 const PLACEHOLDER = "⏳ Думаю…";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -12,6 +13,8 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const TOOL_TTL_MS = 10_000;
 const MAX_STATUS_TOOLS = 2;
 const MAX_STATUS_SUBAGENTS = 2;
+/** A turn id is not reused for this long after its stream was finalized. */
+const CLOSED_TTL_MS = 15_000;
 
 type ToolResult = "running" | "ok" | "fail";
 
@@ -55,10 +58,14 @@ export interface DiscordStreamOptions {
   showTools: "off" | "compact" | "full";
   /** Called when the bound thread/channel no longer exists. */
   onGone?: (sessionID: string) => void;
+  /** `ui.diagnostics`: turn ids in logs and in the stats line (default off). */
+  diagnostics?: () => boolean;
 }
 
 interface State {
   sessionID: string;
+  /** Assistant message id of this turn; a message is never shared by turns. */
+  turnId: string;
   channelId: string;
   text: string;
   tools: ToolState[];
@@ -94,24 +101,58 @@ interface State {
  * block (spinner + model + the last tools).
  */
 export class DiscordStreamer {
+  /** `sessionID#turnId` → the stream of exactly one turn. */
   private readonly states = new Map<string, State>();
   private readonly models = new Map<string, string>();
+  /** Turn bookkeeping: execution.started opens, execution.* ends. */
+  private readonly turns = new TurnRegistry();
   /** Blocks a duplicate placeholder after a turn already ended (late SSE). */
   private readonly gate = new TurnGate();
-  /** Deltas that arrived while the gate was closed; replayed on the next begin. */
-  private readonly pendingText = new Map<string, string>();
+  /** Deltas that arrived before the stream existed; replayed once by `begin`. */
+  private readonly pendingText = new Map<string, { text: string; at: number }>();
+  /** Finalized turn keys, so a late delta never reopens a finished message. */
+  private readonly closed = new Map<string, number>();
+  /** `sessionID:messageId` → turn id; a message must never serve two turns. */
+  private readonly messageTurns = new Map<string, string>();
+  private sweepTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly client: Client,
     private readonly options: DiscordStreamOptions,
   ) {}
 
+  private diagnostics(): boolean {
+    try {
+      return this.options.diagnostics?.() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Any block of this session is on screen (a parent awaiting subagents too). */
+  hasBlock(sessionID: string): boolean {
+    return this.latest(sessionID) !== undefined;
+  }
+
+  /** The *current* turn of the session still has a live block. */
   has(sessionID: string): boolean {
-    return this.states.has(sessionID);
+    const turn = this.turns.current(sessionID);
+    return Boolean(turn && this.states.has(turnKey(sessionID, turn.turnId)));
+  }
+
+  /** Turn id of the current stream (diagnostics and footers). */
+  turnOf(sessionID: string): string | undefined {
+    return this.turns.current(sessionID)?.turnId ?? this.latest(sessionID)?.turnId;
+  }
+
+  /** Chat message the answer of a turn was written into. */
+  messageIdOf(sessionID: string, turnId?: string): string | undefined {
+    const state = turnId ? this.states.get(turnKey(sessionID, turnId)) : this.current(sessionID);
+    return [...(state?.messageIds ?? [])].reverse().find((id) => Boolean(id));
   }
 
   elapsedMs(sessionID: string): number | undefined {
-    const state = this.states.get(sessionID);
+    const state = this.current(sessionID) ?? this.latest(sessionID);
     return state ? Date.now() - state.startedAt : undefined;
   }
 
@@ -120,22 +161,32 @@ export class DiscordStreamer {
     return sanitizeModelName(this.models.get(sessionID) ?? UNKNOWN_MODEL);
   }
 
-  async begin(sessionID: string, channelId: string, model?: string, newTurn = false): Promise<void> {
-    if (newTurn) this.gate.open(sessionID);
-    if (this.states.has(sessionID)) return;
-    if (!this.gate.allowsBegin(sessionID)) {
+  async begin(sessionID: string, channelId: string, model?: string, newTurn = false, hint?: string): Promise<string | undefined> {
+    const turn = this.beginTurn(sessionID, newTurn, hint);
+    const key = turnKey(sessionID, turn.turnId);
+    const existing = this.states.get(key);
+    if (existing) return existing.turnId;
+    const closedAt = this.closed.get(key);
+    if (closedAt !== undefined && Date.now() - closedAt <= CLOSED_TTL_MS) {
+      log.info(`discord late event after turn end ignored for ${sessionID.slice(0, 16)} (${turn.turnId})`);
+      return undefined;
+    }
+    if (!newTurn && !turn.fresh && !this.gate.allowsBegin(sessionID)) {
       log.info(`discord late event after turn end ignored for ${sessionID.slice(0, 16)}`);
-      return;
+      return undefined;
     }
     const channel = await this.resolve(channelId);
     if (!channel) {
       log.warn(`discord: channel ${channelId} not found, stream not started`);
-      return;
+      return undefined;
     }
+    const pending = this.pendingText.get(key);
+    this.pendingText.delete(key);
     const state: State = {
       sessionID,
+      turnId: turn.turnId,
       channelId,
-      text: this.pendingText.get(sessionID) ?? "",
+      text: pending?.text ?? "",
       tools: [],
       subagents: [],
       messageIds: [],
@@ -151,12 +202,16 @@ export class DiscordStreamer {
       delivered: false,
     };
     this.models.set(sessionID, state.model);
-    this.states.set(sessionID, state);
-    this.pendingText.delete(sessionID);
+    this.states.set(key, state);
+    this.ensureSweep();
     const message = await channel.send({ content: PLACEHOLDER, allowedMentions: { parse: [] } });
     state.messageIds.push(message.id);
     state.rendered.push(PLACEHOLDER);
     state.delivered = true;
+    this.noteMessage(sessionID, state.turnId, message.id);
+    if (this.diagnostics()) {
+      log.info(`discord turn start ${sessionID.slice(0, 16)} turn=${state.turnId} msg=${message.id}`);
+    }
     if (channel.sendTyping) {
       state.typing = new TypingPulse(() => channel.sendTyping!(), 8000);
       state.typing.start();
@@ -181,21 +236,98 @@ export class DiscordStreamer {
       void this.flush(state).catch((error) => log.warn("discord status tick flush failed:", (error as Error).message));
     }, tick);
     state.statusTimer.unref?.();
+    return state.turnId;
+  }
+
+  /** Resolves the turn for a `begin`; replays of `execution.started` never duplicate. */
+  private beginTurn(sessionID: string, newTurn: boolean, hint?: string): TurnRef {
+    if (!newTurn) {
+      const turn = this.turns.bind(sessionID, hint);
+      if (turn.adoptedFrom) this.rekey(sessionID, turn.adoptedFrom, turn.turnId);
+      return turn;
+    }
+    const current = this.turns.current(sessionID);
+    const live = current ? this.states.get(turnKey(sessionID, current.turnId)) : undefined;
+    if (current && !hint && live && !live.finished) {
+      return { turnId: current.turnId, fresh: false, provisional: current.provisional };
+    }
+    return this.turns.started(sessionID, hint);
+  }
+
+  private rekey(sessionID: string, from: string, to: string): void {
+    const fromKey = turnKey(sessionID, from);
+    const toKey = turnKey(sessionID, to);
+    const state = this.states.get(fromKey);
+    if (state && !this.states.has(toKey)) {
+      this.states.delete(fromKey);
+      state.turnId = to;
+      this.states.set(toKey, state);
+    }
+    const pending = this.pendingText.get(fromKey);
+    if (pending) {
+      this.pendingText.delete(fromKey);
+      if (!this.pendingText.has(toKey)) this.pendingText.set(toKey, pending);
+    }
+    const closedAt = this.closed.get(fromKey);
+    if (closedAt !== undefined) {
+      this.closed.delete(fromKey);
+      this.closed.set(toKey, closedAt);
+    }
+  }
+
+  private resolveTurn(sessionID: string, hint?: string): { turnId: string; key: string; state?: State } {
+    const turn = this.turns.bind(sessionID, hint);
+    if (turn.adoptedFrom) this.rekey(sessionID, turn.adoptedFrom, turn.turnId);
+    const key = turnKey(sessionID, turn.turnId);
+    return { turnId: turn.turnId, key, state: this.states.get(key) };
+  }
+
+  private current(sessionID: string): State | undefined {
+    const turn = this.turns.current(sessionID);
+    return turn ? this.states.get(turnKey(sessionID, turn.turnId)) : undefined;
+  }
+
+  /** Map key of a stream; always derived from the state, so rekeys stay valid. */
+  private keyOf(state: State): string {
+    return turnKey(state.sessionID, state.turnId);
+  }
+
+  private latest(sessionID: string): State | undefined {
+    let found: State | undefined;
+    for (const state of this.states.values()) {
+      if (state.sessionID !== sessionID) continue;
+      if (!found || state.startedAt >= found.startedAt) found = state;
+    }
+    return found;
+  }
+
+  private noteMessage(sessionID: string, turnId: string, messageId: string): void {
+    const key = `${sessionID}:${messageId}`;
+    const previous = this.messageTurns.get(key);
+    if (previous && previous !== turnId) {
+      log.warn(`discord message ${messageId} reused across turns ${previous} → ${turnId} for ${sessionID.slice(0, 16)}`);
+    }
+    this.messageTurns.set(key, turnId);
   }
 
   setModel(sessionID: string, model: string): void {
     const label = sanitizeModelName(model);
-    const state = this.states.get(sessionID);
     this.models.set(sessionID, label);
-    if (!state || state.model === label) return;
-    state.model = label;
-    this.schedule(state);
+    for (const state of this.states.values()) {
+      if (state.sessionID !== sessionID || state.model === label) continue;
+      state.model = label;
+      this.schedule(state);
+    }
   }
 
-  append(sessionID: string, delta: string): void {
-    const state = this.states.get(sessionID);
+  append(sessionID: string, delta: string, hint?: string): void {
+    const { key, state } = this.resolveTurn(sessionID, hint);
     if (!state) {
-      if (delta) { const next = `${this.pendingText.get(sessionID) ?? ""}${delta}`; this.pendingText.set(sessionID, next.slice(-200_000)); }
+      if (!delta) return;
+      if (this.closed.has(key)) return; // late delta of a finished turn
+      const pending = this.pendingText.get(key);
+      const text = `${pending?.text ?? ""}${delta}`;
+      this.pendingText.set(key, { text: text.slice(-200_000), at: Date.now() });
       return;
     }
     if (!delta) return;
@@ -203,28 +335,29 @@ export class DiscordStreamer {
     this.schedule(state);
   }
 
-  setText(sessionID: string, text: string): void {
-    const state = this.states.get(sessionID);
+  setText(sessionID: string, text: string, hint?: string): void {
+    const { key, state } = this.resolveTurn(sessionID, hint);
     if (!state || !text) return;
     state.text = text;
     this.schedule(state);
   }
 
   /** `session.tool.failed` for a permission/policy refusal. */
-  blockedTool(sessionID: string): void {
-    const state = this.states.get(sessionID);
+  blockedTool(sessionID: string, hint?: string): void {
+    const state = this.resolveTurn(sessionID, hint).state ?? this.latest(sessionID);
     if (!state) return;
     state.blocked += 1;
   }
 
   blockedOf(sessionID: string): number {
-    return this.states.get(sessionID)?.blocked ?? 0;
+    return this.current(sessionID)?.blocked ?? this.latest(sessionID)?.blocked ?? 0;
   }
 
   /** `session.tool.called`: remember the tool for the live status block. */
-  toolCalled(sessionID: string, callID: string, name: string, input: unknown): void {
-    const state = this.states.get(sessionID);
-    if (!state || this.options.showTools === "off") return;
+  toolCalled(sessionID: string, callID: string, name: string, input: unknown, hint?: string): void {
+    if (this.options.showTools === "off") return;
+    const { key, state } = this.resolveTurn(sessionID, hint);
+    if (!state) return;
     const presentation = toolPresentation(name, input);
     const existing = state.tools.find((tool) => tool.label === presentation.label);
     if (existing) {
@@ -248,8 +381,8 @@ export class DiscordStreamer {
   }
 
   /** `session.tool.success` / `session.tool.failed`. */
-  toolFinished(sessionID: string, callID: string, ok: boolean): void {
-    const state = this.states.get(sessionID);
+  toolFinished(sessionID: string, callID: string, ok: boolean, hint?: string): void {
+    const { key, state } = this.resolveTurn(sessionID, hint);
     if (!state) return;
     const tool = callID ? state.tools.find((entry) => entry.callID === callID) : undefined;
     if (!tool || tool.state !== "running") return;
@@ -260,7 +393,7 @@ export class DiscordStreamer {
 
   /** Child session started: `🧩 <agent> · 12s` in the parent's live block. */
   subagentStarted(sessionID: string, label: string): void {
-    const state = this.states.get(sessionID);
+    const state = this.latest(sessionID);
     if (!state) return;
     if (state.finalizeTimer) {
       clearTimeout(state.finalizeTimer);
@@ -283,7 +416,7 @@ export class DiscordStreamer {
 
   /** Child session finished: `✓` / `✗`, fades out after ~10 s. */
   subagentFinished(sessionID: string, label: string, ok: boolean): void {
-    const state = this.states.get(sessionID);
+    const state = this.latest(sessionID);
     if (!state) return;
     const entry = state.subagents.find((item) => item.label === (label || "subagent") && item.state === "running");
     if (!entry) return;
@@ -296,10 +429,14 @@ export class DiscordStreamer {
   /**
    * Parent turn ended. With children still running the block stays alive
    * (footer included) until the last child finishes and its line fades.
+   * The turn itself ends immediately: the next prompt opens a new message.
    */
-  async end(sessionID: string, footer?: string): Promise<void> {
-    const state = this.states.get(sessionID);
-    if (!state) return;
+  async end(sessionID: string, footer?: string, turnId?: string): Promise<string | undefined> {
+    const id = turnId ?? this.turns.current(sessionID)?.turnId;
+    const key = id ? turnKey(sessionID, id) : undefined;
+    const state = key ? this.states.get(key) : undefined;
+    this.turns.end(sessionID, id);
+    if (!state || !key) return id;
     state.finished = true;
     if (state.timer) {
       clearTimeout(state.timer);
@@ -313,15 +450,17 @@ export class DiscordStreamer {
       await this.flush(state, footer).catch((error) =>
         log.warn("discord subagent tail flush failed:", (error as Error).message),
       );
-      return;
+      return state.turnId;
     }
 
-    await this.finalize(sessionID, state, footer);
+    await this.finalize(state, footer);
+    return state.turnId;
   }
 
   /** Delivers the final message once and removes the state. */
-  private async finalize(sessionID: string, state: State, footer?: string): Promise<void> {
-    if (this.states.get(sessionID) !== state) return;
+  private async finalize(state: State, footer?: string): Promise<void> {
+    const key = this.keyOf(state);
+    if (this.states.get(key) !== state) return;
     if (state.finalizeTimer) {
       clearTimeout(state.finalizeTimer);
       state.finalizeTimer = undefined;
@@ -333,7 +472,8 @@ export class DiscordStreamer {
     if (state.statusTimer) clearInterval(state.statusTimer);
     state.typing?.stop();
     state.typing = undefined;
-    this.gate.close(sessionID);
+    this.gate.close(state.sessionID);
+    this.turns.end(state.sessionID, state.turnId);
 
     const text = footer ?? state.footer;
     let delivered = false;
@@ -357,20 +497,57 @@ export class DiscordStreamer {
           // Reuse the message that already carries part of the answer.
           const message = await channel.messages.fetch(existing);
           await message.edit({ content: finalText, allowedMentions: { parse: [] } });
-          log.info(`discord final delivery recovered by editing ${existing} for ${sessionID.slice(0, 16)}`);
+          log.info(`discord final delivery recovered by editing ${existing} for ${state.sessionID.slice(0, 16)}`);
         } else if (channel) {
           for (const chunk of chunkText(finalText)) {
             await channel.send({ content: chunk, allowedMentions: { parse: [] } });
           }
-          log.info(`discord final delivery recovered as a new message for ${sessionID.slice(0, 16)}`);
+          log.info(`discord final delivery recovered as a new message for ${state.sessionID.slice(0, 16)}`);
         }
       } catch (error) {
-        log.error(`discord final delivery lost for ${sessionID.slice(0, 16)}: ${(error as Error).message}`);
+        log.error(`discord final delivery lost for ${state.sessionID.slice(0, 16)}: ${(error as Error).message}`);
       }
     }
     // Delete only after the final flush: an early delete let a late tick find
     // no state and drop the answer.
-    if (this.states.get(sessionID) === state) this.states.delete(sessionID);
+    this.closed.set(key, Date.now());
+    this.pendingText.delete(key);
+    if (this.states.get(key) === state) this.states.delete(key);
+    if (this.diagnostics()) {
+      const ids = state.messageIds.filter((id): id is string => Boolean(id)).join(",");
+      log.info(`discord turn end ${state.sessionID.slice(0, 16)} turn=${state.turnId} msg=${ids || "none"}`);
+    }
+  }
+
+  /** Drops streams whose turn end never arrived, so the maps cannot grow. */
+  private ensureSweep(): void {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setInterval(() => this.sweep(), 60_000);
+    this.sweepTimer.unref?.();
+  }
+
+  private sweep(): void {
+    const now = Date.now();
+    for (const [key, state] of [...this.states]) {
+      if (now - state.startedAt <= TURN_TTL_MS) continue;
+      log.warn(`discord stale stream ${state.sessionID.slice(0, 16)} turn=${state.turnId} removed after 1 h`);
+      if (state.timer) clearTimeout(state.timer);
+      if (state.finalizeTimer) clearTimeout(state.finalizeTimer);
+      if (state.statusTimer) clearInterval(state.statusTimer);
+      state.typing?.stop();
+      this.states.delete(key);
+      this.closed.set(key, now);
+      this.pendingText.delete(key);
+      this.turns.end(state.sessionID, state.turnId);
+    }
+    for (const [key, entry] of [...this.pendingText]) {
+      if (now - entry.at > TURN_TTL_MS) this.pendingText.delete(key);
+    }
+    for (const [key, at] of [...this.closed]) {
+      if (now - at > CLOSED_TTL_MS) this.closed.delete(key);
+    }
+    this.turns.pruneAll(now);
+    if (this.messageTurns.size > 1000) this.messageTurns.clear();
   }
 
   /** Keeps the finished child line visible for the TTL, then finalizes. */
@@ -379,7 +556,7 @@ export class DiscordStreamer {
     state.finalizeTimer = setTimeout(() => {
       state.finalizeTimer = undefined;
       if (hasActiveSubagents(state)) return;
-      void this.finalize(state.sessionID, state).catch((error) =>
+      void this.finalize(state).catch((error) =>
         log.warn("discord subagent finalize failed:", (error as Error).message),
       );
     }, TOOL_TTL_MS);
@@ -387,7 +564,11 @@ export class DiscordStreamer {
   }
 
   async shutdown(): Promise<void> {
-    await Promise.all([...this.states.keys()].map((id) => this.end(id)));
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    this.sweepTimer = undefined;
+    await Promise.all(
+      [...this.states.values()].map((state) => this.end(state.sessionID, undefined, state.turnId)),
+    );
   }
 
   private schedule(state: State): void {
@@ -473,6 +654,7 @@ export class DiscordStreamer {
     // Serialize with any in-flight tick: a slow edit used to make `end()` a
     // no-op, leaving the placeholder on screen with no final answer.
     while (state.flushPromise) await state.flushPromise.catch(() => undefined);
+    if (this.states.get(this.keyOf(state)) !== state) return;
     const run = this.performFlush(state, footer);
     state.flushPromise = run;
     try {
@@ -500,6 +682,7 @@ export class DiscordStreamer {
           const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
           assignChunk(state.messageIds, step.index, message.id);
           state.rendered[step.index] = chunk;
+          this.noteMessage(state.sessionID, state.turnId, message.id);
           continue;
         }
         // Always edit: elapsed strings change every tick, so a same-content
@@ -517,6 +700,7 @@ export class DiscordStreamer {
             const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
             assignChunk(state.messageIds, step.index, message.id);
             state.rendered[step.index] = chunk;
+            this.noteMessage(state.sessionID, state.turnId, message.id);
             continue;
           }
           if (isRateLimited(error)) {

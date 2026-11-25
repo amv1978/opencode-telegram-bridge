@@ -146,6 +146,21 @@ While a turn runs, a live block is shown above the answer:
 DeepSeek V4.1 Flash · ⏱ 1m 23s · ⚡ 197.8 tok/s · 🧠 531k
 ```
 
+### One message per turn
+
+Streams are keyed by `(sessionID, turnId)`, where `turnId` is the assistant message
+id of the turn (`session.text.started/delta`, `session.execution.started`). A new
+prompt always opens a **new** message: a previous answer is never edited, even when
+its block is still on screen because subagents are finishing, and a retried turn
+never reuses an old message. The mirrored user message (text + media) is posted
+first, then the answer. Turn state is dropped at the end of the turn, and a safety
+sweep removes anything older than an hour.
+
+With `ui.diagnostics: true` the stats line ends with the short turn id
+(`#t4f2a91`) and the log gets `turn start` / `turn end` lines with the turn and
+message id; a message reused across turns would be logged too (it must never
+happen). Off by default: the footer and the relay/utilization path are unchanged.
+
 ### Honest stop footer
 
 An abnormal end never looks like success: the reason is its own line, the stats
@@ -200,9 +215,12 @@ observed session ids live in `state.json` (`observe`). `/observe status` lists t
   never touched.
 - `off` — no status marker.
 
-A session rename during a turn updates the stored original title; in `icon` mode
-the topic name is never changed. Chat decorations are cosmetic: the OpenCode
-session title is not modified.
+A `session.renamed` event always updates the title in `state.json` and renames the
+bound topic. The status icon is preserved (name and icon are independent
+`editForumTopic` fields); in `rename` mode the current `⏳`/`✅` marker is kept. An
+unchanged name is skipped, the General chat is never renamed, and a rename inside
+the 60-second window is deferred, not dropped. Renaming the topic in Telegram
+still updates the session title (our own echo is ignored).
 
 ## Permissions
 

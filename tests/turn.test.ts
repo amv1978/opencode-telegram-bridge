@@ -68,6 +68,21 @@ describe("footer", () => {
     expect(isBlockedToolFailure({ message: "Permission declined: bash" })).toBe(true);
     expect(isBlockedToolFailure({ message: "ECONNREFUSED" })).toBe(false);
   });
+
+  test("diagnostics tag is appended only when enabled", () => {
+    const base = { model: "DeepSeek V4.1 Flash", durationMs: 42_000, turnId: "msg_abcdef123" };
+    const off = composeTurnFooter({ ...base, diagnostics: false });
+    expect(off.endsWith("#tmsgabc")).toBe(false);
+    const on = composeTurnFooter({ ...base, diagnostics: true });
+    expect(on.endsWith("#tmsgabc")).toBe(true);
+    expect(on.split("\n")).toHaveLength(1);
+    const withReason = composeTurnFooter({ ...base, diagnostics: true, reason: "⚠️ остановлено" });
+    const [reason, stats] = withReason.split("\n");
+    expect(reason).toBe("⚠️ остановлено");
+    expect(stats?.endsWith("#tmsgabc")).toBe(true);
+    // No turn id (e.g. an event without payload) still yields a stable tag.
+    expect(composeTurnFooter({ diagnostics: true }).endsWith("#tnone")).toBe(true);
+  });
 });
 
 describe("StopRegistry", () => {

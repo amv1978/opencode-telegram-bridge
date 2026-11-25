@@ -117,11 +117,17 @@ current one through `PATCH /api/session/{id}` (auto allows everything, plan deni
 - **Title status**: Discord threads have no icons, so status markers are **off by
   default**. Set `discord.titleStatus: "rename"` to opt in: the thread is renamed to
   `⏳ <title>` on turn start and `✅ <title>` on success, then restored after ~10 s.
-  Discord allows about two renames per 10 minutes, so a rename is only attempted
-  5 minutes after the previous one: a short turn may keep `⏳` until the window
-  opens, then the original title is restored. A session rename during the turn
-  keeps the marker and becomes the new original title. `ui.titleStatus` applies
-  only to Telegram.
+  `session.renamed` always syncs the thread name to the new session title (a plain
+  channel, e.g. the server's General, is never renamed): an unchanged name is
+  skipped and Discord allows about two renames per 10 minutes, so a rename inside
+  the 5-minute window is attempted when it opens. `ui.titleStatus` applies only to
+  Telegram.
+- **One message per turn**: streams are keyed by `(sessionID, turnId)`, where
+  `turnId` is the assistant message id of the turn. A new prompt always opens a new
+  message — a finished answer is never edited by the next turn, even while its block
+  is still alive for subagents — and a deferred mirror/retry never reuses an old
+  message. With `ui.diagnostics: true` the stats line ends with `#t<turnId>` and the
+  log records `turn start`/`turn end` with the turn and message id (off by default).
 - **Subagents**: a child session (`parentID`) does not open a separate thread. With
   an active parent block it adds an inline line — `🧩 explore · 12s`, then `✓`/`✗`
   (`🧩 general · 1m 03s ✓`). At most 2 lines, repeats collapse (`×2`), finished ones

@@ -246,6 +246,13 @@ export const PAGE = /* html */ `<!doctype html>
                 <option value="off">off</option>
               </select>
             </div>
+            <div>
+              <label class="check" style="margin-top:22px">
+                <input type="checkbox" id="diagnostics" />
+                <span data-i18n="cfg.diagnostics">Диагностика: id хода в статистике и журнале</span>
+              </label>
+              <div class="hint" data-i18n="cfg.diagnostics.hint">В статистику добавляется #t&lt;turnId&gt;, в журнал — turn start/end с id хода и сообщения. По умолчанию выключено.</div>
+            </div>
           </div>
           <div class="row">
             <button class="primary" type="submit" data-i18n="btn.save">Сохранить</button>
@@ -492,6 +499,8 @@ const I18N = {
     "cfg.titleStatus.rename": "rename — переименование темы (служебные сообщения)",
     "cfg.titleStatus.off": "off — выключено",
     "cfg.titleStatus.hint": "Иконка: ⏳ во время хода, ✅ в конце, через ~10 с возвращается обычная. Rename включён только по желанию: каждое переименование оставляет служебное сообщение.",
+    "cfg.diagnostics": "Диагностика: id хода в статистике и журнале",
+    "cfg.diagnostics.hint": "В статистику добавляется #t<turnId>, в журнал — turn start/end с id хода и сообщения. По умолчанию выключено.",
     "cfg.telegram.enabled": "Включить Telegram",
     "cfg.dir": "Папка по умолчанию",
     "cfg.throttle": "Троттлинг правок, мс",
@@ -619,6 +628,8 @@ const I18N = {
     "cfg.titleStatus.rename": "rename — rename the topic (service messages)",
     "cfg.titleStatus.off": "off — disabled",
     "cfg.titleStatus.hint": "Icon: ⏳ while a turn runs, ✅ when it ends, the default icon returns after ~10 s. Rename is opt-in: every rename posts a service message.",
+    "cfg.diagnostics": "Diagnostics: turn id in the stats line and the log",
+    "cfg.diagnostics.hint": "Adds #t<turnId> to the stats line and logs turn start/end with the turn and message id. Off by default.",
     "cfg.telegram.enabled": "Enable Telegram",
     "cfg.dir": "Default directory",
     "cfg.throttle": "Edit throttle, ms",
@@ -878,6 +889,7 @@ function fill(s) {
     applyI18n();
     $("autoTopics").checked = s.config.autoTopics;
     $("showSubagents").value = s.config.showSubagents || "auto";
+    $("diagnostics").checked = Boolean(s.config.ui && s.config.ui.diagnostics);
     $("mediaRelay").value = s.config.media.relay;
     $("mediaPhotoMb").value = s.config.media.maxPhotoMb;
     if (s.config.update) {
@@ -994,7 +1006,7 @@ function currentPayload() {
       autoDownload: $("updateAuto").checked,
     },
     stream: { editIntervalMs: Number($("editIntervalMs").value), showTools: $("showTools").value, format: $("format").value },
-    ui: { titleStatus: $("titleStatus").value },
+    ui: { titleStatus: $("titleStatus").value, diagnostics: $("diagnostics").checked },
     discord: {
       enabled: $("dcEnabled").checked,
       token: $("dcToken").value,

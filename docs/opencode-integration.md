@@ -52,7 +52,7 @@ The repeated `types` parameter is mandatory: OpenCode does not accept a comma li
 | `session.tool.called` | Tool line (last 2, `showTools` mode) |
 | `session.execution.succeeded/failed/interrupted` | Ends the turn, writes the footer |
 | `permission.asked` | Sends a message with buttons |
-| `session.renamed` | Renames the forum topic |
+| `session.renamed` | `state.json` title + bound topic/thread rename (deduplicated) |
 | `session.created` | Caches `parentID`/`agent`/`title` of a new session |
 | `session.model.selected` | Refreshes the model label in a live block |
 | `session.synthetic` | Subagent report (`<subagent>`) into the parent chat |
@@ -61,6 +61,13 @@ The repeated `types` parameter is mandatory: OpenCode does not accept a comma li
 | `form.cancelled` | Marks the chat form as cancelled |
 
 `session.idle` never arrives — the end of a turn is defined only by `session.execution.*`.
+
+**Turn ids.** `session.text.started/delta/ended` (and, depending on the build,
+`session.execution.started`) carry `assistantMessageID`. A stream is keyed by
+`(sessionID, turnId)` where `turnId` is that id, so a new turn always gets a new
+message; a later step of the same turn (another assistant message id) stays in the
+same message, and the first id merely renames the provisional turn opened by
+`execution.started` (see `src/turns.ts`).
 
 **Forms.** `Form.Info` is `{ id: "frm_…", sessionID, title, metadata, fields[] }`;
 `metadata.kind` is `question`, `mcp-elicitation` or `websearch.provider`. Field types:

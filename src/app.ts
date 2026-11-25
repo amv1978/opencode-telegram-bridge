@@ -57,6 +57,7 @@ export interface Snapshot {
       scheme: "system" | "light" | "dark";
       lang: "system" | "ru" | "en";
       titleStatus: "icon" | "rename" | "off";
+      diagnostics: boolean;
       seenChangelog: string[];
     };
     proxy?: string;
@@ -184,6 +185,7 @@ export class App {
           scheme: this.cfg.ui?.scheme ?? "system",
           lang: this.cfg.ui?.lang ?? "system",
           titleStatus: this.cfg.ui?.titleStatus ?? "icon",
+          diagnostics: this.cfg.ui?.diagnostics === true,
           seenChangelog: this.cfg.ui?.seenChangelog ?? [],
         },
         proxy: this.cfg.telegram.proxy,
@@ -717,6 +719,9 @@ export class App {
     }
     if (ui.titleStatus === "icon" || ui.titleStatus === "rename" || ui.titleStatus === "off") {
       this.cfg.ui = { ...(this.cfg.ui ?? {}), titleStatus: ui.titleStatus };
+    }
+    if (typeof ui.diagnostics === "boolean") {
+      this.cfg.ui = { ...(this.cfg.ui ?? {}), diagnostics: ui.diagnostics };
     }
 
     const stream = (patch.stream ?? {}) as Record<string, unknown>;

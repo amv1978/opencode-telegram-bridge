@@ -29,6 +29,19 @@ export function canRename(lastRename: number, now = Date.now(), minMs = 60_000):
   return now - lastRename >= minMs;
 }
 
+/**
+ * Name a bound topic/thread must carry for a session title: the status marker
+ * is only used in `rename` mode (icon mode keeps the icon and the clean name).
+ */
+export function syncTitleName(base: string, mode: TitleStatusMode, phase: TitlePhase, limit = 128): string {
+  return titleWithMarker(base, mode === "rename" ? phase : "idle", limit);
+}
+
+/** True when the topic already shows this name, so a rename would be noise. */
+export function sameTitleName(current: string | undefined, next: string): boolean {
+  return (current ?? "").replace(/\s+/g, " ").trim() === next.replace(/\s+/g, " ").trim();
+}
+
 /** Milliseconds until the window opens (0 when a rename is allowed now). */
 export function renameWait(lastRename: number, now = Date.now(), minMs = 60_000): number {
   if (!Number.isFinite(lastRename) || lastRename <= 0) return 0;

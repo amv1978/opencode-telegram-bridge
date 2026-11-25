@@ -1,4 +1,5 @@
 import { formatUsd } from "./budget.ts";
+import { turnTag } from "./turns.ts";
 
 /**
  * End-of-turn wording shared by Telegram and Discord.
@@ -130,6 +131,9 @@ export interface TurnFooterInput {
   durationMs?: number;
   tps?: number;
   contextTokens?: number;
+  /** `ui.diagnostics`: append the turn id to the stats line. */
+  diagnostics?: boolean;
+  turnId?: string;
 }
 
 /**
@@ -151,6 +155,8 @@ export function composeTurnFooter(input: TurnFooterInput): string {
   if (input.durationMs !== undefined && input.durationMs > 0) stats.push(`⏱ ${formatDuration(input.durationMs)}`);
   if (input.tps) stats.push(`⚡ ${input.tps.toFixed(1)} tok/s`);
   if (input.contextTokens) stats.push(`🧠 ${formatTokens(input.contextTokens)}`);
+  // Diagnostics only: the tag is the last element of the stats line.
+  if (input.diagnostics) stats.push(turnTag(input.turnId));
 
   return [reason, stats.join(" · ")].filter(Boolean).join("\n");
 }

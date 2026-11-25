@@ -51,7 +51,8 @@ import { DiscordStreamer, resolveSendable } from "./stream.ts";
 import { isPermissionMode, MODE_SUMMARY, modeOf, rulesForMode } from "../permissions.ts";
 import { recentEntries, recentLine } from "../recent.ts";
 import { budgetReport, type BudgetSnapshot } from "../budget.ts";
-import { canRename, renameWait, titleWithMarker } from "../titles.ts";
+import { canRename, renameWait, sameTitleName, syncTitleName, titleWithMarker } from "../titles.ts";
+import { assistantMessageIDOf } from "../turns.ts";
 import {
   activeFields,
   buildAnswer,
@@ -129,6 +130,8 @@ interface DiscordTitle {
   lastRename: number;
   version: number;
   timer?: ReturnType<typeof setTimeout>;
+  /** Thread name currently applied, so an unchanged title is never renamed. */
+  appliedName?: string;
 }
 
 interface ThreadParent {
@@ -161,6 +164,8 @@ export class DiscordBridge {
   private readonly seenForms = new Map<string, number>();
   /** Per-session thread title markers (`⏳` / `✅`). */
   private readonly titles = new Map<string, DiscordTitle>();
+  /** Deferred thread renames: Discord allows ~2 renames per 10 minutes. */
+  private readonly renameTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private formTimer?: ReturnType<typeof setInterval>;
   private readonly sessionCache = new Map<string, { parentID?: string | null; agent?: string; title?: string }>();
   /** Child session id → parent agent, so `execution.*` updates the parent block. */
@@ -257,6 +262,7 @@ export class DiscordBridge {
       // Discord rate limits edits per channel; never faster than 2.5 s.
       editIntervalMs: Math.max(2500, this.cfg.stream.editIntervalMs || 2500),
       showTools: this.cfg.stream.showTools,
+      diagnostics: () => this.cfg.ui?.diagnostics === true,
       onGone: (sessionID) => {
         this.store.clearDiscord(sessionID);
         log.warn(`discord thread for ${sessionID.slice(0, 16)} was deleted; binding cleared`);
@@ -332,6 +338,8 @@ export class DiscordBridge {
     this.forms.clear();
     for (const state of this.titles.values()) if (state.timer) clearTimeout(state.timer);
     this.titles.clear();
+    for (const timer of this.renameTimers.values()) clearTimeout(timer);
+    this.renameTimers.clear();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     this.background.stop();
@@ -968,7 +976,7 @@ export class DiscordBridge {
   /** Starts a card for a run without a thread/channel binding; never duplicates one. */
   private async maybeObserve(sessionID: string): Promise<boolean> {
     if (this.observer.has(sessionID)) return true;
-    if (this.streamer?.has(sessionID)) return false;
+    if (this.streamer?.hasBlock(sessionID)) return false;
     const targets = this.observeTargets();
     if (!targets.length) return false;
     const session = await this.oc.getSession(sessionID).catch(() => undefined);
@@ -1050,6 +1058,8 @@ export class DiscordBridge {
 
     const sessionID = String(event.data?.sessionID ?? "");
     if (!sessionID) return;
+    // Turn id of this event: the assistant message id (turn keying + diagnostics).
+    const turnHint = assistantMessageIDOf(event.data);
 
     switch (event.type) {
       case "session.inbox.enqueued":
@@ -1060,7 +1070,7 @@ export class DiscordBridge {
         const meta = await this.sessionMeta(sessionID);
         if (meta.parentID) {
           const agent = meta.agent || "subagent";
-          const placement = subagentPlacement(this.cfg.showSubagents, this.streamer?.has(meta.parentID) ?? false);
+          const placement = subagentPlacement(this.cfg.showSubagents, this.streamer?.hasBlock(meta.parentID) ?? false);
           this.childSessions.set(sessionID, { parentID: meta.parentID, agent, placement });
           if (placement === "inline") {
             this.streamer?.subagentStarted(meta.parentID, agent);
@@ -1083,37 +1093,38 @@ export class DiscordBridge {
         if (!(await this.maybeObserve(sessionID))) {
           await this.mirrorLatestExternal(sessionID);
           if (signal.aborted) return;
-          await this.ensureStream(sessionID, true);
+          await this.ensureStream(sessionID, true, turnHint);
           this.streamer?.setModel(sessionID, await modelLabel(this.oc, sessionID));
           await this.markTitle(sessionID, "start");
         }
         break;
       }
       case "session.text.started":
-        await this.ensureStream(sessionID, true);
+        // Binds the turn to its assistant message; never opens a second message.
+        await this.ensureStream(sessionID, false, turnHint);
         break;
       case "session.text.delta": {
-        if (!this.streamer?.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID);
-        this.streamer?.append(sessionID, String(event.data.delta ?? ""));
+        if (!this.streamer?.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID, false, turnHint);
+        this.streamer?.append(sessionID, String(event.data.delta ?? ""), turnHint);
         break;
       }
       case "session.text.ended": {
         const text = String(event.data.text ?? "");
-        if (text) this.streamer?.setText(sessionID, text);
+        if (text) this.streamer?.setText(sessionID, text, turnHint);
         break;
       }
       case "session.tool.called": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
         this.observer.toolCalled(sessionID);
-        this.streamer?.toolCalled(sessionID, callID, String(event.data.name ?? "tool"), event.data.input);
+        this.streamer?.toolCalled(sessionID, callID, String(event.data.name ?? "tool"), event.data.input, turnHint);
         break;
       }
       case "session.tool.success":
       case "session.tool.failed": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
-        this.streamer?.toolFinished(sessionID, callID, event.type === "session.tool.success");
+        this.streamer?.toolFinished(sessionID, callID, event.type === "session.tool.success", turnHint);
         if (event.type === "session.tool.failed" && isBlockedToolFailure(event.data.error ?? event.data)) {
-          this.streamer?.blockedTool(sessionID);
+          this.streamer?.blockedTool(sessionID, turnHint);
         }
         if (event.type === "session.tool.success") void this.relayAgentFiles(sessionID);
         break;
@@ -1136,6 +1147,7 @@ export class DiscordBridge {
         if (await this.finishObservation(sessionID, event)) break;
         if (!this.streamer?.has(sessionID)) break;
         const elapsed = this.streamer.elapsedMs(sessionID);
+        const turnId = this.streamer.turnOf(sessionID);
         const type = event.type.replace("session.execution.", "");
         const reason = turnReason({
           type,
@@ -1152,12 +1164,14 @@ export class DiscordBridge {
           durationMs: stats.duration ?? elapsed,
           tps: stats.tps,
           contextTokens: stats.contextTokens,
+          diagnostics: this.cfg.ui?.diagnostics === true,
+          turnId,
         });
         const [reasonLine, statsLine] = footer.split("\n");
         const formatted =
           reasonLine && statsLine ? `${reasonLine}\n${italicLine(statsLine)}` : italicLine(footer) || footer;
         if (signal.aborted) break;
-        await this.streamer.end(sessionID, formatted || undefined);
+        await this.streamer.end(sessionID, formatted || undefined, turnId);
         await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
         log.info(`discord turn ${type} ${sessionID.slice(0, 16)}: ${reason ?? "ok"}${blocked ? ` · blocked=${blocked}` : ""}`);
@@ -1184,22 +1198,13 @@ export class DiscordBridge {
       }
       case "session.renamed": {
         const title = String(event.data.title ?? "").trim();
+        // Every received rename is logged: it used to be invisible in the log.
+        log.info(`discord session renamed evt: ${title || "(empty)"} ${sessionID.slice(0, 16)}`);
         if (!title) break;
-        const state = this.titles.get(sessionID);
-        if (state) state.base = title;
+        const state = this.titleState(sessionID, title);
+        state.base = title;
         this.store.setDiscordTitle(sessionID, title);
-        // Renames are opt-in (`discord.titleStatus: "rename"`).
-        if (this.cfg.discord?.titleStatus !== "rename") break;
-        const threadId = this.store.locateDiscord(sessionID).threadId;
-        if (!threadId || !this.client) break;
-        try {
-          const channel = await this.client.channels.fetch(threadId);
-          if (channel?.isThread()) await channel.setName(titleWithMarker(title, state?.phase ?? "idle", 100));
-          if (state) state.lastRename = Date.now();
-          log.info(`discord session renamed → thread: ${title}`);
-        } catch (error) {
-          log.warn("discord thread rename failed:", (error as Error).message);
-        }
+        await this.syncThreadTitle(sessionID, title);
         break;
       }
       default:
@@ -1207,7 +1212,7 @@ export class DiscordBridge {
     }
   }
 
-  private async ensureStream(sessionID: string, newTurn = false): Promise<void> {
+  private async ensureStream(sessionID: string, newTurn = false, hint?: string): Promise<void> {
     if (this.streamer?.has(sessionID) || this.observer.has(sessionID)) return;
     // Same guard as Telegram: late events from a finished turn must not create
     // an orphan placeholder that never receives the final answer.
@@ -1217,8 +1222,8 @@ export class DiscordBridge {
     if (!busy) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
-    await this.streamer?.begin(sessionID, target, await modelLabel(this.oc, sessionID), newTurn);
-    log.info(`discord attached to running session ${sessionID.slice(0, 16)}`);
+    const turnId = await this.streamer?.begin(sessionID, target, await modelLabel(this.oc, sessionID), newTurn, hint);
+    if (turnId) log.info(`discord attached to running session ${sessionID.slice(0, 16)} turn=${turnId.slice(0, 12)}`);
   }
 
   private async mirrorUserMessage(sessionID: string, item: unknown): Promise<void> {
@@ -1378,6 +1383,83 @@ export class DiscordBridge {
 
   // ------------------------------------------------------------------ titles
 
+  /** Thread title state of a session; created lazily from the event/store title. */
+  private titleState(sessionID: string, title?: string): DiscordTitle {
+    let state = this.titles.get(sessionID);
+    if (!state) {
+      const base = (title || this.store.session[sessionID]?.title || sessionID.slice(0, 12)).trim();
+      state = { base, phase: "idle", lastRename: 0, version: 0 };
+      this.titles.set(sessionID, state);
+    }
+    return state;
+  }
+
+  /**
+   * Keeps the bound thread name in sync with `session.renamed`.
+   *
+   * - only threads are renamed (a plain channel, e.g. the server's General, is
+   *   never touched);
+   * - an unchanged name is skipped;
+   * - Discord allows ~2 renames per 10 minutes, so `TITLE_MIN_MS` gaps are
+   *   enforced and a change inside the window is deferred, not dropped.
+   */
+  private async syncThreadTitle(sessionID: string, title: string): Promise<void> {
+    const threadId = this.store.locateDiscord(sessionID).threadId;
+    if (!threadId || !this.client) return;
+    const state = this.titleState(sessionID, title);
+    const mode = this.cfg.discord?.titleStatus === "rename";
+    const name = syncTitleName(title, mode ? "rename" : "off", state.phase, 100);
+    if (sameTitleName(state.appliedName, name)) return;
+    let channel;
+    try {
+      channel = await this.client.channels.fetch(threadId);
+    } catch (error) {
+      log.warn("discord thread rename failed:", (error as Error).message);
+      return;
+    }
+    if (!channel?.isThread()) return; // General / plain channel is never renamed
+    if (sameTitleName(channel.name, name)) {
+      state.appliedName = name;
+      return;
+    }
+    const wait = renameWait(state.lastRename, Date.now(), TITLE_MIN_MS);
+    if (wait > 0) {
+      this.deferThreadRename(sessionID, title, wait);
+      return;
+    }
+    await this.applyThreadRename(sessionID, title, name);
+  }
+
+  private deferThreadRename(sessionID: string, title: string, wait: number): void {
+    if (this.renameTimers.has(sessionID)) return;
+    log.info(`discord thread rename deferred ${Math.ceil(wait / 1000)}s for ${sessionID.slice(0, 16)}`);
+    const timer = setTimeout(() => {
+      this.renameTimers.delete(sessionID);
+      void this.syncThreadTitle(sessionID, title).catch((error) =>
+        log.warn("discord thread rename retry failed:", (error as Error).message),
+      );
+    }, wait + 500);
+    timer.unref?.();
+    this.renameTimers.set(sessionID, timer);
+  }
+
+  private async applyThreadRename(sessionID: string, title: string, name: string): Promise<void> {
+    const threadId = this.store.locateDiscord(sessionID).threadId;
+    if (!threadId || !this.client) return;
+    try {
+      const channel = await this.client.channels.fetch(threadId);
+      if (!channel?.isThread()) return;
+      await channel.setName(name);
+      const state = this.titleState(sessionID, title);
+      state.lastRename = Date.now();
+      state.appliedName = name;
+      log.info(`discord session renamed → thread: ${title}`);
+    } catch (error) {
+      log.warn("discord thread rename failed:", (error as Error).message);
+    }
+  }
+
+
   /**
    * Thread title markers with Discord's rename budget in mind: a rename is only
    * attempted 5 minutes after the previous one (≤2 per 10 min per channel).
@@ -1435,7 +1517,10 @@ export class DiscordBridge {
     try {
       const channel = await this.client.channels.fetch(threadId);
       if (!channel?.isThread()) return false;
-      await channel.setName(titleWithMarker(name, "idle", 100));
+      const clean = titleWithMarker(name, "idle", 100);
+      await channel.setName(clean);
+      const state = this.titles.get(sessionID);
+      if (state) state.appliedName = clean;
       return true;
     } catch (error) {
       log.debug("discord thread title:", (error as Error).message);

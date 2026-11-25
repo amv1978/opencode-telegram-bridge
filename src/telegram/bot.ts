@@ -31,7 +31,8 @@ import {
 import { isPermissionMode, MODE_SUMMARY, modeOf, rulesForMode } from "../permissions.ts";
 import { recentEntries, recentLine } from "../recent.ts";
 import { formatUsd, type BudgetSnapshot } from "../budget.ts";
-import { canRename, normalizeTitleStatus, pickTopicIcon, renameWait, titleWithMarker } from "../titles.ts";
+import { canRename, normalizeTitleStatus, pickTopicIcon, renameWait, sameTitleName, syncTitleName, titleWithMarker } from "../titles.ts";
+import { assistantMessageIDOf, turnTag } from "../turns.ts";
 import { enableHexFileTranscription, transcribeAudio } from "../audio/transcribe.ts";
 import {
   collectAgentFiles,
@@ -110,6 +111,8 @@ interface TelegramTitle {
   /** Last applied topic icon: "start", "done" or null (default icon). */
   icon?: "start" | "done" | null;
   lastIconAt?: number;
+  /** Name currently on the topic, so an unchanged title is never re-applied. */
+  appliedName?: string;
 }
 
 export class Bridge {
@@ -142,6 +145,8 @@ export class Bridge {
   /** Prompts this bridge sent itself, so history never mirrors them back. */
   private readonly selfPrompts = new Map<string, { text: string; at: number }[]>();
   private readonly appliedTitles = new Map<string, string>();
+  /** Deferred topic renames: Telegram allows roughly one rename per 60 s. */
+  private readonly renameTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly fetchImpl: typeof fetch;
   /** Last agent-files scan per session, so tool.success + turn end don't double-fetch. */
   private readonly agentFilesAt = new Map<string, number>();
@@ -189,6 +194,7 @@ export class Bridge {
       editIntervalMs: cfg.stream.editIntervalMs,
       showTools: cfg.stream.showTools,
       format: cfg.stream.format ?? "rich",
+      diagnostics: () => this.cfg.ui?.diagnostics === true,
       onThreadGone: (sessionID) => {
         this.store.clearThread(sessionID);
         log.warn(`topic for ${sessionID.slice(0, 16)} was deleted; binding cleared`);
@@ -256,6 +262,8 @@ export class Bridge {
     this.forms.clear();
     for (const state of this.titles.values()) if (state.timer) clearTimeout(state.timer);
     this.titles.clear();
+    for (const timer of this.renameTimers.values()) clearTimeout(timer);
+    this.renameTimers.clear();
     this.unsubscribe?.();
     this.background.stop();
     await this.observer.shutdown();
@@ -601,7 +609,7 @@ export class Bridge {
    */
   private async maybeObserve(sessionID: string): Promise<boolean> {
     if (this.observer.has(sessionID)) return true;
-    if (this.streamer.has(sessionID)) return false;
+    if (this.streamer.hasBlock(sessionID)) return false;
     const targets = this.observeTargets();
     if (!targets.length) return false;
     const session = await this.oc.getSession(sessionID).catch(() => undefined);
@@ -693,6 +701,7 @@ export class Bridge {
     });
     this.store.bindThread(topic.message_thread_id, session.id);
     this.store.upsert({ id: session.id, title: session.title, chatId: this.cfg.topicsChatId, threadId: topic.message_thread_id });
+    this.rememberTopicName(session.id, title);
     await this.bot.api.sendMessage(this.cfg.topicsChatId, `🆕 Сессия <code>${session.id}</code>`, {
       parse_mode: "HTML",
       message_thread_id: topic.message_thread_id,
@@ -917,6 +926,7 @@ export class Bridge {
         sessionID = session.id;
         this.store.bindThread(topicID, session.id);
         this.store.upsert({ id: session.id, title: session.title, chatId, threadId: topicID });
+        this.rememberTopicName(session.id, title);
       } catch (error) {
         // Only topic/session creation may fall back to the chat session; a failed
         // prompt inside an already-created topic must not create a duplicate.
@@ -1046,6 +1056,11 @@ export class Bridge {
       await this.oc.updateSession(sessionID, { title: name });
       this.store.setTitle(sessionID, name);
       this.appliedTitles.set(sessionID, name);
+      const state = this.titles.get(sessionID);
+      if (state) {
+        state.base = name;
+        state.appliedName = name;
+      }
       log.info(`topic renamed → session: ${name}`);
     } catch (error) {
       log.warn("session rename failed:", (error as Error).message);
@@ -1259,6 +1274,8 @@ export class Bridge {
 
     const sessionID = String(event.data?.sessionID ?? "");
     if (!sessionID) return;
+    // Turn id of this event: the assistant message id (turn keying + diagnostics).
+    const turnHint = assistantMessageIDOf(event.data);
 
     switch (event.type) {
       case "session.inbox.enqueued":
@@ -1272,7 +1289,7 @@ export class Bridge {
           const meta = await this.sessionMeta(sessionID);
           if (meta.parentID) {
             const agent = meta.agent || "subagent";
-            const placement = subagentPlacement(this.cfg.showSubagents, this.streamer.has(meta.parentID));
+            const placement = subagentPlacement(this.cfg.showSubagents, this.streamer.hasBlock(meta.parentID));
             this.childSessions.set(sessionID, { parentID: meta.parentID, agent, placement });
             if (placement === "inline") {
               this.streamer.subagentStarted(meta.parentID, agent);
@@ -1304,30 +1321,34 @@ export class Bridge {
         // arrived after `execution.started` (volatile SSE).
         await this.mirrorLatestExternal(sessionID);
         if (signal.aborted) return;
-        if (!(await this.maybeObserve(sessionID))) await this.ensureStream(sessionID, true);
+        if (!(await this.maybeObserve(sessionID))) {
+          // `execution.started` is the turn boundary; `text.started` only binds
+          // the turn to its assistant message (never opens a second message).
+          await this.ensureStream(sessionID, event.type === "session.execution.started", turnHint);
+        }
         break;
       case "session.text.delta": {
-        if (!this.streamer.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID);
-        this.streamer.append(sessionID, String(event.data.delta ?? ""));
+        if (!this.streamer.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID, false, turnHint);
+        this.streamer.append(sessionID, String(event.data.delta ?? ""), turnHint);
         break;
       }
       case "session.text.ended": {
         const text = String(event.data.text ?? "");
-        if (text) this.streamer.setText(sessionID, text);
+        if (text) this.streamer.setText(sessionID, text, turnHint);
         break;
       }
       case "session.tool.called": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
         this.observer.toolCalled(sessionID);
-        this.streamer.toolCalled(sessionID, callID, String(event.data.name ?? "tool"), event.data.input);
+        this.streamer.toolCalled(sessionID, callID, String(event.data.name ?? "tool"), event.data.input, turnHint);
         break;
       }
       case "session.tool.success":
       case "session.tool.failed": {
         const callID = String(event.data.id ?? event.data.callID ?? "");
-        this.streamer.toolFinished(sessionID, callID, event.type === "session.tool.success");
+        this.streamer.toolFinished(sessionID, callID, event.type === "session.tool.success", turnHint);
         if (event.type === "session.tool.failed" && isBlockedToolFailure(event.data.error ?? event.data)) {
-          this.streamer.blockedTool(sessionID);
+          this.streamer.blockedTool(sessionID, turnHint);
         }
         if (event.type === "session.tool.success") void this.relayAgentFiles(sessionID);
         break;
@@ -1351,6 +1372,7 @@ export class Bridge {
         if (await this.finishObservation(sessionID, event)) break;
         if (!this.streamer.has(sessionID)) break;
         const elapsed = this.streamer.elapsedMs(sessionID);
+        const turnId = this.streamer.turnOf(sessionID);
         const type = event.type.replace("session.execution.", "");
         const reason = turnReason({
           type,
@@ -1368,9 +1390,11 @@ export class Bridge {
           durationMs: stats.duration ?? elapsed,
           tps: stats.tps,
           contextTokens: stats.contextTokens,
+          diagnostics: this.cfg.ui?.diagnostics === true,
+          turnId,
         });
         if (signal.aborted) break;
-        await this.streamer.end(sessionID, footer);
+        await this.streamer.end(sessionID, footer, turnId);
         await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
         log.info(`turn ${type} ${sessionID.slice(0, 16)}: ${reason ?? "ok"}${blocked ? ` · blocked=${blocked}` : ""}`);
@@ -1400,24 +1424,14 @@ export class Bridge {
       }
       case "session.renamed": {
         const title = String(event.data.title ?? "").trim();
+        // Every received rename is logged: it used to be invisible in the log.
+        log.info(`session renamed evt: ${title || "(empty)"} ${sessionID.slice(0, 16)}`);
         if (!title) break;
-        if (this.appliedTitles.get(sessionID) === title) break;
-        const target = this.targetFor(sessionID);
-        const state = this.titles.get(sessionID);
-        if (state) state.base = title;
-        this.store.setTitle(sessionID, title);
-        // Renames are cosmetic and opt-in: icon mode must never touch the name.
-        if (!target?.threadId || normalizeTitleStatus(this.cfg.ui?.titleStatus) !== "rename") break;
-        try {
-          await this.bot.api.editForumTopic(target.chatId, target.threadId, {
-            name: titleWithMarker(title, state?.phase ?? "idle"),
-          });
-          if (state) state.lastRename = Date.now();
-          this.appliedTitles.set(sessionID, title);
-          log.info(`session renamed → topic: ${title}`);
-        } catch (error) {
-          log.warn("topic rename failed:", (error as Error).message);
-        }
+        const state = this.titleState(sessionID, title);
+        state.base = title;
+        // state.json follows the session title even without a chat binding.
+        this.store.upsert({ id: sessionID, title });
+        await this.syncTopicTitle(sessionID, title);
         break;
       }
       default:
@@ -1425,7 +1439,7 @@ export class Bridge {
     }
   }
 
-  private async ensureStream(sessionID: string, newTurn = false): Promise<void> {
+  private async ensureStream(sessionID: string, newTurn = false, hint?: string): Promise<void> {
     if (this.streamer.has(sessionID) || this.observer.has(sessionID)) return;
     // One fetch covers both checks: child sessions never get a block, and a
     // late event from a finished turn must not create an orphan placeholder
@@ -1436,8 +1450,8 @@ export class Bridge {
     if (!busy) return;
     const target = this.targetFor(sessionID);
     if (!target) return;
-    await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID), newTurn);
-    log.info(`attached to running session ${sessionID.slice(0, 16)}`);
+    const turnId = await this.streamer.begin(sessionID, target, await this.modelLabel(sessionID), newTurn, hint);
+    if (turnId) log.info(`attached to running session ${sessionID.slice(0, 16)} turn=${turnId.slice(0, 12)}`);
   }
 
   private async sessionMeta(sessionID: string): Promise<{ parentID?: string | null; agent?: string; title?: string }> {
@@ -1771,6 +1785,71 @@ export class Bridge {
 
   // ------------------------------------------------------------------ titles
 
+  /** Title state of a session; created lazily from the event/store title. */
+  private titleState(sessionID: string, title?: string): TelegramTitle {
+    let state = this.titles.get(sessionID);
+    if (!state) {
+      const base = (title || this.store.session[sessionID]?.title || sessionID.slice(0, 12)).trim();
+      state = { base, phase: "idle", lastRename: 0, version: 0, icon: null };
+      this.titles.set(sessionID, state);
+    }
+    return state;
+  }
+
+  /**
+   * Keeps the bound topic name in sync with `session.renamed`.
+   *
+   * - the General chat and chats without a topic are never renamed;
+   * - an unchanged name is skipped (no "renamed the topic" service messages);
+   * - `titleStatus: rename` keeps the ⏳/✅ marker, icon mode keeps the icon
+   *   untouched (`editForumTopic` with `name` only never resets it);
+   * - Telegram allows ~1 rename per 60 s, so a change inside the window is
+   *   deferred instead of dropped.
+   */
+  private async syncTopicTitle(sessionID: string, title: string): Promise<void> {
+    if (this.appliedTitles.get(sessionID) === title) return; // our own echo
+    const target = this.targetFor(sessionID);
+    if (!target?.threadId || target.threadId <= 1) return; // General is never renamed
+    const mode = normalizeTitleStatus(this.cfg.ui?.titleStatus);
+    const state = this.titleState(sessionID, title);
+    const name = syncTitleName(title, mode, state.phase);
+    if (sameTitleName(state.appliedName, name)) return; // already on the topic
+    const wait = renameWait(state.lastRename);
+    if (wait > 0) {
+      this.deferTopicRename(sessionID, title, wait);
+      return;
+    }
+    await this.applyTopicRename(sessionID, title, name);
+  }
+
+  private deferTopicRename(sessionID: string, title: string, wait: number): void {
+    if (this.renameTimers.has(sessionID)) return;
+    log.info(`topic rename deferred ${Math.ceil(wait / 1000)}s for ${sessionID.slice(0, 16)}`);
+    const timer = setTimeout(() => {
+      this.renameTimers.delete(sessionID);
+      void this.syncTopicTitle(sessionID, title).catch((error) =>
+        log.warn("topic rename retry failed:", (error as Error).message),
+      );
+    }, wait + 500);
+    timer.unref?.();
+    this.renameTimers.set(sessionID, timer);
+  }
+
+  private async applyTopicRename(sessionID: string, title: string, name: string): Promise<void> {
+    const target = this.targetFor(sessionID);
+    if (!target?.threadId) return;
+    try {
+      await this.bot.api.editForumTopic(target.chatId, target.threadId, { name });
+      const state = this.titleState(sessionID, title);
+      state.lastRename = Date.now();
+      state.appliedName = name;
+      this.appliedTitles.set(sessionID, title);
+      log.info(`session renamed → topic: ${title}`);
+    } catch (error) {
+      log.warn("topic rename failed:", (error as Error).message);
+    }
+  }
+
   /**
    * Turn status on a forum topic.
    *
@@ -1918,6 +1997,8 @@ export class Bridge {
     const clean = titleWithMarker(name, "idle");
     try {
       await this.bot.api.editForumTopic(target.chatId, target.threadId, { name: clean });
+      const state = this.titles.get(sessionID);
+      if (state) state.appliedName = clean;
       return true;
     } catch (error) {
       log.debug("topic title:", (error as Error).message);
@@ -2267,11 +2348,20 @@ export class Bridge {
 
   // ------------------------------------------------------------------ helpers
 
+  /** Remembers the name a freshly created topic already carries. */
+  private rememberTopicName(sessionID: string, title: string): void {
+    const clean = String(title ?? "").replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    this.appliedTitles.set(sessionID, clean);
+    this.titleState(sessionID, clean).appliedName = titleWithMarker(clean, "idle");
+  }
+
   private async openTopicForSession(chatId: number, session: OcSession): Promise<{ threadId: number; title: string }> {
     const title = (session.title || session.id.slice(0, 12)).replace(/\s+/g, " ").trim().slice(0, 60) || "OpenCode";
     const topic = await this.bot.api.createForumTopic(chatId, title);
     this.store.bindThread(topic.message_thread_id, session.id);
     this.store.upsert({ id: session.id, title: session.title, chatId, threadId: topic.message_thread_id });
+    this.rememberTopicName(session.id, title);
     await this.bot.api.sendMessage(
       chatId,
       `🔗 <b>${escape(session.title)}</b>\n<code>${session.id}</code>\n📁 <code>${escape(session.location?.directory ?? "?")}</code>\n\n` +
