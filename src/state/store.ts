@@ -152,6 +152,24 @@ export class Store {
     return {};
   }
 
+  /**
+   * Every Telegram chat the session is bound to: topics (thread id only), private
+   * chats and the record left by the last binding. Callers resolve a topic to the
+   * configured forum chat and deduplicate, so one prompt is mirrored once per chat.
+   */
+  telegramBindings(sessionID: string): Array<{ chatId?: number; threadId?: number }> {
+    const result: Array<{ chatId?: number; threadId?: number }> = [];
+    for (const [threadId, id] of Object.entries(this.data.topics)) {
+      if (id === sessionID) result.push({ threadId: Number(threadId) });
+    }
+    for (const [chatId, id] of Object.entries(this.data.chats)) {
+      if (id === sessionID) result.push({ chatId: Number(chatId) });
+    }
+    const rec = this.data.sessions[sessionID];
+    if (rec) result.push({ chatId: rec.chatId, threadId: rec.threadId });
+    return result;
+  }
+
   // --------------------------------------------------------------- discord
 
   byDiscordThread(threadId: string): string | undefined {

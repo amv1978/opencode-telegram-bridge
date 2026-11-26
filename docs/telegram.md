@@ -149,12 +149,17 @@ DeepSeek V4.1 Flash · ⏱ 1m 23s · ⚡ 197.8 tok/s · 🧠 531k
 ### One message per turn
 
 Streams are keyed by `(sessionID, turnId)`, where `turnId` is the assistant message
-id of the turn (`session.text.started/delta`, `session.execution.started`). A new
-prompt always opens a **new** message: a previous answer is never edited, even when
-its block is still on screen because subagents are finishing, and a retried turn
-never reuses an old message. The mirrored user message (text + media) is posted
-first, then the answer. Turn state is dropped at the end of the turn, and a safety
-sweep removes anything older than an hour.
+id carried by the event (`session.text.started/delta/ended`,
+`session.execution.started/succeeded/failed/interrupted`). One assistant message =
+one answer: a new id always opens a **new** message, while a late event for an
+already ended id is ignored, so it cannot edit the previous answer. End events are
+routed by the id they carry (never by a single per-session pointer); if the event
+names a different message than the live stream, the mismatch is logged and the
+newest live stream is finalized instead of the end being lost. A previous answer
+is never edited, even when its block is still on screen because subagents are
+finishing, and a retried turn never reuses an old message. The mirrored user
+message (text + media) is posted first, then the answer. Turn state is dropped at
+the end of the turn, and a safety sweep removes anything older than an hour.
 
 With `ui.diagnostics: true` the stats line ends with the short turn id
 (`#t4f2a91`) and the log gets `turn start` / `turn end` lines with the turn and
@@ -259,12 +264,19 @@ same final state, so the chat never shows a stale question. Forms created before
 the bridge started (or with a missed ephemeral event) are picked up by a 20 s
 poll of bound sessions.
 
-## Echo protection
+## Echo protection and mirror dedupe
 
 The bridge mirrors a prompt typed in Desktop/TUI into the bound chat (as a quote).
 To keep that message from going back into the model, the text is remembered for
 10 minutes (last 20 per chat) and ignored on a match. Prompts with
 `metadata.source = "telegram"` are not mirrored at all.
+
+Mirror dedupe is shared by Telegram and Discord and keyed by
+`sessionID + hash(normalized text) + target` for 10 minutes; the item id is only a
+fallback for prompts without text. The SSE inbox id and the history message id
+therefore address one prompt. A session bound to a topic, a private chat and a
+Discord thread gets exactly **one copy per target**: replays are suppressed per
+target, and a failed send releases its claim so the next event can retry.
 
 ## Media and voice
 
@@ -301,6 +313,9 @@ code blocks are closed and reopened at part boundaries.
 - The bot cannot send messages as a human or read chat history.
 - In a group the bot receives messages either as an administrator or with privacy
   mode disabled (BotFather → `/setprivacy` → Disable, then re-add to the group).
-- Edits are rate-limited: on 429 the bridge waits for `retry_after` and retries.
+- Edits are rate-limited: on 429 the bridge waits for `retry_after` and retries
+  the same send/edit (up to 3 attempts). After the third failure the loss is
+  logged, counted in `/api/state.delivery` (`retries`, `lost`) and retried by the
+  next flush tick instead of being dropped.
 - The bot cannot download files larger than 20 MB — a Telegram limitation, not the
   bridge's.

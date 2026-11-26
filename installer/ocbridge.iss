@@ -4,7 +4,7 @@
 
 #define AppName "OpenCode Telegram Bridge"
 #ifndef AppVersion
-  #define AppVersion "0.8.5"
+  #define AppVersion "0.8.6"
 #endif
 #define AppExe "ocbridge.exe"
 

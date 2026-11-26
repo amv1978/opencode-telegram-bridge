@@ -123,11 +123,21 @@ current one through `PATCH /api/session/{id}` (auto allows everything, plan deni
   the 5-minute window is attempted when it opens. `ui.titleStatus` applies only to
   Telegram.
 - **One message per turn**: streams are keyed by `(sessionID, turnId)`, where
-  `turnId` is the assistant message id of the turn. A new prompt always opens a new
-  message — a finished answer is never edited by the next turn, even while its block
-  is still alive for subagents — and a deferred mirror/retry never reuses an old
-  message. With `ui.diagnostics: true` the stats line ends with `#t<turnId>` and the
-  log records `turn start`/`turn end` with the turn and message id (off by default).
+  `turnId` is the assistant message id carried by the event. One assistant message =
+  one answer: a new id opens a new message, a late event for an ended id is
+  ignored, and an end event is routed by the id it carries (a mismatch with the live
+  stream is logged and the newest live stream is finalized, never dropped). A
+  finished answer is never edited by the next turn, even while its block is still
+  alive for subagents, and a deferred mirror/retry never reuses an old message. With
+  `ui.diagnostics: true` the stats line ends with `#t<turnId>` and the log records
+  `turn start`/`turn end` with the turn and message id (off by default).
+- **429**: a rate-limited send/edit waits for `retry_after` and retries the same
+  call up to 3 times; after that the loss is logged, counted in
+  `/api/state.delivery` and retried by the next tick.
+- **Mirror dedupe**: prompts from TUI/Desktop are deduplicated by
+  `sessionID + hash(normalized text) + target` for 10 minutes with a ledger shared
+  with Telegram, so a session bound to a topic, a private chat and this thread gets
+  exactly one copy per target.
 - **Subagents**: a child session (`parentID`) does not open a separate thread. With
   an active parent block it adds an inline line — `🧩 explore · 12s`, then `✓`/`✗`
   (`🧩 general · 1m 03s ✓`). At most 2 lines, repeats collapse (`×2`), finished ones
@@ -188,6 +198,9 @@ current one through `PATCH /api/session/{id}` (auto allows everything, plan deni
   there is never a double `> >`. The text then goes into the prompt.
 - **Mirror**: prompts from TUI/Desktop (`session.inbox.enqueued` without
   `metadata.source === "discord"`) are posted in the thread as a quote with `👤`.
+  Dedupe is by `sessionID + hash(normalized text) + target` for 10 minutes, shared
+  with Telegram, so topic + private chat + this thread get one copy each and a
+  replay (inbox id vs message id) is suppressed.
 - **Subagents** are shown as `🧩` lines in the parent block, as background cards
   when the parent answer already finished, and as a quoted report; there is no
   separate thread for a child session.

@@ -2,6 +2,7 @@ import type { Client, Message, MessageCreateOptions } from "discord.js";
 import { log } from "../log.ts";
 import { sanitizeModelName, UNKNOWN_MODEL } from "../model.ts";
 import { assignChunk, planChunks, TurnGate } from "../order.ts";
+import { RETRY_ATTEMPTS, RetryCounters, errorText, retryAfterMs, withRetry } from "../retry.ts";
 import { statusMarkdown, type StatusItem } from "../status.ts";
 import { TypingPulse } from "../typing.ts";
 import { DISCORD_CHUNK, chunkText, formatDuration, toDiscordMarkdown } from "./render.ts";
@@ -115,11 +116,34 @@ export class DiscordStreamer {
   /** `sessionID:messageId` → turn id; a message must never serve two turns. */
   private readonly messageTurns = new Map<string, string>();
   private sweepTimer?: ReturnType<typeof setInterval>;
+  /** 429 retries and lost sends/edits, surfaced in `/api/state.delivery`. */
+  readonly stats = new RetryCounters();
 
   constructor(
     private readonly client: Client,
     private readonly options: DiscordStreamOptions,
   ) {}
+
+  retryStats(): { retries: number; lost: number } {
+    return this.stats.snapshot();
+  }
+
+  /** One Discord call with bounded 429 retries (same send/edit is repeated). */
+  private withApi<T>(label: string, call: () => Promise<T>): Promise<T> {
+    return withRetry(label, call, {
+      retryAfterMs,
+      onRetry: (info) => {
+        this.stats.recordRetry();
+        log.warn(
+          `discord ${label} 429, retry ${info.attempt}/${RETRY_ATTEMPTS} after ${Math.round(info.waitMs / 1000)}s`,
+        );
+      },
+      onLost: (error) => {
+        this.stats.recordLoss();
+        log.error(`discord ${label} lost after ${RETRY_ATTEMPTS} attempts: ${errorText(error)}`);
+      },
+    });
+  }
 
   private diagnostics(): boolean {
     try {
@@ -138,6 +162,14 @@ export class DiscordStreamer {
   has(sessionID: string): boolean {
     const turn = this.turns.current(sessionID);
     return Boolean(turn && this.states.has(turnKey(sessionID, turn.turnId)));
+  }
+
+  /** Any stream of the session that has not been finalized yet. */
+  hasLive(sessionID: string): boolean {
+    for (const state of this.states.values()) {
+      if (state.sessionID === sessionID && !state.finished) return true;
+    }
+    return false;
   }
 
   /** Turn id of the current stream (diagnostics and footers). */
@@ -163,6 +195,10 @@ export class DiscordStreamer {
 
   async begin(sessionID: string, channelId: string, model?: string, newTurn = false, hint?: string): Promise<string | undefined> {
     const turn = this.beginTurn(sessionID, newTurn, hint);
+    if (turn.stale) {
+      log.info(`discord late event for an ended turn ignored for ${sessionID.slice(0, 16)} (${turn.turnId})`);
+      return undefined;
+    }
     const key = turnKey(sessionID, turn.turnId);
     const existing = this.states.get(key);
     if (existing) return existing.turnId;
@@ -204,7 +240,9 @@ export class DiscordStreamer {
     this.models.set(sessionID, state.model);
     this.states.set(key, state);
     this.ensureSweep();
-    const message = await channel.send({ content: PLACEHOLDER, allowedMentions: { parse: [] } });
+    const message = await this.withApi("send", () =>
+      channel.send({ content: PLACEHOLDER, allowedMentions: { parse: [] } }),
+    );
     state.messageIds.push(message.id);
     state.rendered.push(PLACEHOLDER);
     state.delivered = true;
@@ -275,11 +313,29 @@ export class DiscordStreamer {
     }
   }
 
-  private resolveTurn(sessionID: string, hint?: string): { turnId: string; key: string; state?: State } {
+  /**
+   * Binds an event to its turn and returns that turn's stream, if any.
+   * A new id with no stream falls back to the session's live stream, so a later
+   * step of one answer never opens a second message.
+   */
+  private resolveTurn(sessionID: string, hint?: string): { turnId: string; key: string; state?: State; stale: boolean } {
     const turn = this.turns.bind(sessionID, hint);
+    if (turn.stale) {
+      return { turnId: turn.turnId, key: turnKey(sessionID, turn.turnId), state: undefined, stale: true };
+    }
     if (turn.adoptedFrom) this.rekey(sessionID, turn.adoptedFrom, turn.turnId);
     const key = turnKey(sessionID, turn.turnId);
-    return { turnId: turn.turnId, key, state: this.states.get(key) };
+    let state = this.states.get(key);
+    if (!state) {
+      const live = this.liveState(sessionID);
+      if (live) {
+        log.info(
+          `discord event turn ${turn.turnId} routed to live stream ${live.turnId} for ${sessionID.slice(0, 16)}`,
+        );
+        state = live;
+      }
+    }
+    return { turnId: turn.turnId, key, state, stale: false };
   }
 
   private current(sessionID: string): State | undefined {
@@ -321,7 +377,11 @@ export class DiscordStreamer {
   }
 
   append(sessionID: string, delta: string, hint?: string): void {
-    const { key, state } = this.resolveTurn(sessionID, hint);
+    const { key, state, stale } = this.resolveTurn(sessionID, hint);
+    if (stale) {
+      log.debug(`discord late delta for an ended turn ignored ${sessionID.slice(0, 16)} (${hint ?? "?"})`);
+      return;
+    }
     if (!state) {
       if (!delta) return;
       if (this.closed.has(key)) return; // late delta of a finished turn
@@ -330,14 +390,14 @@ export class DiscordStreamer {
       this.pendingText.set(key, { text: text.slice(-200_000), at: Date.now() });
       return;
     }
-    if (!delta) return;
+    if (!delta || state.finished) return;
     state.text += delta;
     this.schedule(state);
   }
 
   setText(sessionID: string, text: string, hint?: string): void {
-    const { key, state } = this.resolveTurn(sessionID, hint);
-    if (!state || !text) return;
+    const { state, stale } = this.resolveTurn(sessionID, hint);
+    if (stale || !state || !text || state.finished) return;
     state.text = text;
     this.schedule(state);
   }
@@ -430,13 +490,31 @@ export class DiscordStreamer {
    * Parent turn ended. With children still running the block stays alive
    * (footer included) until the last child finishes and its line fades.
    * The turn itself ends immediately: the next prompt opens a new message.
+   *
+   * `turnId` is the assistant message id carried by the end event; a mismatch
+   * is logged and the newest live stream is finalized instead of returning.
    */
   async end(sessionID: string, footer?: string, turnId?: string): Promise<string | undefined> {
-    const id = turnId ?? this.turns.current(sessionID)?.turnId;
-    const key = id ? turnKey(sessionID, id) : undefined;
-    const state = key ? this.states.get(key) : undefined;
-    this.turns.end(sessionID, id);
-    if (!state || !key) return id;
+    const exact = turnId ? this.states.get(turnKey(sessionID, turnId)) : undefined;
+    if (exact?.finished) {
+      if (footer && exact.awaiting) exact.footer = footer;
+      this.turns.end(sessionID, turnId);
+      log.info(`discord duplicate turn end ignored for ${sessionID.slice(0, 16)} (${turnId})`);
+      return exact.turnId;
+    }
+    const state = exact ?? this.liveState(sessionID);
+    const effective = state?.turnId ?? turnId ?? this.turns.current(sessionID)?.turnId;
+    this.turns.end(sessionID, turnId);
+    if (!state) {
+      log.warn(`discord finalize: no live stream for ${sessionID.slice(0, 16)} turn=${turnId ?? "?"} (footer dropped)`);
+      return effective;
+    }
+    if (turnId && state.turnId !== turnId) {
+      log.warn(
+        `discord turn end mismatch ${sessionID.slice(0, 16)}: event turn=${turnId} stream=${state.turnId}; finalizing stream`,
+      );
+    }
+    this.turns.end(sessionID, state.turnId);
     state.finished = true;
     if (state.timer) {
       clearTimeout(state.timer);
@@ -457,10 +535,25 @@ export class DiscordStreamer {
     return state.turnId;
   }
 
+  /** Newest stream of the session that has not been finalized. */
+  private liveState(sessionID: string): State | undefined {
+    let found: State | undefined;
+    for (const state of this.states.values()) {
+      if (state.sessionID !== sessionID || state.finished) continue;
+      if (!found || state.startedAt >= found.startedAt) found = state;
+    }
+    return found;
+  }
+
   /** Delivers the final message once and removes the state. */
   private async finalize(state: State, footer?: string): Promise<void> {
     const key = this.keyOf(state);
-    if (this.states.get(key) !== state) return;
+    if (this.states.get(key) !== state) {
+      log.warn(
+        `discord finalize: stream ${state.sessionID.slice(0, 16)} turn=${state.turnId} was already replaced or removed; skipped`,
+      );
+      return;
+    }
     if (state.finalizeTimer) {
       clearTimeout(state.finalizeTimer);
       state.finalizeTimer = undefined;
@@ -495,12 +588,14 @@ export class DiscordStreamer {
         const existing = [...state.messageIds].reverse().find((id) => Boolean(id));
         if (channel && existing) {
           // Reuse the message that already carries part of the answer.
-          const message = await channel.messages.fetch(existing);
-          await message.edit({ content: finalText, allowedMentions: { parse: [] } });
+          await this.withApi("edit", async () => {
+            const message = await channel.messages.fetch(existing);
+            await message.edit({ content: finalText, allowedMentions: { parse: [] } });
+          });
           log.info(`discord final delivery recovered by editing ${existing} for ${state.sessionID.slice(0, 16)}`);
         } else if (channel) {
           for (const chunk of chunkText(finalText)) {
-            await channel.send({ content: chunk, allowedMentions: { parse: [] } });
+            await this.withApi("send", () => channel.send({ content: chunk, allowedMentions: { parse: [] } }));
           }
           log.info(`discord final delivery recovered as a new message for ${state.sessionID.slice(0, 16)}`);
         }
@@ -679,7 +774,9 @@ export class DiscordStreamer {
         if (!chunk) continue;
         const messageId = state.messageIds[step.index];
         if (messageId === undefined) {
-          const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
+          const message = await this.withApi("send", () =>
+            channel.send({ content: chunk, allowedMentions: { parse: [] } }),
+          );
           assignChunk(state.messageIds, step.index, message.id);
           state.rendered[step.index] = chunk;
           this.noteMessage(state.sessionID, state.turnId, message.id);
@@ -688,8 +785,10 @@ export class DiscordStreamer {
         // Always edit: elapsed strings change every tick, so a same-content
         // guard would leave the live block frozen.
         try {
-          const message = await channel.messages.fetch(messageId);
-          await message.edit({ content: chunk, allowedMentions: { parse: [] } });
+          await this.withApi("edit", async () => {
+            const message = await channel.messages.fetch(messageId);
+            await message.edit({ content: chunk, allowedMentions: { parse: [] } });
+          });
           state.rendered[step.index] = chunk;
         } catch (error) {
           const code = (error as { code?: number }).code;
@@ -697,15 +796,13 @@ export class DiscordStreamer {
             // Message or channel was deleted mid-stream: send this chunk afresh.
             state.messageIds[step.index] = undefined;
             state.rendered[step.index] = undefined;
-            const message = await channel.send({ content: chunk, allowedMentions: { parse: [] } });
+            const message = await this.withApi("send", () =>
+              channel.send({ content: chunk, allowedMentions: { parse: [] } }),
+            );
             assignChunk(state.messageIds, step.index, message.id);
             state.rendered[step.index] = chunk;
             this.noteMessage(state.sessionID, state.turnId, message.id);
             continue;
-          }
-          if (isRateLimited(error)) {
-            await waitForRateLimit(error);
-            return; // the next 2.5 s tick retries
           }
           throw error;
         }
@@ -734,20 +831,6 @@ function formatSubagentElapsed(ms: number): string {
 /** At least one child is running (not counting the fade-out window). */
 function hasActiveSubagents(state: { subagents: SubagentState[] }): boolean {
   return state.subagents.some((entry) => entry.state === "running");
-}
-
-function isRateLimited(error: unknown): boolean {
-  const value = error as { status?: number; httpStatus?: number; name?: string; code?: number };
-  return value?.status === 429 || value?.httpStatus === 429 || value?.name === "RateLimitError" || value?.code === 429;
-}
-
-/** Waits `retry_after` from a Discord 429; the next tick retries the edit. */
-async function waitForRateLimit(error: unknown): Promise<void> {
-  const value = error as { retryAfter?: number; rawError?: { retry_after?: number } };
-  const raw = value?.rawError?.retry_after ?? value?.retryAfter ?? 2.5;
-  const ms = Math.max(1000, raw > 100 ? raw : raw * 1000);
-  log.warn(`discord 429, retry after ${Math.round(ms / 1000)}s`);
-  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Human label for a tool call (`edit bot.ts`, `bash npm test`). Copied from Telegram. */

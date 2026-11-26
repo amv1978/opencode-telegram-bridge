@@ -89,6 +89,8 @@ export interface Snapshot {
   hiddenSessions: string[];
   /** Doctor warnings (stalled prompts, etc.) shown in the panel. */
   warnings: string[];
+  /** Delivery counters: 429 retries, lost sends/edits, suppressed mirror replays. */
+  delivery: { retries: number; lost: number; duplicatesSuppressed: number };
   update: ReturnType<Updater["snapshot"]>;
 }
 
@@ -221,6 +223,7 @@ export class App {
       sessions: [],
       hiddenSessions: this.store.hiddenSessions(),
       warnings: this.bridge?.warnings() ?? [],
+      delivery: this.deliveryStats(),
       update: this.updater.snapshot(),
     };
   }
@@ -403,6 +406,17 @@ export class App {
 
   budgetSnapshot(): BudgetSnapshot | undefined {
     return this.budget?.snapshot();
+  }
+
+  /** Telegram + Discord delivery counters, shown in `/api/state.delivery`. */
+  deliveryStats(): { retries: number; lost: number; duplicatesSuppressed: number } {
+    const tg = this.bridge?.deliveryStats() ?? { retries: 0, lost: 0, duplicatesSuppressed: 0 };
+    const dc = this.discord?.deliveryStats() ?? { retries: 0, lost: 0 };
+    return {
+      retries: tg.retries + dc.retries,
+      lost: tg.lost + dc.lost,
+      duplicatesSuppressed: tg.duplicatesSuppressed,
+    };
   }
 
   /** The web server may fall back when the configured port is busy. */

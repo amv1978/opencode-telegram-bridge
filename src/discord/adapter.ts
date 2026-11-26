@@ -72,7 +72,7 @@ import {
 } from "../forms.ts";
 import pkg from "../../package.json";
 import { runEvent } from "../events.ts";
-import { mirrorKey, MirrorLedger } from "../order.ts";
+import { mirrorKey, mirrorTargetKey, sharedMirrorLedger } from "../order.ts";
 import { BackgroundSubagents, normalizeSubagentMode, subagentPlacement, type SubagentPlacement } from "../subagents.ts";
 import { statusReport, statusReportMarkdown, type BridgeRuntimeInfo } from "../status.ts";
 
@@ -181,9 +181,8 @@ export class DiscordBridge {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempt = 0;
   private eventChain: Promise<void> = Promise.resolve();
-  private readonly mirrorLedger = new MirrorLedger();
+  private readonly mirrorLedger = sharedMirrorLedger;
   private readonly mirroredAt = new Map<string, number>();
-  private readonly lastMirror = new Map<string, { text: string; at: number }>();
   /** Prompts this bridge sent itself, so history never mirrors them back. */
   private readonly selfPrompts = new Map<string, { text: string; at: number }[]>();
   private unsubscribe: (() => void) | undefined;
@@ -244,6 +243,11 @@ export class DiscordBridge {
 
   get status(): { state: DiscordState; error: string; username: string; retryAt: number; attempt: number } {
     return { state: this.state, error: this.error, username: this.username, retryAt: this.retryAt, attempt: this.attempt };
+  }
+
+  /** 429 retries and lost sends/edits for `/api/state.delivery`. */
+  deliveryStats(): { retries: number; lost: number } {
+    return this.streamer?.retryStats() ?? { retries: 0, lost: 0 };
   }
 
   async start(): Promise<string> {
@@ -1104,7 +1108,7 @@ export class DiscordBridge {
         await this.ensureStream(sessionID, false, turnHint);
         break;
       case "session.text.delta": {
-        if (!this.streamer?.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID, false, turnHint);
+        if (!this.streamer?.hasLive(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID, false, turnHint);
         this.streamer?.append(sessionID, String(event.data.delta ?? ""), turnHint);
         break;
       }
@@ -1145,9 +1149,10 @@ export class DiscordBridge {
           break;
         }
         if (await this.finishObservation(sessionID, event)) break;
-        if (!this.streamer?.has(sessionID)) break;
+        // Route the end by the assistant id carried by the event (not a pointer).
+        if (!this.streamer?.hasBlock(sessionID)) break;
         const elapsed = this.streamer.elapsedMs(sessionID);
-        const turnId = this.streamer.turnOf(sessionID);
+        const turnId = turnHint ?? this.streamer.turnOf(sessionID);
         const type = event.type.replace("session.execution.", "");
         const reason = turnReason({
           type,
@@ -1171,7 +1176,7 @@ export class DiscordBridge {
         const formatted =
           reasonLine && statsLine ? `${reasonLine}\n${italicLine(statsLine)}` : italicLine(footer) || footer;
         if (signal.aborted) break;
-        await this.streamer.end(sessionID, formatted || undefined, turnId);
+        await this.streamer.end(sessionID, formatted || undefined, turnHint);
         await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
         log.info(`discord turn ${type} ${sessionID.slice(0, 16)}: ${reason ?? "ok"}${blocked ? ` · blocked=${blocked}` : ""}`);
@@ -1213,7 +1218,7 @@ export class DiscordBridge {
   }
 
   private async ensureStream(sessionID: string, newTurn = false, hint?: string): Promise<void> {
-    if (this.streamer?.has(sessionID) || this.observer.has(sessionID)) return;
+    if (this.streamer?.hasLive(sessionID) || this.observer.has(sessionID)) return;
     // Same guard as Telegram: late events from a finished turn must not create
     // an orphan placeholder that never receives the final answer.
     const session = await this.oc.getSession(sessionID).catch(() => undefined);
@@ -1244,18 +1249,16 @@ export class DiscordBridge {
     }
     const target = this.targetFor(sessionID);
     if (!target) return;
-    const previous = this.lastMirror.get(sessionID);
-    if (text && previous && previous.text === text && Date.now() - previous.at < 20_000) {
-      log.info(`discord mirror duplicate skipped → ${sessionID.slice(0, 16)}`);
+    const key = mirrorTargetKey({ kind: "dc", chatId: target });
+    // Shared text-hash ledger: the history fallback and the SSE event carry
+    // different ids but the same prompt, so the second one is suppressed.
+    if (!this.mirrorLedger.claim(sessionID, text, key, Date.now(), mirrorKey(item))) {
+      log.info(`discord mirror duplicate skipped (${key}) → ${sessionID.slice(0, 16)}`);
       return;
     }
-    if (!this.mirrorLedger.claim(sessionID, item)) {
-      log.info(`discord mirror replay skipped (id=${mirrorKey(item) ?? "?"}) → ${sessionID.slice(0, 16)}`);
+    if (text && !(await this.send(target, quoteBlock("👤 **Вы** · OpenCode", text)))) {
+      this.mirrorLedger.release(sessionID, text, key, mirrorKey(item));
       return;
-    }
-    if (text) {
-      await this.send(target, quoteBlock("👤 **Вы** · OpenCode", text));
-      this.lastMirror.set(sessionID, { text, at: Date.now() });
     }
     this.mirroredAt.set(sessionID, Date.now());
     await this.options.relay?.relayBeforeTurn(sessionID, media, "agent", undefined, undefined, 15_000);
@@ -2156,15 +2159,20 @@ export class DiscordBridge {
     return Buffer.from(await response.arrayBuffer());
   }
 
-  private async send(channelId: string, content: string): Promise<void> {
+  private async send(channelId: string, content: string): Promise<boolean> {
     try {
       const channel = this.client ? await resolveSendable(this.client, channelId) : undefined;
-      if (!channel) return;
+      if (!channel) return false;
+      let sent = false;
       for (const chunk of chunkText(content, DISCORD_CHUNK)) {
-        if (chunk.trim()) await channel.send({ content: chunk, allowedMentions: { parse: [] } });
+        if (!chunk.trim()) continue;
+        await channel.send({ content: chunk, allowedMentions: { parse: [] } });
+        sent = true;
       }
+      return sent;
     } catch (error) {
       log.warn(`discord send to ${channelId} failed: ${(error as Error).message}`);
+      return false;
     }
   }
 

@@ -62,12 +62,15 @@
 
 `session.idle` не приходит вообще — конец хода определяется только `session.execution.*`.
 
-**Id хода.** `session.text.started/delta/ended` (и, в зависимости от сборки,
-`session.execution.started`) содержат `assistantMessageID`. Стрим ключуется парой
-`(sessionID, turnId)`, где `turnId` — этот id, поэтому новый ход всегда получает
-новое сообщение; следующий шаг того же хода (другой id ассистентского сообщения)
-остаётся в том же сообщении, а первый id лишь переименовывает временный ход,
-открытый по `execution.started` (см. `src/turns.ts`).
+**Id хода.** `session.text.started/delta/ended` и
+`session.execution.started/succeeded/failed/interrupted` содержат
+`assistantMessageID`. Стрим ключуется парой `(sessionID, turnId)`, где `turnId` —
+этот id, поэтому новое ассистентское сообщение всегда получает новое сообщение в
+чате. Конец хода маршрутизируется по id из события: расхождение с живым стримом
+пишется в журнал, а завершается самый свежий живой стрим — конец хода не теряется
+(0.8.6). Id уже завершённого хода отклоняется как `stale`, поэтому позднее
+событие не правит старый ответ. `execution.started` может прийти без id — такой
+временный ход принимает первый настоящий id (см. `src/turns.ts`).
 
 **Формы.** `Form.Info` — это `{ id: "frm_…", sessionID, title, metadata, fields[] }`;
 `metadata.kind` — `question`, `mcp-elicitation` или `websearch.provider`. Типы полей:

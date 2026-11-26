@@ -62,12 +62,15 @@ The repeated `types` parameter is mandatory: OpenCode does not accept a comma li
 
 `session.idle` never arrives — the end of a turn is defined only by `session.execution.*`.
 
-**Turn ids.** `session.text.started/delta/ended` (and, depending on the build,
-`session.execution.started`) carry `assistantMessageID`. A stream is keyed by
-`(sessionID, turnId)` where `turnId` is that id, so a new turn always gets a new
-message; a later step of the same turn (another assistant message id) stays in the
-same message, and the first id merely renames the provisional turn opened by
-`execution.started` (see `src/turns.ts`).
+**Turn ids.** `session.text.started/delta/ended` and
+`session.execution.started/succeeded/failed/interrupted` carry
+`assistantMessageID`. A stream is keyed by `(sessionID, turnId)` where `turnId`
+is that id, so a new assistant message always gets a new chat message. End events
+are routed by the id they carry: a mismatch with the live stream is logged and the
+newest live stream is finalized, so an end is never lost (0.8.6). An id of an
+already ended turn is rejected as stale, so a late event cannot edit an old
+answer. `execution.started` may omit the id; that provisional turn is adopted by
+the first real assistant id (see `src/turns.ts`).
 
 **Forms.** `Form.Info` is `{ id: "frm_…", sessionID, title, metadata, fields[] }`;
 `metadata.kind` is `question`, `mcp-elicitation` or `websearch.provider`. Field types:

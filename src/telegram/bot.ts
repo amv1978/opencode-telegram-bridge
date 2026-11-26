@@ -8,7 +8,7 @@ import type { Store } from "../state/store.ts";
 import { entitiesToMarkdown } from "./entities.ts";
 import { Streamer, type Target } from "./stream.ts";
 import { runEvent } from "../events.ts";
-import { mirrorKey, MirrorLedger } from "../order.ts";
+import { mirrorKey, mirrorTargetKey, sharedMirrorLedger, uniqueMirrorTargets, type MirrorTarget } from "../order.ts";
 import { BackgroundSubagents, normalizeSubagentMode, subagentPlacement, type SubagentPlacement } from "../subagents.ts";
 import { statusReport, statusReportHtml, type BridgeRuntimeInfo } from "../status.ts";
 import {
@@ -136,12 +136,10 @@ export class Bridge {
   private readonly admitted = new Map<string, { at: number; target?: Target; warned: boolean }>();
   private doctorTimer?: ReturnType<typeof setInterval>;
   private readonly recentMirrors = new Map<string, { text: string; at: number }[]>();
-  /** Item-id guard: a replayed SSE event never mirrors the same prompt twice. */
-  private readonly mirrorLedger = new MirrorLedger();
+  /** Text-hash guard shared with Discord: a replayed prompt never mirrors twice. */
+  private readonly mirrorLedger = sharedMirrorLedger;
   /** Last successful mirror per session, so the history fallback does not repeat it. */
   private readonly mirroredAt = new Map<string, number>();
-  /** Text+time guard across event/history paths with different item ids. */
-  private readonly lastMirror = new Map<string, { text: string; at: number }>();
   /** Prompts this bridge sent itself, so history never mirrors them back. */
   private readonly selfPrompts = new Map<string, { text: string; at: number }[]>();
   private readonly appliedTitles = new Map<string, string>();
@@ -269,6 +267,11 @@ export class Bridge {
     await this.observer.shutdown();
     await this.streamer.shutdown();
     await this.bot.stop();
+  }
+
+  /** 429 retries and lost sends/edits for `/api/state.delivery`. */
+  deliveryStats(): { retries: number; lost: number; duplicatesSuppressed: number } {
+    return { ...this.streamer.retryStats(), duplicatesSuppressed: this.mirrorLedger.suppressedCount };
   }
 
   /** Current doctor warnings for the web panel. */
@@ -1328,7 +1331,7 @@ export class Bridge {
         }
         break;
       case "session.text.delta": {
-        if (!this.streamer.has(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID, false, turnHint);
+        if (!this.streamer.hasLive(sessionID) && !this.observer.has(sessionID)) await this.ensureStream(sessionID, false, turnHint);
         this.streamer.append(sessionID, String(event.data.delta ?? ""), turnHint);
         break;
       }
@@ -1370,9 +1373,11 @@ export class Bridge {
         }
         this.admitted.delete(sessionID);
         if (await this.finishObservation(sessionID, event)) break;
-        if (!this.streamer.has(sessionID)) break;
+        // Route the end by the assistant id carried by this event; a stale
+        // per-session pointer used to end an older message and lose the answer.
+        if (!this.streamer.hasBlock(sessionID)) break;
         const elapsed = this.streamer.elapsedMs(sessionID);
-        const turnId = this.streamer.turnOf(sessionID);
+        const turnId = turnHint ?? this.streamer.turnOf(sessionID);
         const type = event.type.replace("session.execution.", "");
         const reason = turnReason({
           type,
@@ -1394,7 +1399,7 @@ export class Bridge {
           turnId,
         });
         if (signal.aborted) break;
-        await this.streamer.end(sessionID, footer, turnId);
+        await this.streamer.end(sessionID, footer, turnHint);
         await this.markTitle(sessionID, "done");
         if (event.type === "session.execution.succeeded") void this.relayAgentFiles(sessionID);
         log.info(`turn ${type} ${sessionID.slice(0, 16)}: ${reason ?? "ok"}${blocked ? ` · blocked=${blocked}` : ""}`);
@@ -1440,7 +1445,7 @@ export class Bridge {
   }
 
   private async ensureStream(sessionID: string, newTurn = false, hint?: string): Promise<void> {
-    if (this.streamer.has(sessionID) || this.observer.has(sessionID)) return;
+    if (this.streamer.hasLive(sessionID) || this.observer.has(sessionID)) return;
     // One fetch covers both checks: child sessions never get a block, and a
     // late event from a finished turn must not create an orphan placeholder
     // that stays at "thinking… 1s" forever.
@@ -1541,7 +1546,7 @@ export class Bridge {
     return entries.some((entry) => entry.text === value && Date.now() - entry.at < 2 * 60 * 1000);
   }
 
-  /** Mirrors prompts sent from the desktop/TUI into the bound Telegram chat. */
+  /** Mirrors prompts sent from the desktop/TUI into the bound Telegram chat(s). */
   private async mirrorUserMessage(sessionID: string, item: unknown): Promise<void> {
     const envelope = item as {
       type?: string;
@@ -1558,44 +1563,91 @@ export class Bridge {
       log.info(`mirror of own prompt skipped → ${sessionID.slice(0, 16)}`);
       return;
     }
-    const target = this.targetFor(sessionID);
-    if (!target) return;
-    // History fallback and the SSE event may carry different item ids; a
-    // repeated text within 20 s is the same prompt, not a new one.
-    const previous = this.lastMirror.get(sessionID);
-    if (text && previous && previous.text === text && Date.now() - previous.at < 20_000) {
-      log.info(`mirror duplicate skipped → ${sessionID.slice(0, 16)}`);
-      return;
-    }
-    if (!this.mirrorLedger.claim(sessionID, item)) {
-      log.info(`mirror replay skipped (id=${mirrorKey(item) ?? "?"}) → ${sessionID.slice(0, 16)}`);
-      return;
-    }
-    const options = target.threadId ? { message_thread_id: target.threadId } : {};
-    if (text) {
-      const quoted = text
-        .split("\n")
-        .map((line) => `> ${line}`)
-        .join("\n");
-      const markdown = `> 👤 **Вы** · OpenCode\n>\n${quoted}`;
-      try {
-        await this.bot.api.sendRichMessage(target.chatId, { markdown }, options);
-      } catch (error) {
-        if (target.threadId && /message thread not found/i.test((error as Error).message)) {
-          this.store.unbindThread(target.threadId);
-          log.warn(`topic ${target.threadId} was deleted, binding cleared`);
-          return;
-        }
-        await this.bot.api.sendMessage(target.chatId, `👤 Вы (OpenCode):\n${text}`, options).catch(() => undefined);
+    const targets = this.mirrorTargetsFor(sessionID);
+    if (!targets.length) return;
+    const fallbackId = mirrorKey(item);
+    let delivered = false;
+    for (const target of targets) {
+      const key = mirrorTargetKey({ kind: "tg", chatId: target.chatId, threadId: target.threadId });
+      // One copy per target chat; a replay (inbox id vs message id) is skipped.
+      if (!this.mirrorLedger.claim(sessionID, text, key, Date.now(), fallbackId)) {
+        log.info(`mirror duplicate skipped (${key}) → ${sessionID.slice(0, 16)}`);
+        continue;
+      }
+      if (!text) {
+        delivered = true;
+        continue;
+      }
+      if (!(await this.sendMirrorText(target, text))) {
+        this.mirrorLedger.release(sessionID, text, key, fallbackId);
+        continue;
       }
       this.rememberMirror(target.chatId, text);
-      this.lastMirror.set(sessionID, { text, at: Date.now() });
+      delivered = true;
     }
+    if (!delivered) return;
     this.mirroredAt.set(sessionID, Date.now());
     // Media must finish (first attempt + retries) before the answer starts, so
     // the mirrored attachments are always above the answer.
     await this.options.relay?.relayBeforeTurn(sessionID, media, "agent", undefined, undefined, 15_000);
-    log.info(`mirror user → ${sessionID.slice(0, 16)}`);
+    log.info(`mirror user → ${sessionID.slice(0, 16)} (${targets.length} target${targets.length === 1 ? "" : "s"})`);
+  }
+
+  /** Posts one mirrored prompt; `false` when every attempt failed. */
+  private async sendMirrorText(target: Target, text: string): Promise<boolean> {
+    const options = target.threadId ? { message_thread_id: target.threadId } : {};
+    const quoted = text
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n");
+    const markdown = `> 👤 **Вы** · OpenCode\n>\n${quoted}`;
+    try {
+      await this.bot.api.sendRichMessage(target.chatId, { markdown }, options);
+      return true;
+    } catch (error) {
+      if (target.threadId && /message thread not found/i.test((error as Error).message)) {
+        this.store.unbindThread(target.threadId);
+        log.warn(`topic ${target.threadId} was deleted, binding cleared`);
+        return false;
+      }
+      try {
+        await this.bot.api.sendMessage(target.chatId, `👤 Вы (OpenCode):\n${text}`, options);
+        return true;
+      } catch (fallbackError) {
+        log.warn(`mirror send to ${target.chatId} failed: ${(fallbackError as Error).message}`);
+        return false;
+      }
+    }
+  }
+
+  /**
+   * Every chat the session is mirrored into: its topic, a bound private chat and
+   * the legacy single target. Deduplicated, so topic + private never get two
+   * copies of one prompt.
+   */
+  private mirrorTargetsFor(sessionID: string): Target[] {
+    const candidates: Target[] = [];
+    for (const binding of this.store.telegramBindings(sessionID)) {
+      if (binding.threadId) {
+        if (this.cfg.topicsChatId) candidates.push({ chatId: this.cfg.topicsChatId, threadId: binding.threadId });
+        continue;
+      }
+      if (binding.chatId) candidates.push({ chatId: binding.chatId });
+    }
+    const single = this.targetFor(sessionID);
+    if (single) candidates.push(single);
+    const targets: MirrorTarget[] = [];
+    for (const target of candidates) {
+      const chatId = target.chatId;
+      // Never leak into foreign groups; General is never a reply target.
+      if (chatId < 0 && chatId !== this.cfg.topicsChatId) continue;
+      if (chatId === this.cfg.topicsChatId && !target.threadId) continue;
+      targets.push({ kind: "tg", chatId, threadId: target.threadId });
+    }
+    return uniqueMirrorTargets(targets).map((target) => ({
+      chatId: Number(target.chatId),
+      threadId: target.threadId === undefined ? undefined : Number(target.threadId),
+    }));
   }
 
   /**

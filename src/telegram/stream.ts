@@ -2,6 +2,7 @@ import { GrammyError, type Api } from "grammy";
 import { log } from "../log.ts";
 import { sanitizeModelName, UNKNOWN_MODEL } from "../model.ts";
 import { assignChunk, planChunks, TurnGate } from "../order.ts";
+import { RETRY_ATTEMPTS, RetryCounters, errorText, retryAfterMs, withRetry } from "../retry.ts";
 import { statusHtml, statusMarkdownList, type StatusItem } from "../status.ts";
 import { TypingPulse } from "../typing.ts";
 import { markdownToHtml, splitHtml, splitMarkdown, stripHtml } from "./render.ts";
@@ -100,9 +101,16 @@ export class Streamer {
   private rich: boolean;
   /** model display name currently used by a session's live block. */
   private readonly models = new Map<string, string>();
+  /** 429 retries and lost deliveries, surfaced in `/api/state.delivery`. */
+  readonly stats = new RetryCounters();
 
   constructor(private readonly api: Api, private readonly options: StreamerOptions) {
     this.rich = options.format !== "html";
+  }
+
+  /** Delivery counters for the panel/API. */
+  retryStats(): { retries: number; lost: number } {
+    return this.stats.snapshot();
   }
 
   private diagnostics(): boolean {
@@ -122,6 +130,14 @@ export class Streamer {
   has(sessionID: string): boolean {
     const turn = this.turns.current(sessionID);
     return Boolean(turn && this.states.has(turnKey(sessionID, turn.turnId)));
+  }
+
+  /** Any stream of the session that has not been finalized yet. */
+  hasLive(sessionID: string): boolean {
+    for (const state of this.states.values()) {
+      if (state.sessionID === sessionID && !state.finished) return true;
+    }
+    return false;
   }
 
   /** Turn id of the current stream (diagnostics and footers). */
@@ -157,6 +173,10 @@ export class Streamer {
 
   async begin(sessionID: string, target: Target, model?: string, newTurn = false, hint?: string): Promise<string | undefined> {
     const turn = this.beginTurn(sessionID, newTurn, hint);
+    if (turn.stale) {
+      log.info(`late event for an ended turn ignored for ${sessionID.slice(0, 16)} (${turn.turnId})`);
+      return undefined;
+    }
     const key = turnKey(sessionID, turn.turnId);
     const existing = this.states.get(key);
     if (existing) return existing.turnId;
@@ -258,12 +278,32 @@ export class Streamer {
     }
   }
 
-  /** Binds an event to its turn and returns that turn's stream, if any. */
-  private resolveTurn(sessionID: string, hint?: string): { turnId: string; key: string; state?: State } {
+  /**
+   * Binds an event to its turn and returns that turn's stream, if any.
+   *
+   * A new assistant id opens a new turn in the registry. If that turn has no
+   * stream yet but the session still has a live one (a later step of the running
+   * answer), the text/tool goes to the live stream instead of spawning a second
+   * message. An end event later finalizes the live stream with a mismatch log.
+   */
+  private resolveTurn(sessionID: string, hint?: string): { turnId: string; key: string; state?: State; stale: boolean } {
     const turn = this.turns.bind(sessionID, hint);
+    if (turn.stale) {
+      return { turnId: turn.turnId, key: turnKey(sessionID, turn.turnId), state: undefined, stale: true };
+    }
     if (turn.adoptedFrom) this.rekey(sessionID, turn.adoptedFrom, turn.turnId);
     const key = turnKey(sessionID, turn.turnId);
-    return { turnId: turn.turnId, key, state: this.states.get(key) };
+    let state = this.states.get(key);
+    if (!state) {
+      const live = this.liveState(sessionID);
+      if (live) {
+        log.info(
+          `event turn ${turn.turnId} routed to live stream ${live.turnId} for ${sessionID.slice(0, 16)}`,
+        );
+        state = live;
+      }
+    }
+    return { turnId: turn.turnId, key, state, stale: false };
   }
 
   private current(sessionID: string): State | undefined {
@@ -299,7 +339,11 @@ export class Streamer {
   }
 
   append(sessionID: string, delta: string, hint?: string): void {
-    const { key, state } = this.resolveTurn(sessionID, hint);
+    const { key, state, stale } = this.resolveTurn(sessionID, hint);
+    if (stale) {
+      log.debug(`late delta for an ended turn ignored ${sessionID.slice(0, 16)} (${hint ?? "?"})`);
+      return;
+    }
     if (!state) {
       if (!delta) return;
       if (this.closed.has(key)) return; // late delta of a finished turn
@@ -308,14 +352,14 @@ export class Streamer {
       this.pendingText.set(key, { text: text.slice(-200_000), at: Date.now() });
       return;
     }
-    if (!delta) return;
+    if (!delta || state.finished) return;
     state.text += delta;
     this.schedule(state);
   }
 
   setText(sessionID: string, text: string, hint?: string): void {
-    const { key, state } = this.resolveTurn(sessionID, hint);
-    if (!state || !text) return;
+    const { state, stale } = this.resolveTurn(sessionID, hint);
+    if (stale || !state || !text || state.finished) return;
     state.text = text;
     this.schedule(state);
   }
@@ -409,13 +453,34 @@ export class Streamer {
    * (footer included) until the last child finishes and its line fades.
    * The *turn* itself ends immediately: the next prompt opens a new message,
    * never editing this one.
+   *
+   * `turnId` is the assistant message id carried by the end event. The stream
+   * is looked up by that id; when the event names a different message than the
+   * stream (OpenCode is inconsistent here) the mismatch is logged and the newest
+   * live stream is finalized instead of silently returning.
    */
   async end(sessionID: string, footer?: string, turnId?: string): Promise<string | undefined> {
-    const id = turnId ?? this.turns.current(sessionID)?.turnId;
-    const key = id ? turnKey(sessionID, id) : undefined;
-    const state = key ? this.states.get(key) : undefined;
-    this.turns.end(sessionID, id);
-    if (!state || !key) return id;
+    const exact = turnId ? this.states.get(turnKey(sessionID, turnId)) : undefined;
+    if (exact?.finished) {
+      // Duplicate end (e.g. replay): keep the newest footer, do not re-finalize.
+      if (footer && exact.awaiting) exact.footer = footer;
+      this.turns.end(sessionID, turnId);
+      log.info(`duplicate turn end ignored for ${sessionID.slice(0, 16)} (${turnId})`);
+      return exact.turnId;
+    }
+    const state = exact ?? this.liveState(sessionID);
+    const effective = state?.turnId ?? turnId ?? this.turns.current(sessionID)?.turnId;
+    this.turns.end(sessionID, turnId);
+    if (!state) {
+      log.warn(`finalize: no live stream for ${sessionID.slice(0, 16)} turn=${turnId ?? "?"} (footer dropped)`);
+      return effective;
+    }
+    if (turnId && state.turnId !== turnId) {
+      log.warn(
+        `turn end mismatch ${sessionID.slice(0, 16)}: event turn=${turnId} stream=${state.turnId}; finalizing stream`,
+      );
+    }
+    this.turns.end(sessionID, state.turnId);
     state.finished = true;
     if (state.timer) {
       clearTimeout(state.timer);
@@ -436,10 +501,25 @@ export class Streamer {
     return state.turnId;
   }
 
+  /** Newest stream of the session that has not been finalized. */
+  private liveState(sessionID: string): State | undefined {
+    let found: State | undefined;
+    for (const state of this.states.values()) {
+      if (state.sessionID !== sessionID || state.finished) continue;
+      if (!found || state.startedAt >= found.startedAt) found = state;
+    }
+    return found;
+  }
+
   /** Delivers the final message once and removes the state. */
   private async finalize(state: State, footer?: string): Promise<void> {
     const key = this.keyOf(state);
-    if (this.states.get(key) !== state) return;
+    if (this.states.get(key) !== state) {
+      log.warn(
+        `finalize: stream ${state.sessionID.slice(0, 16)} turn=${state.turnId} was already replaced or removed; skipped`,
+      );
+      return;
+    }
     if (state.finalizeTimer) {
       clearTimeout(state.finalizeTimer);
       state.finalizeTimer = undefined;
@@ -721,14 +801,18 @@ export class Streamer {
 
   private async sendRich(state: State, markdown: string): Promise<number | undefined> {
     try {
-      const message = await this.api.sendRichMessage(state.target.chatId, { markdown }, this.threadOptions(state));
+      const message = await this.withApi("sendRichMessage", () =>
+        this.api.sendRichMessage(state.target.chatId, { markdown }, this.threadOptions(state)),
+      );
       return message.message_id;
     } catch (error) {
       if (isThreadMissing(error) && state.target.threadId) {
         log.warn(`thread ${state.target.threadId} is gone, posting to the chat root`);
         this.options.onThreadGone?.(state.sessionID);
         state.target.threadId = undefined;
-        const message = await this.api.sendRichMessage(state.target.chatId, { markdown });
+        const message = await this.withApi("sendRichMessage", () =>
+          this.api.sendRichMessage(state.target.chatId, { markdown }),
+        );
         return message.message_id;
       }
       throw error;
@@ -737,14 +821,11 @@ export class Streamer {
 
   private async editRich(state: State, messageId: number, markdown: string): Promise<void> {
     try {
-      await this.api.editMessageText(state.target.chatId, messageId, { markdown });
+      await this.withApi("editMessageText", () =>
+        this.api.editMessageText(state.target.chatId, messageId, { markdown }),
+      );
     } catch (error) {
       if (isNotModified(error)) return;
-      if (error instanceof GrammyError && error.error_code === 429) {
-        // Wait `retry_after`; the next 1.2 s tick repeats the edit.
-        await this.handleRetry(error);
-        return;
-      }
       throw error;
     }
   }
@@ -752,46 +833,65 @@ export class Streamer {
   private async sendHtml(state: State, html: string): Promise<number | undefined> {
     const options = { parse_mode: "HTML" as const, ...this.threadOptions(state) };
     try {
-      const message = await this.api.sendMessage(state.target.chatId, html, options);
+      const message = await this.withApi("sendMessage", () =>
+        this.api.sendMessage(state.target.chatId, html, options),
+      );
       return message.message_id;
     } catch (error) {
       if (isThreadMissing(error) && state.target.threadId) {
         log.warn(`thread ${state.target.threadId} is gone, posting to the chat root`);
         this.options.onThreadGone?.(state.sessionID);
         state.target.threadId = undefined;
-        const message = await this.api.sendMessage(state.target.chatId, html, { parse_mode: "HTML" });
+        const message = await this.withApi("sendMessage", () =>
+          this.api.sendMessage(state.target.chatId, html, { parse_mode: "HTML" }),
+        );
         return message.message_id;
       }
       if (isParseError(error)) {
-        const message = await this.api.sendMessage(state.target.chatId, stripHtml(html), this.threadOptions(state));
+        const message = await this.withApi("sendMessage", () =>
+          this.api.sendMessage(state.target.chatId, stripHtml(html), this.threadOptions(state)),
+        );
         return message.message_id;
       }
-      await this.handleRetry(error);
-      return undefined;
+      throw error;
     }
   }
 
   private async editHtml(state: State, messageId: number, html: string): Promise<void> {
     try {
-      await this.api.editMessageText(state.target.chatId, messageId, html, { parse_mode: "HTML" });
+      await this.withApi("editMessageText", () =>
+        this.api.editMessageText(state.target.chatId, messageId, html, { parse_mode: "HTML" }),
+      );
     } catch (error) {
       if (isNotModified(error)) return;
       if (isParseError(error)) {
-        await this.api.editMessageText(state.target.chatId, messageId, stripHtml(html)).catch(() => undefined);
+        await this.withApi("editMessageText", () =>
+          this.api.editMessageText(state.target.chatId, messageId, stripHtml(html)),
+        ).catch(() => undefined);
         return;
       }
-      await this.handleRetry(error);
+      throw error;
     }
   }
 
-  private async handleRetry(error: unknown): Promise<void> {
-    if (error instanceof GrammyError && error.error_code === 429) {
-      const retryAfter = (error.parameters as { retry_after?: number } | undefined)?.retry_after ?? 3;
-      log.warn(`Telegram 429, retry after ${retryAfter}s`);
-      await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
-      return;
-    }
-    log.warn("telegram request failed:", (error as Error).message);
+  /**
+   * One Telegram call with bounded 429 retries. The same send/edit is repeated
+   * after `retry_after`; a non-429 error is rethrown untouched. After the last
+   * attempt the loss is logged and counted, and the error is rethrown so the
+   * next flush tick retries the chunk instead of dropping it.
+   */
+  private withApi<T>(label: string, call: () => Promise<T>): Promise<T> {
+    return withRetry(label, call, {
+      retryAfterMs,
+      onRetry: (info) => {
+        this.stats.recordRetry();
+        log.warn(`${label} 429, retry ${info.attempt}/${RETRY_ATTEMPTS} after ${Math.round(info.waitMs / 1000)}s`);
+      },
+      onLost: (error) => {
+        this.stats.recordLoss();
+        log.error(`${label} lost after ${RETRY_ATTEMPTS} attempts: ${errorText(error)}`);
+      },
+    });
   }
 
   async shutdown(): Promise<void> {

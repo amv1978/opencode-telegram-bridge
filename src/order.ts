@@ -76,22 +76,79 @@ export function mirrorKey(item: unknown): string | undefined {
   return undefined;
 }
 
-/** Remembers which mirrored items were already delivered per session. */
+/** A mirror destination: a transport, a chat and an optional thread. */
+export interface MirrorTarget {
+  kind: string;
+  chatId: string | number;
+  threadId?: string | number;
+}
+
+/** Stable target key: `tg:-100123:0`, `dc:456:0`. */
+export function mirrorTargetKey(target: MirrorTarget): string {
+  return `${target.kind}:${target.chatId}:${target.threadId ?? 0}`;
+}
+
+/** Drops duplicate targets while keeping the first occurrence. */
+export function uniqueMirrorTargets(targets: Iterable<MirrorTarget>): MirrorTarget[] {
+  const seen = new Set<string>();
+  const result: MirrorTarget[] = [];
+  for (const target of targets) {
+    const key = mirrorTargetKey(target);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(target);
+  }
+  return result;
+}
+
+/** Whitespace-insensitive text, so replayed events with reformatting match. */
+export function normalizeMirrorText(text: string): string {
+  return String(text ?? "").replace(/\s+/g, " ").trim();
+}
+
+/** FNV-1a over UTF-16 code units: short, stable, dependency-free. */
+export function mirrorHash(text: string): string {
+  let hash = 0x811c9dc5;
+  const value = normalizeMirrorText(text);
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/** How long a mirrored prompt is remembered per target. */
+export const MIRROR_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Remembers delivered mirror prompts per `(session, normalized text, target)`.
+ *
+ * The old ledger keyed on an item id, but the SSE event carries the inbox id
+ * while the history fallback carries the message id — the same prompt looked
+ * new and was posted twice. Text is the stable identity; the id is only a
+ * fallback for prompts without text.
+ */
 export class MirrorLedger {
   private readonly seen = new Map<string, number>();
+  private suppressed = 0;
 
   constructor(
-    private readonly ttlMs = 30 * 60 * 1000,
-    private readonly maxEntries = 500,
+    private readonly ttlMs = MIRROR_TTL_MS,
+    private readonly maxEntries = 1000,
   ) {}
 
-  /** `true` = first delivery, `false` = replay and must be skipped. */
-  claim(sessionID: string, item: unknown, now = Date.now()): boolean {
-    const id = mirrorKey(item);
-    if (!id) return true;
-    const key = `${sessionID}:${id}`;
+  /**
+   * `true` = first delivery to this target, `false` = replay and must be
+   * skipped. A prompt may still be claimed once per target.
+   */
+  claim(sessionID: string, text: string, target: string, now = Date.now(), fallbackId?: string): boolean {
+    const key = this.keyOf(sessionID, text, target, fallbackId);
+    if (!key) return true;
     const at = this.seen.get(key);
-    if (at !== undefined && now - at <= this.ttlMs) return false;
+    if (at !== undefined && now - at <= this.ttlMs) {
+      this.suppressed += 1;
+      return false;
+    }
     this.seen.set(key, now);
     if (this.seen.size > this.maxEntries) {
       const cutoff = now - this.ttlMs;
@@ -99,7 +156,28 @@ export class MirrorLedger {
     }
     return true;
   }
+
+  /** Frees a claim when every send attempt failed: the next event may retry. */
+  release(sessionID: string, text: string, target: string, fallbackId?: string): void {
+    const key = this.keyOf(sessionID, text, target, fallbackId);
+    if (key) this.seen.delete(key);
+  }
+
+  /** How many replays were suppressed (visible in stats/tests). */
+  get suppressedCount(): number {
+    return this.suppressed;
+  }
+
+  private keyOf(sessionID: string, text: string, target: string, fallbackId?: string): string | undefined {
+    const normalized = normalizeMirrorText(text);
+    if (normalized) return `${sessionID}:${mirrorHash(normalized)}:${target}`;
+    if (fallbackId) return `${sessionID}:id:${fallbackId}:${target}`;
+    return undefined;
+  }
 }
+
+/** One ledger for Telegram and Discord: a replay cannot post in either. */
+export const sharedMirrorLedger = new MirrorLedger();
 
 /**
  * Suppresses a second placeholder for a turn that already ended: late SSE
