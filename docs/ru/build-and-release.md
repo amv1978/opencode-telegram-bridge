@@ -19,6 +19,7 @@
 bun install
 bun run typecheck
 bun test                      # pure modules: status, stats, render, media, config
+node scripts/check-ui.mjs     # <script> страницы должен парситься как JS
 bun run build                 # dist\ocbridge.exe
 ```
 
@@ -154,7 +155,7 @@ ocbridge-bundle-0.8.2.zip.sha256
 ## Чек-лист релиза
 
 1. Поднять версию только в `package.json`; запустить `bun scripts/sync-version.mjs`.
-2. `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`.
+2. `bunx tsc --noEmit`, `bun test`, `node scripts/check-ui.mjs`, `bun run src/doctor.ts`.
 3. `powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1`.
 4. Проверить layout bundle (`version.json` со списком файлов,
    `desktop\OpenCode Bridge.exe`).

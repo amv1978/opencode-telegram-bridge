@@ -53,9 +53,9 @@ CLI: see `docs/build-and-release.md`. Installer: `ISCC installer\ocbridge.iss`.
   out of scope; plan: approach; tasks: ordered, tests included). Specs are local
   (gitignored); only the template is committed.
 - **Every feature = spec + tests + a manual check in Telegram AND Discord.**
-- **Release gate:** `bunx tsc --noEmit` + `bun test` + installer check
-  (`ISCC installer\ocbridge.iss`), then a manual Telegram pass (private chat +
-  topic + voice + permission button) and a Discord thread/channel pass.
+- **Release gate:** `bunx tsc --noEmit` + `bun test` + `node scripts/check-ui.mjs`
+  + installer check (`ISCC installer\ocbridge.iss`), then a manual Telegram pass
+  (private chat + topic + voice + permission button) and a Discord thread/channel pass.
 
 ## Docs
 

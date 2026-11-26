@@ -779,10 +779,10 @@ function applyTheme() {
 }
 
 function rgbToHex(color) {
-  const match = /rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/.exec(color || "");
-  if (!match) return "#161616";
-  const hex = (n) => Number(n).toString(16).padStart(2, "0");
-  return "#" + hex(match[1]) + hex(match[2]) + hex(match[3]);
+  const parts = String(color || "").replace("rgba(", "").replace("rgb(", "").replace(")", "").split(",").map((v) => Number(v.trim()));
+  if (parts.length < 3 || parts.some((v) => Number.isNaN(v))) return "#161616";
+  const hex = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+  return "#" + hex(parts[0]) + hex(parts[1]) + hex(parts[2]);
 }
 
 applyTheme();
@@ -973,7 +973,7 @@ function renderUpdate(u) {
   hintBox.hidden = !u.hint || Boolean(u.error);
   hintBox.textContent = u.hint || "";
   releaseRow.hidden = !u.error;
-  $("updateRelease").href = u.assetUrl ? String(u.assetUrl).replace(/\/download\/.*$/, "") : "https://github.com/amv1978/opencode-telegram-bridge/releases/latest";
+  $("updateRelease").href = u.assetUrl ? String(u.assetUrl).split("/download/")[0] : "https://github.com/amv1978/opencode-telegram-bridge/releases/latest";
 
   progress.hidden = !u.downloading;
   progress.value = u.progress || 0;

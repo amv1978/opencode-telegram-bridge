@@ -56,9 +56,9 @@ CLI: см. `docs/build-and-release.md`. Установщик: `ISCC installer\oc
   рамок; plan: подход; tasks: по порядку, с тестами). Спеки локальные
   (gitignored), версионируется только шаблон.
 - **Каждая фича = spec + тесты + ручная проверка в Telegram И Discord.**
-- **Release gate:** `bunx tsc --noEmit` + `bun test` + проверка установщика
-  (`ISCC installer\ocbridge.iss`), затем ручной проход по Telegram (личный чат +
-  тема + голос + кнопка разрешения) и по треду/каналу Discord.
+- **Release gate:** `bunx tsc --noEmit` + `bun test` + `node scripts/check-ui.mjs`
+  + проверка установщика (`ISCC installer\ocbridge.iss`), затем ручной проход по
+  Telegram (личный чат + тема + голос + кнопка разрешения) и по треду/каналу Discord.
 
 ## Документация
 

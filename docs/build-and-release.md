@@ -19,6 +19,7 @@
 bun install
 bun run typecheck
 bun test                      # pure modules: status, stats, render, media, config
+node scripts/check-ui.mjs     # page <script> must parse as JS (no regex escaping bugs)
 bun run build                 # dist\ocbridge.exe
 ```
 
@@ -153,7 +154,7 @@ and `version.json` come from `package.json` automatically.
 ## Release checklist
 
 1. Bump `package.json` only; run `bun scripts/sync-version.mjs`.
-2. `bunx tsc --noEmit`, `bun test`, `bun run src/doctor.ts`.
+2. `bunx tsc --noEmit`, `bun test`, `node scripts/check-ui.mjs`, `bun run src/doctor.ts`.
 3. `powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1`.
 4. Verify the bundle layout (`version.json` file list, `desktop\OpenCode Bridge.exe`).
 5. Install the standalone and the lite setup on a clean machine: window, tray,

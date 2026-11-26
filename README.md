@@ -71,9 +71,10 @@ sessions**; no OpenCode plugin is required.
 
 ### Installer (Windows 10/11)
 
-1. Run `ocbridge-setup-standalone-0.8.2.exe` (offline) or `ocbridge-setup-lite-0.8.2.exe`
+1. Run `ocbridge-setup-standalone-0.8.5.exe` (offline) or `ocbridge-setup-lite-0.8.5.exe`
    (downloads the portable bundle, ~2 MB). The portable layout is also available
-   as `ocbridge-bundle-0.8.2.zip`.
+   as `ocbridge-bundle-0.8.5.zip`. Everything is on the
+   [releases page](https://github.com/amv1978/opencode-telegram-bridge/releases/latest).
 2. Paste the bot token from [@BotFather](https://t.me/BotFather) - you may skip this
    and set it later in the panel `http://127.0.0.1:7788`.
 3. Send `/start` to the bot — the first user becomes administrator.

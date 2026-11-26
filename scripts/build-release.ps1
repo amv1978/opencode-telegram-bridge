@@ -25,12 +25,17 @@ if ($LASTEXITCODE -ne 0) { throw "version sync failed" }
 & bun scripts/sync-version.mjs --check
 if ($LASTEXITCODE -ne 0) { throw "version mismatch: root package.json is the single source" }
 
-# 1. Daemon ---------------------------------------------------------------
+# 1. UI guard -------------------------------------------------------------
+Write-Host "-- ui client script"
+& node scripts/check-ui.mjs
+if ($LASTEXITCODE -ne 0) { throw "ui client script check failed: the page script would not parse in the browser" }
+
+# 2. Daemon ---------------------------------------------------------------
 Write-Host "-- daemon"
 & bun run build
 if ($LASTEXITCODE -ne 0) { throw "bun build failed" }
 
-# 2. CLI ------------------------------------------------------------------
+# 3. CLI ------------------------------------------------------------------
 if (-not $SkipCli) {
   Write-Host "-- cli"
   Push-Location (Join-Path $root "cli")
@@ -44,7 +49,7 @@ if (-not $SkipCli) {
   }
 }
 
-# 3. Electron shell -------------------------------------------------------
+# 4. Electron shell -------------------------------------------------------
 if (-not $SkipDesktop) {
   Write-Host "-- desktop"
   Push-Location (Join-Path $root "desktop")
@@ -59,7 +64,7 @@ if (-not (Test-Path (Join-Path $desktop "OpenCode Bridge.exe"))) {
   throw "desktop build is missing: $desktop"
 }
 
-# 4. Portable bundle ------------------------------------------------------
+# 5. Portable bundle ------------------------------------------------------
 Write-Host "-- bundle"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -100,7 +105,7 @@ if (-not $bundleSha) { throw "bundle SHA256 is empty" }
 "$bundleSha  ocbridge-bundle-$Version.zip" | Set-Content "$zip.sha256" -Encoding ascii
 Write-Host "bundle: $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
 
-# 5. Installers -----------------------------------------------------------
+# 6. Installers -----------------------------------------------------------
 $iscc = @(
   (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
@@ -116,7 +121,7 @@ Write-Host "-- setup-lite"
 & $iscc "/DAppVersion=$Version" "/DBundleSha=$bundleSha" (Join-Path $root "installer\ocbridge-lite.iss")
 if ($LASTEXITCODE -ne 0) { throw "lite installer failed" }
 
-# 6. Checksums ------------------------------------------------------------
+# 7. Checksums ------------------------------------------------------------
 foreach ($name in @("ocbridge-setup-standalone-$Version.exe", "ocbridge-setup-lite-$Version.exe")) {
   $path = Join-Path $dist $name
   if (-not (Test-Path $path)) { throw "missing artifact: $path" }
